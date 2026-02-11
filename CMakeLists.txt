@@ -84,10 +84,23 @@ target_link_options(abtrda3_flags INTERFACE
 add_subdirectory(src)
 
 # =============================================================================
+# Tests
+# =============================================================================
+
+option(ABTRDA3_BUILD_TESTS "Build test executables" ON)
+
+if(ABTRDA3_BUILD_TESTS)
+    add_subdirectory(test)
+endif()
+
+# =============================================================================
 # Summary
 # =============================================================================
 
 message(STATUS "")
 message(STATUS "Targets:")
-message(STATUS "  - abtrda3 : Packet MMAP library (STATIC)")
+message(STATUS "  - abtrda3      : Packet MMAP library (STATIC)")
+if(ABTRDA3_BUILD_TESTS)
+    message(STATUS "  - abtrda3_test : Ping-pong / burst test binary")
+endif()
 message(STATUS "")

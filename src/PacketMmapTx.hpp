@@ -14,7 +14,7 @@
 #include <sys/socket.h>
 
 
-static constexpr std::uint32_t kDataOffset = TPACKET_ALIGN(sizeof(tpacket3_hdr));
+static constexpr std::uint32_t kDataOffset = TPACKET_ALIGN(sizeof(tpacket2_hdr));
 
 class PacketMmapTx {
 public:
@@ -30,7 +30,7 @@ public:
   // HOT PATH function set to inline
   [[nodiscard, gnu::always_inline]]
   bool send(std::span<const std::uint8_t> frame) noexcept {
-    tpacket3_hdr* hdr = reinterpret_cast<tpacket3_hdr*>(m_nextSlot);
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
     // This is less frequently to trigger to let the compiler optimise it away
     if (hdr->tp_status != TP_STATUS_AVAILABLE)[[unlikely]] {
@@ -41,7 +41,6 @@ public:
     std::memcpy(m_nextSlot + kDataOffset, frame.data(), currentFrameSize);
     hdr->tp_len     = static_cast<std::uint32_t>(currentFrameSize);
     hdr->tp_snaplen = static_cast<std::uint32_t>(currentFrameSize);
-    hdr->tp_next_offset = 0;
 
     std::atomic_thread_fence(std::memory_order_release);
     hdr->tp_status = TP_STATUS_SEND_REQUEST;

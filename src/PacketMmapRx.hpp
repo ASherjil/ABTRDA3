@@ -30,46 +30,51 @@ public:
 
   ~PacketMmapRx() = default;
 
-  // HOT PATH - non-blocking, returns nullptr-span if no frame ready
-  // The returned RxFrame::data point into ring. Valid release().
+  // HOT PATH - non-blocking, returns empty span if no frame ready.
+  // The returned RxFrame::data points into the ring. Valid until release().
+  // A block may contain multiple packets. tryReceive() returns them one at a
+  // time; release() advances to the next packet, releasing the block back to
+  // the kernel only after the last packet is consumed.
   [[nodiscard, gnu::always_inline]]
   RxFrame tryReceive() noexcept {
-    tpacket_block_desc* block = reinterpret_cast<tpacket_block_desc*>(m_nextBlock);
-    auto& bh = block->hdr.bh1;
+    // If we're already inside a block, return the current packet
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextFrame);
 
-    if ((bh.block_status & TP_STATUS_USER) == 0) [[likely]]{
-      return {.data = {}, .sec = 0, .nsec = 0, .status = 0};
+    if ((hdr->tp_status & TP_STATUS_USER) == 0) [[likely]] {
+      return {};
     }
 
-    tpacket3_hdr* pkt = reinterpret_cast<tpacket3_hdr*>(m_nextBlock + bh.offset_to_first_pkt);
-
+    // Data is ready! Return pointer to payload
     return {
-      .data = {reinterpret_cast<const std::uint8_t*>(pkt) + pkt->tp_mac, pkt->tp_snaplen},
-      .sec  = pkt->tp_sec,
-      .nsec = pkt->tp_nsec,
-      .status = pkt->tp_status
+      .data = {reinterpret_cast<const std::uint8_t*>(hdr) + hdr->tp_mac, hdr->tp_snaplen},
+      .sec  = hdr->tp_sec,
+      .nsec = hdr->tp_nsec,
+      .status = hdr->tp_status
     };
   }
 
-  // HOT PATH - Release is seperated fromt he tryReceive()
+  // HOT PATH - advance to next packet in block, or release block if last.
   [[gnu::always_inline]]
   void release() noexcept {
-    tpacket_block_desc* block = reinterpret_cast<tpacket_block_desc*>(m_nextBlock);
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextFrame);
 
+    // 1. Mark frame as free for the Kernal to use again
     std::atomic_thread_fence(std::memory_order_release);
-    block->hdr.bh1.block_status = TP_STATUS_KERNEL; // hand the space back to the kernel
+    hdr->tp_status = TP_STATUS_KERNEL;
 
-    m_nextBlock += m_blockSize;
-    if (m_nextBlock >= m_ringEnd) {
-      m_nextBlock = m_ringBase;
+    // Move along to the next frame in the buffer
+    m_nextFrame += m_frameSize;
+    if (m_nextFrame >= m_ringEnd) {
+      m_nextFrame = m_ringBase;
     }
   }
+
 private:
   SocketOps m_socketHandler;
-  std::uint8_t* m_nextBlock;
+  std::uint8_t* m_nextFrame;
   std::uint8_t* m_ringBase;
   std::uint8_t* m_ringEnd;
-  std::uint32_t m_blockSize;
+  std::uint32_t m_frameSize;
 };
 
 #endif // ABTRDA3_PACKETMMAPRX_H

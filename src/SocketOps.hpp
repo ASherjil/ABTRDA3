@@ -5,9 +5,10 @@
 #ifndef ABTRDA3_SOCKETOPS_H
 #define ABTRDA3_SOCKETOPS_H
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <linux/if_ether.h>
+#include <linux/if_packet.h>
 
 enum class RingDirection : std::uint8_t {TX, RX};
 
@@ -17,6 +18,7 @@ struct RingConfig {
   std::uint32_t blockSize   = 4096; // each frame fills the whole block
   std::uint32_t blockNumber = 64; // ring depth
   std::uint16_t protocol    = ETH_P_ALL;
+  int packetVersion         = TPACKET_V2; // default to V2 but V3 can also be used
   bool hwTimeStamp          = true;
   bool qdiscBypass          = true; // PACKET_QDISC_BYPASS
 };

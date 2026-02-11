@@ -9,6 +9,10 @@
 PacketMmapTx::PacketMmapTx(const RingConfig& cfg)
   :m_socketHandler{cfg}, m_frameSize{cfg.blockSize} {
 
+  if (cfg.packetVersion != TPACKET_V2) {
+    throw std::invalid_argument("PacketMmapTx requires the TPACKET_V2 ring configuration");
+  }
+
   m_fd        = m_socketHandler.m_fd;
   m_ringBase  = static_cast<uint8_t*>(m_socketHandler.m_ringAddress);
   m_ringEnd   = m_ringBase + m_socketHandler.m_ringSize;

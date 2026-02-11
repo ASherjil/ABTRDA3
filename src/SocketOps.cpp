@@ -22,27 +22,40 @@ SocketOps::SocketOps(const RingConfig& ringConfig) {
     throw std::system_error(errno, std::generic_category(), "socket(AF_PACKET)");
   }
 
-  // Step 2: Set TPACKET_V3
-  int version = TPACKET_V3;
+  // Step 2: Set TPACKET version
+  const int version = ringConfig.packetVersion; // it is usually V2 or V3
   if (::setsockopt(m_fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0) {
     throw std::system_error(errno, std::generic_category(), "PACKET_VERSION");
   }
 
   // Step 3: Set the RX/TX ring: one frame per block
-  tpacket_req3 req{};
-  req.tp_block_size = ringConfig.blockSize;
-  req.tp_frame_size = ringConfig.blockSize; // frame is the same size as the block
-  req.tp_block_nr   = ringConfig.blockNumber;
-  req.tp_frame_nr   = ringConfig.blockNumber;
-  req.tp_retire_blk_tov   = 0;
-  req.tp_sizeof_priv      = 0;
-  req.tp_feature_req_word = 0;
+  const int ringOpt = (ringConfig.direction == RingDirection::TX) ? PACKET_TX_RING : PACKET_RX_RING;
+  if (version == TPACKET_V2) {
+    tpacket_req req{};
+    req.tp_block_size = ringConfig.blockSize;
+    req.tp_frame_size = ringConfig.blockSize;
+    req.tp_block_nr   = ringConfig.blockNumber;
+    req.tp_frame_nr   = ringConfig.blockNumber;
 
-  // Setup the TX/RX ring with the above definiations
-  int ringOpt = (ringConfig.direction == RingDirection::TX) ? PACKET_TX_RING : PACKET_RX_RING;
-  if (::setsockopt(m_fd, SOL_PACKET, ringOpt, &req, sizeof(req)) < 0) {
-    throw std::system_error(errno, std::generic_category(),
-	(ringConfig.direction == RingDirection::TX) ? "PACKET_TX_RING" : "PACKET_RX_RING");
+    if (::setsockopt(m_fd, SOL_PACKET, ringOpt, &req, sizeof(req)) < 0) {
+      throw std::system_error(errno, std::generic_category(), "PACKET_RX/TX_RING (V2)");
+    }
+  }
+  else if (version == TPACKET_V3){
+    tpacket_req3 req{};
+    req.tp_block_size = ringConfig.blockSize;
+    req.tp_frame_size = ringConfig.blockSize; // frame is the same size as the block
+    req.tp_block_nr   = ringConfig.blockNumber;
+    req.tp_frame_nr   = ringConfig.blockNumber;
+    // RX: retire blocks after 1ms even if not full (safety net for isolated packets).
+    // In steady-state traffic, the next arriving packet triggers immediate retirement.
+    req.tp_retire_blk_tov   = (ringConfig.direction == RingDirection::RX) ? 1 : 0;
+    req.tp_sizeof_priv      = 0;
+    req.tp_feature_req_word = 0;
+
+    if (::setsockopt(m_fd, SOL_PACKET, ringOpt, &req, sizeof(req)) < 0) {
+      throw std::system_error(errno, std::generic_category(), "PACKET_RX/TX_RING (V3)");
+    }
   }
 
   // Step 4: Create a memory mapped space
@@ -60,7 +73,7 @@ SocketOps::SocketOps(const RingConfig& ringConfig) {
   }
 
   // Step 5: Bind to the interface
-  unsigned ifindex = ::if_nametoindex(ringConfig.interface);
+  const unsigned ifindex = ::if_nametoindex(ringConfig.interface);
   if (ifindex == 0) {
     throw std::system_error(errno, std::generic_category(), "if_nametoindex");
   }
@@ -78,7 +91,7 @@ SocketOps::SocketOps(const RingConfig& ringConfig) {
 
   // Step 6a: TX- bypass qdisc
   if (ringConfig.qdiscBypass && ringConfig.direction == RingDirection::TX) {
-    int val = 1;
+    const int val = 1;
     if (::setsockopt(m_fd, SOL_PACKET, PACKET_QDISC_BYPASS, &val, sizeof(val)) < 0) {
       throw std::system_error(errno, std::generic_category(), "PACKET_QDISC_BYPASS");
     }
