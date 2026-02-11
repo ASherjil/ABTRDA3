@@ -229,167 +229,90 @@ Same LEMO loopback setup can be used for apples-to-apples comparison.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| TPACKET version | V3 for both RX and TX | Block-based, best kernel support, busy-poll compatible |
-| RX block sizing | `block_size = frame_size = 4096` | One frame per block → immediate retirement, no batching latency |
-| TX send mechanism | `send(fd, NULL, 0, 0)` after ring write | Socket already bound; `sendto()` sockaddr lookup is redundant |
-| Qdisc bypass | `PACKET_QDISC_BYPASS` on TX | Skips kernel traffic control layer, saves ~1-2us per packet |
-| HW timestamps | RX: always enabled, TX: optional | RX is free (in mmap'd header). TX requires `recvmsg(MSG_ERRQUEUE)` |
-| Class design | Separate `PacketMmapRx` / `PacketMmapTx` | Different deployments, different tuning, zero hot-path coupling |
+| TPACKET version | **V2** for both RX and TX | Deterministic frame-by-frame processing. V3 block batching introduced jitter/timeouts for single events. |
+| Ring sizing | `frame_size = 4096` | Page-aligned frames. One frame per slot. No block aggregation. |
+| TX send mechanism | `send(fd, NULL, 0, MSG_DONTWAIT)` | Immediate transmission of marked frame. |
+| Qdisc bypass | `PACKET_QDISC_BYPASS` on TX | Skips kernel traffic control layer, saves ~1-2us per packet. |
+| HW timestamps | RX: `SOF_TIMESTAMPING_RAW_HARDWARE` | Zero cost in `tpacket2_hdr`. |
+| Safety | 30s Watchdog Thread | Prevents system lockup when running `SCHED_FIFO` at 100% CPU on isolated cores. |
 
-### TPACKET_V3 Ring Setup (RX, low-latency single-frame mode)
+### TPACKET_V2 Ring Setup (Deterministic Low-Latency)
 
 ```cpp
-struct tpacket_req3 req{};
-req.tp_block_size     = 4096;   // one page = one frame
-req.tp_frame_size     = 4096;   // fills the block
-req.tp_block_nr       = 64;     // ring depth
-req.tp_frame_nr       = 64;     // one frame per block
-req.tp_retire_blk_tov = 0;      // no timeout needed (block retires instantly)
-req.tp_sizeof_priv    = 0;
-req.tp_feature_req_word = 0;
+struct tpacket_req req{};
+req.tp_block_size = 4096;   // Page size
+req.tp_frame_size = 4096;   // One frame per block/slot
+req.tp_block_nr   = 64;     // Ring depth
+req.tp_frame_nr   = 64;     // Total frames
 
-setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req));
+setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)); // or TX_RING
 ```
 
-One packet arrives → block is full → retired to userspace immediately. No batching delay.
+### Measured Performance (Feb 2026)
+Hardware: CERN FECs (cfc-865-mkdev30 <-> cfc-865-mkdev16)
+Optimization: `SCHED_FIFO` (99), `isolcpus`, `mlockall`
 
-### Socket Setup Sequence
+| Metric | Value |
+|--------|-------|
+| Min RTT | ~43 µs |
+| Avg RTT | ~57 µs |
+| **One-Way Latency** | **~28.5 µs** |
 
-```cpp
-// 1. Create raw packet socket
-int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-
-// 2. Set TPACKET_V3
-int version = TPACKET_V3;
-setsockopt(fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version));
-
-// 3. Configure ring (RX or TX)
-setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req));  // or PACKET_TX_RING
-
-// 4. Memory-map the ring
-size_t ring_size = req.tp_block_size * req.tp_block_nr;
-void* ring = mmap(NULL, ring_size, PROT_READ | PROT_WRITE,
-                  MAP_SHARED | MAP_LOCKED, fd, 0);
-
-// 5. Bind to interface
-struct sockaddr_ll sll{};
-sll.sll_family   = AF_PACKET;
-sll.sll_protocol = htons(ETH_P_ALL);
-sll.sll_ifindex  = if_nametoindex("eth0");
-bind(fd, (struct sockaddr*)&sll, sizeof(sll));
-
-// 6. Enable hardware timestamping (RX, zero hot-path cost)
-int ts = SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE;
-setsockopt(fd, SOL_PACKET, PACKET_TIMESTAMP, &ts, sizeof(ts));
-
-// 7. Bypass qdisc (TX only, saves ~1-2us)
-int bypass = 1;
-setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass));
-```
-
-### RX Busy-Poll Hot Loop
+### RX Busy-Poll Hot Loop (V2)
 
 ```cpp
-uint32_t block_idx = 0;
-
 while (running) {
-    auto* block = (struct tpacket_block_desc*)((uint8_t*)ring + block_idx * block_size);
-    auto& hdr   = block->hdr.bh1;
+    auto* hdr = (struct tpacket2_hdr*)next_frame_ptr;
 
-    if ((hdr.block_status & TP_STATUS_USER) == 0)
-        continue;  // no data yet — spin
+    if ((hdr->tp_status & TP_STATUS_USER) == 0)
+        continue;  // spin
 
-    // One frame per block: jump directly to the packet
-    auto* pkt = (struct tpacket3_hdr*)((uint8_t*)block + hdr.offset_to_first_pkt);
-    uint8_t* data = (uint8_t*)pkt + pkt->tp_mac;
-    uint32_t len  = pkt->tp_snaplen;
+    // Data ready at: (uint8_t*)hdr + hdr->tp_mac
+    process_packet((uint8_t*)hdr + hdr->tp_mac, hdr->tp_snaplen);
 
-    // Timestamps available in pkt->tp_sec, pkt->tp_nsec
-    // Check pkt->tp_status & TP_STATUS_TS_RAW_HARDWARE for HW timestamp
-
-    process_packet(data, len, pkt->tp_sec, pkt->tp_nsec);
-
-    // Release block back to kernel
-    hdr.block_status = TP_STATUS_KERNEL;
-    block_idx = (block_idx + 1) % block_nr;
+    // Release frame
+    hdr->tp_status = TP_STATUS_KERNEL;
+    advance_ring_pointer();
 }
 ```
 
-### TX Hot Path
+### TX Hot Path (V2)
 
 ```cpp
-uint32_t frame_idx = 0;
-
 bool send_packet(const uint8_t* payload, size_t len) {
-    auto* frame = (struct tpacket3_hdr*)((uint8_t*)ring + frame_idx * frame_size);
+    auto* hdr = (struct tpacket2_hdr*)next_frame_ptr;
 
-    if (frame->tp_status != TP_STATUS_AVAILABLE)
-        return false;  // ring full
+    if (hdr->tp_status != TP_STATUS_AVAILABLE)
+        return false;
 
-    // Write packet after TPACKET3 header
-    memcpy((uint8_t*)frame + TPACKET3_HDRLEN, payload, len);
-    frame->tp_len        = len;
-    frame->tp_snaplen    = len;
-    frame->tp_next_offset = 0;
+    // Copy payload
+    memcpy((uint8_t*)hdr + TPACKET_ALIGN(sizeof(tpacket2_hdr)), payload, len);
+    hdr->tp_len = len;
+    hdr->tp_snaplen = len;
 
-    // Mark for transmission (must be last write before send)
-    frame->tp_status = TP_STATUS_SEND_REQUEST;
+    // Mark and flush
+    hdr->tp_status = TP_STATUS_SEND_REQUEST;
+    send(fd, NULL, 0, MSG_DONTWAIT);
 
-    // Flush — kernel transmits all SEND_REQUEST frames
-    send(fd, NULL, 0, 0);
-
-    frame_idx = (frame_idx + 1) % frame_nr;
+    advance_ring_pointer();
     return true;
 }
-```
-
-### Hardware Timestamping
-
-| Direction | setsockopt | Hot-path cost | Where timestamp appears |
-|-----------|-----------|---------------|------------------------|
-| RX | `PACKET_TIMESTAMP` + `SOF_TIMESTAMPING_RAW_HARDWARE` | Zero — already in mmap'd `tpacket3_hdr` | `pkt->tp_sec`, `pkt->tp_nsec` |
-| TX | `SOF_TIMESTAMPING_TX_HARDWARE` + `SO_TIMESTAMPING` | Extra `recvmsg(MSG_ERRQUEUE)` | Error queue (requires syscall) |
-
-RX timestamps are free: the NIC captures them in hardware, the kernel copies them into the
-TPACKET_V3 frame header during NAPI processing, and you read them from mapped memory.
-
-TX timestamps require reading from the socket error queue after transmission — useful for
-benchmarking wire departure time but adds a syscall to the hot path. Enable only for
-latency measurement, disable in production.
-
-Check NIC capability: `ethtool -T <iface>`
-
-### Key TPACKET_V3 Constants
-
-```
-TP_STATUS_KERNEL          = 0         // kernel owns block/frame
-TP_STATUS_USER            = (1 << 0)  // userspace owns block (RX)
-TP_STATUS_AVAILABLE       = 0         // TX frame available for writing
-TP_STATUS_SEND_REQUEST    = (1 << 0)  // mark TX frame for transmission
-TP_STATUS_SENDING         = (1 << 1)  // kernel is transmitting
-TP_STATUS_WRONG_FORMAT    = (1 << 2)  // malformed TX packet
-TP_STATUS_TS_RAW_HARDWARE = (1 << 31) // frame has HW timestamp
 ```
 
 ### System Tuning Checklist
 
 ```bash
-# TX: bypass qdisc at OS level (belt + suspenders with PACKET_QDISC_BYPASS)
-tc qdisc replace dev eth0 root noqueue
-
-# RX: disable interrupt coalescing (immediate NAPI)
-ethtool -C eth0 rx-usecs 0 rx-frames 1
-
-# RX: enable kernel busy-poll support
+# 1. Enable Busy Polling (Critical for RX)
 sysctl -w net.core.busy_poll=1
 sysctl -w net.core.busy_read=1
 
-# Both: isolate CPU core for polling thread
-# In /etc/default/grub: GRUB_CMDLINE_LINUX="isolcpus=5 nohz_full=5 rcu_nocbs=5"
+# 2. Run with Real-Time Priority and CPU Pinning
+# (Test app now accepts --cpu <N> to handle pinning internally)
+sudo ./abtrda3_test --client --count 1000 --cpu 2
 
-# Both: pin thread to isolated core + real-time priority
-taskset -c 5 chrt -f 90 ./sidecar
+# 3. Disable Interrupt Coalescing
+ethtool -C eth0 rx-usecs 0 rx-frames 1
 
-# Both: lock all pages (prevent page faults in hot path)
-# In code: mlockall(MCL_CURRENT | MCL_FUTURE)
+# 4. Watchdog Safety
+# App automatically terminates after 30s to allow recovery if SSH locks up.
 ```
