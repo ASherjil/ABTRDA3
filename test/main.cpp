@@ -1,9 +1,8 @@
-// ABTRDA3 - Ultra Low Latency Latency Test
+// ABTRDA3 - Ultra-Low Latency Ping-Pong Test
 //
 // Usage:
-//   Server (Reflector): sudo ./abtrda3_test --server
-//   Client (Measurer):  sudo ./abtrda3_test --client --count 100
-//
+//   Server (Reflector): sudo taskset -c 4 ./abtrda3_test --server
+//   Client (Measurer):  sudo taskset -c 4 ./abtrda3_test --client --count 1000
 
 #include "PacketMmapTx.hpp"
 #include "PacketMmapRx.hpp"
@@ -11,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <cstdint>
 #include <array>
 #include <vector>
@@ -18,9 +18,12 @@
 #include <csignal>
 #include <time.h>
 #include <sched.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <thread>
+#include <chrono>
 
 // =============================================================================
 // Configuration
@@ -29,14 +32,14 @@
 constexpr const char*   kInterface  = "eno2";
 constexpr std::uint16_t kEtherType  = 0x88B5;   // IEEE local experimental
 
-// FEC-A: cfc-865-mkdev30 (eno2: d4:f5:27:2a:a9:59)
+// FEC-A: cfc-865-mkdev30 (eno2)
 constexpr std::array<std::uint8_t, 6> kFecA_MAC = {0xd4, 0xf5, 0x27, 0x2a, 0xa9, 0x59};
-// FEC-B: cfc-865-mkdev16 (eno2: 20:87:56:b6:33:67)
+// FEC-B: cfc-865-mkdev16 (eno2)
 constexpr std::array<std::uint8_t, 6> kFecB_MAC = {0x20, 0x87, 0x56, 0xb6, 0x33, 0x67};
 
-constexpr std::uint32_t kBlockSize    = 4096;
-constexpr std::uint32_t kBlockNumber  = 64;   // Keep ring small/fast
-constexpr std::size_t   kFrameSize    = 64;   // Minimum ethernet frame
+constexpr std::uint32_t kBlockSize   = 4096;
+constexpr std::uint32_t kBlockNumber = 64;
+constexpr std::size_t   kFrameSize   = 64;   // Minimum ethernet frame
 
 // =============================================================================
 // Globals
@@ -44,9 +47,7 @@ constexpr std::size_t   kFrameSize    = 64;   // Minimum ethernet frame
 
 static volatile std::sig_atomic_t g_running = 1;
 
-static void sigint_handler(int) {
-    g_running = 0;
-}
+static void sigint_handler(int) { g_running = 0; }
 
 [[gnu::always_inline]]
 inline std::uint64_t now_ns() noexcept {
@@ -56,48 +57,58 @@ inline std::uint64_t now_ns() noexcept {
          + static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
-#include <thread>
-#include <chrono>
+// =============================================================================
+// Watchdog — safety net for RT lockups / unreachable SSH
+//
+// Runs on core 0 at SCHED_OTHER (normal priority) so it can always fire
+// even when the hot path busy-spins at SCHED_FIFO on another core.
+// After 30s it sets g_running = 0, allowing the program to exit cleanly.
+// =============================================================================
 
-// ... (existing includes)
+static void spawn_watchdog() {
+    std::thread([](){
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(0, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+
+        sched_param sp{};
+        sp.sched_priority = 0;
+        sched_setscheduler(0, SCHED_OTHER, &sp);
+
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        if (g_running) {
+            std::fprintf(stderr, "\n[Watchdog] 30s timeout. Stopping...\n");
+            g_running = 0;
+        }
+    }).detach();
+}
 
 // =============================================================================
-// Server (Reflector) - The "Echo" side
+// Server (Reflector)
 // =============================================================================
 
 static void run_server() {
-    std::printf("[Server] Listening on %s (Reflector Mode)\n", kInterface);
-    std::printf("[Server] Auto-shutdown in 30 seconds (Safety Watchdog)...\n");
+    std::printf("[Server] Listening on %s (Reflector)\n", kInterface);
+    std::printf("[Server] Watchdog: auto-shutdown in 30 seconds\n");
+    spawn_watchdog();
 
-    // Watchdog thread: kills server after 30s to prevent RT lockups
-    std::thread watchdog([](){
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-        if (g_running) {
-            std::fprintf(stderr, "\n[Watchdog] Timeout reached. Stopping...\n");
-            g_running = 0;
-        }
-    });
-    // Detach so we don't have to join it if we exit early (clean OS cleanup)
-    watchdog.detach();
-
-    // RX: TPACKET_V3 (Efficient polling)
     RingConfig rx_cfg{};
     rx_cfg.interface   = kInterface;
     rx_cfg.direction   = RingDirection::RX;
     rx_cfg.blockSize   = kBlockSize;
     rx_cfg.blockNumber = kBlockNumber;
     rx_cfg.protocol    = kEtherType;
-    rx_cfg.hwTimeStamp = false; // Not needed for reflector
+    rx_cfg.hwTimeStamp = false;
 
-    // TX: TPACKET_V2 (Low latency send)
     RingConfig tx_cfg{};
-    tx_cfg.interface   = kInterface;
-    tx_cfg.direction   = RingDirection::TX;
-    tx_cfg.blockSize   = kBlockSize;
-    tx_cfg.blockNumber = kBlockNumber;
-    tx_cfg.protocol    = kEtherType;
-    tx_cfg.packetVersion = TPACKET_V2; 
-    tx_cfg.qdiscBypass = true;
+    tx_cfg.interface     = kInterface;
+    tx_cfg.direction     = RingDirection::TX;
+    tx_cfg.blockSize     = kBlockSize;
+    tx_cfg.blockNumber   = kBlockNumber;
+    tx_cfg.protocol      = kEtherType;
+    tx_cfg.packetVersion = TPACKET_V2;
+    tx_cfg.qdiscBypass   = true;
 
     PacketMmapRx rx(rx_cfg);
     PacketMmapTx tx(tx_cfg);
@@ -105,154 +116,131 @@ static void run_server() {
     std::array<std::uint8_t, kFrameSize> buffer{};
     std::uint64_t packet_count = 0;
 
-    while (g_running) {
-        RxFrame rxf = rx.tryReceive();
-        
-        if (!rxf.data.empty()) {
-            // DEBUG: Print reception
-            // std::printf("[Server] Rx packet len=%zu\n", rxf.data.size());
+    // Outer loop checks g_running; inner loop spins tight without volatile reads
+    while (true) {
+        for (std::uint32_t i = 0; i < 65536; ++i) {
+            RxFrame rxf = rx.tryReceive();
+            if (rxf.data.empty()) continue;
 
-            // Only reflect our experimental EtherType packets of correct size
             if (rxf.data.size() >= kFrameSize) {
-                // Zero-copy-ish reflection:
-                // We copy from RX ring -> Stack buffer -> TX ring
-                // (Direct RX->TX ring copy would be faster but requires pointer arithmetic safety)
-                
-                std::memcpy(buffer.data(), rxf.data.data(), kFrameSize);
+                // Swap MACs directly from RX ring, copy payload
+                std::memcpy(&buffer[0],  &rxf.data[6],  6);
+                std::memcpy(&buffer[6],  &rxf.data[0],  6);
+                std::memcpy(&buffer[12], &rxf.data[12], kFrameSize - 12);
 
-                // Swap MAC addresses
-                // Dst [0-5] becomes Src [6-11]
-                // Src [6-11] becomes Dst [0-5]
-                std::memcpy(&buffer[0], &rxf.data[6], 6);
-                std::memcpy(&buffer[6], &rxf.data[0], 6);
+                rx.release();  // free RX slot before TX syscall
 
-                // Send it back immediately
-                while (!tx.send(buffer) && g_running) {
-                    // Spin if TX ring is full (unlikely in ping-pong)
+                while (!tx.send(buffer)) {
+                    if (!g_running) return;
                 }
-                
                 packet_count++;
+            } else {
+                rx.release();
             }
-            rx.release();
-        } else {
-            // Busy loop - no sleep for lowest latency
-            // std::this_thread::yield(); // Optional: Uncomment to save CPU at cost of latency
         }
+        if (!g_running) break;
     }
-    std::printf("\n[Server] Reflected %lu packets. Exiting.\n", packet_count);
+
+    std::printf("\n[Server] Reflected %lu packets.\n", packet_count);
 }
 
 // =============================================================================
-// Client (Measurer) - The "Ping" side
+// Client (Measurer)
 // =============================================================================
 
 static void run_client(std::uint32_t count) {
     std::printf("[Client] Sending %u packets to measure RTT\n", count);
-    std::printf("[Client] Auto-shutdown in 30 seconds (Safety Watchdog)...\n");
+    std::printf("[Client] Watchdog: auto-shutdown in 30 seconds\n");
+    spawn_watchdog();
 
-    // Watchdog thread: kills client after 30s to prevent RT lockups
-    std::thread watchdog([](){
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-        if (g_running) {
-            std::fprintf(stderr, "\n[Watchdog] Timeout reached. Stopping...\n");
-            g_running = 0;
-        }
-    });
-    watchdog.detach();
-
-    // TX: TPACKET_V2
     RingConfig tx_cfg{};
-    tx_cfg.interface   = kInterface;
-    tx_cfg.direction   = RingDirection::TX;
-    tx_cfg.blockSize   = kBlockSize;
-    tx_cfg.blockNumber = kBlockNumber;
-    tx_cfg.protocol    = kEtherType;
+    tx_cfg.interface     = kInterface;
+    tx_cfg.direction     = RingDirection::TX;
+    tx_cfg.blockSize     = kBlockSize;
+    tx_cfg.blockNumber   = kBlockNumber;
+    tx_cfg.protocol      = kEtherType;
     tx_cfg.packetVersion = TPACKET_V2;
-    tx_cfg.qdiscBypass = true;
+    tx_cfg.qdiscBypass   = true;
 
-    // RX: TPACKET_V2
     RingConfig rx_cfg{};
-    rx_cfg.interface   = kInterface;
-    rx_cfg.direction   = RingDirection::RX;
-    rx_cfg.blockSize   = kBlockSize;
-    rx_cfg.blockNumber = kBlockNumber;
-    rx_cfg.protocol    = kEtherType;
+    rx_cfg.interface     = kInterface;
+    rx_cfg.direction     = RingDirection::RX;
+    rx_cfg.blockSize     = kBlockSize;
+    rx_cfg.blockNumber   = kBlockNumber;
+    rx_cfg.protocol      = kEtherType;
     rx_cfg.packetVersion = TPACKET_V2;
-    rx_cfg.hwTimeStamp = false; // Use software (userspace) timestamps for RTT
+    rx_cfg.hwTimeStamp   = false;
 
     PacketMmapTx tx(tx_cfg);
     PacketMmapRx rx(rx_cfg);
 
+    // Pre-fill ethernet header
     std::array<std::uint8_t, kFrameSize> frame{};
-    // Pre-fill invariant parts
-    std::memcpy(&frame[0], kFecB_MAC.data(), 6); // Dest
-    std::memcpy(&frame[6], kFecA_MAC.data(), 6); // Src
+    std::memcpy(&frame[0], kFecB_MAC.data(), 6);  // Dst
+    std::memcpy(&frame[6], kFecA_MAC.data(), 6);  // Src
     frame[12] = static_cast<std::uint8_t>(kEtherType >> 8);
     frame[13] = static_cast<std::uint8_t>(kEtherType & 0xFF);
-    // Payload can be zeros or sequence number
-    
-    std::vector<double> latencies_us;
-    latencies_us.reserve(count);
+
+    std::vector<std::uint64_t> latencies_ns;
+    latencies_ns.reserve(count);
+
+    constexpr std::uint64_t kTimeoutNs = 1'000'000'000; // 1 second
 
     for (std::uint32_t i = 0; i < count && g_running; ++i) {
-        // 1. Mark Start Time
         std::uint64_t t1 = now_ns();
 
-        // 2. Send Packet
-        // Embed sequence number in payload for verification (optional, bytes 14-17)
+        // Embed sequence number in payload
         std::uint32_t seq_net = htonl(i);
         std::memcpy(&frame[14], &seq_net, sizeof(seq_net));
 
         if (!tx.send(frame)) {
-            std::fprintf(stderr, "TX Ring full! Skipping packet %u\n", i);
+            std::fprintf(stderr, "TX ring full, skipping packet %u\n", i);
             continue;
         }
 
-        // 3. Wait for Echo (Blocking/Polling with Timeout)
+        // Spin-wait for echo. Check timeout every 65536 spins (~300us).
         bool received = false;
-        std::uint64_t timeout_ns = 1'000'000'000; // 1 second timeout
-        std::uint64_t start_wait = now_ns();
+        std::uint32_t spins = 0;
 
-        while ((now_ns() - start_wait) < timeout_ns && g_running) {
+        while (true) {
             RxFrame rxf = rx.tryReceive();
             if (!rxf.data.empty()) {
-                // Verify it's our packet (check length and/or sequence)
                 if (rxf.data.size() >= kFrameSize) {
-                     // 4. Mark End Time immediately
                     std::uint64_t t2 = now_ns();
-                    
-                    std::uint64_t rtt_ns = t2 - t1;
-                    latencies_us.push_back(static_cast<double>(rtt_ns) / 1000.0);
+                    latencies_ns.push_back(t2 - t1);
                     received = true;
                     rx.release();
-                    break; 
+                    break;
                 }
                 rx.release();
+            }
+            if ((++spins & 0xFFFF) == 0) {
+                if (!g_running || (now_ns() - t1) >= kTimeoutNs) break;
             }
         }
 
         if (!received) {
             std::printf("Packet %u timed out!\n", i);
         }
-
-        // Small gap between packets to let things settle (optional)
-        // usleep(1000); 
     }
 
-    if (latencies_us.empty()) return;
+    if (latencies_ns.empty()) return;
 
     // Stats
-    std::sort(latencies_us.begin(), latencies_us.end());
-    double sum = 0;
-    for (auto v : latencies_us) sum += v;
-    
-    std::printf("\n=== Latency Results (%zu samples) ===\n", latencies_us.size());
-    std::printf("Min RTT:    %.2f us\n", latencies_us.front());
-    std::printf("Median RTT: %.2f us\n", latencies_us[latencies_us.size()/2]);
-    std::printf("Max RTT:    %.2f us\n", latencies_us.back());
-    std::printf("Avg RTT:    %.2f us\n", sum / latencies_us.size());
+    std::sort(latencies_ns.begin(), latencies_ns.end());
+    std::uint64_t sum = 0;
+    for (auto v : latencies_ns) sum += v;
+
+    auto to_us = [](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
+    std::size_t n = latencies_ns.size();
+
+    std::printf("\n=== Latency Results (%zu samples) ===\n", n);
+    std::printf("Min RTT:    %.2f us\n", to_us(latencies_ns.front()));
+    std::printf("Median RTT: %.2f us\n", to_us(latencies_ns[n / 2]));
+    std::printf("Max RTT:    %.2f us\n", to_us(latencies_ns.back()));
+    std::printf("Avg RTT:    %.2f us\n", to_us(sum / n));
     std::printf("-----------------------------\n");
-    std::printf("Est. One-Way Latency: %.2f us\n", latencies_us[latencies_us.size()/2] / 2.0);
+    std::printf("Est. One-Way Latency: %.2f us\n", to_us(latencies_ns[n / 2]) / 2.0);
 }
 
 // =============================================================================
@@ -265,25 +253,32 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Set RT priority (needs root)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         std::fprintf(stderr, "[Warn] mlockall failed\n");
     }
-    // Optional: Set thread priority to SCHED_FIFO here if desired
+
+    // SCHED_FIFO:49 — below ksoftirqd/4 (SCHED_FIFO:50) so NAPI can
+    // still deliver packets to the mmap ring on this RT kernel.
+    // Requires: sudo chrt -f -p 50 $(pgrep ksoftirqd/4) on BOTH machines.
+    {
+        sched_param sp{};
+        sp.sched_priority = 49;
+        if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
+            std::fprintf(stderr, "[Warn] SCHED_FIFO:49 failed: %s\n", std::strerror(errno));
+        }
+    }
 
     std::signal(SIGINT, sigint_handler);
 
     if (std::strcmp(argv[1], "--server") == 0) {
         run_server();
-    } 
-    else if (std::strcmp(argv[1], "--client") == 0) {
-        std::uint32_t count = 10; // default
+    } else if (std::strcmp(argv[1], "--client") == 0) {
+        std::uint32_t count = 10;
         if (argc >= 4 && std::strcmp(argv[2], "--count") == 0) {
-            count = std::atoi(argv[3]);
+            count = static_cast<std::uint32_t>(std::atoi(argv[3]));
         }
         run_client(count);
-    } 
-    else {
+    } else {
         std::printf("Unknown mode.\n");
         return 1;
     }

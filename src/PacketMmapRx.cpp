@@ -7,7 +7,7 @@
 #include <stdexcept>
 
 PacketMmapRx::PacketMmapRx(const RingConfig& cfg)
-  :m_socketHandler{cfg}, m_frameSize{cfg.blockSize}{
+  :m_frameSize{cfg.blockSize}, m_socketHandler{cfg}{
 
   // Safety: Ensure user didn't ask for V3
     if (cfg.packetVersion != TPACKET_V2) {
@@ -21,12 +21,11 @@ PacketMmapRx::PacketMmapRx(const RingConfig& cfg)
 
 
 PacketMmapRx::PacketMmapRx(PacketMmapRx&& other) noexcept
-  :m_socketHandler{std::move(other.m_socketHandler)},
-   m_nextFrame{std::exchange(other.m_nextFrame, nullptr)},
+  :m_nextFrame{std::exchange(other.m_nextFrame, nullptr)},
    m_ringBase{std::exchange(other.m_ringBase, nullptr)},
    m_ringEnd{std::exchange(other.m_ringEnd, nullptr)},
-   m_frameSize{std::exchange(other.m_frameSize, 0)}{
-
+   m_frameSize{std::exchange(other.m_frameSize, 0)},
+   m_socketHandler{std::move(other.m_socketHandler)}{
 }
 
 

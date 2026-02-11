@@ -38,6 +38,10 @@ public:
     }
 
     std::size_t currentFrameSize = frame.size();
+    // Let the compiler also optimise it away
+    if (currentFrameSize > m_frameSize - kDataOffset)[[unlikely]]{
+      return false;
+    }
     std::memcpy(m_nextSlot + kDataOffset, frame.data(), currentFrameSize);
     hdr->tp_len     = static_cast<std::uint32_t>(currentFrameSize);
     hdr->tp_snaplen = static_cast<std::uint32_t>(currentFrameSize);
@@ -52,16 +56,19 @@ public:
     if (m_nextSlot >= m_ringEnd) {// if the next slot reaches the end
       m_nextSlot = m_ringBase;// reset it back to the start
     }
+    __builtin_prefetch(m_nextSlot, 0, 3);  // read, highest temporal locality
 
     return true;
   }
 private:
-  SocketOps     m_socketHandler;
-  int           m_fd;          // copied from SocketOps, avoids indirection in hot path
+  // HOT: accessed every send(), packed into one cache line (32 bytes)
   std::uint8_t* m_nextSlot;    // points directly into the ring
   std::uint8_t* m_ringBase;    // ring start
   std::uint8_t* m_ringEnd;     // ring start + ring_size
+  int           m_fd;          // copied from SocketOps, avoids indirection
   std::uint32_t m_frameSize;
+  // COLD: constructor/destructor only
+  SocketOps     m_socketHandler;
 };
 
 #endif // ABTRDA3_PACKETMMAPTX_H

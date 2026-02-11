@@ -67,14 +67,17 @@ public:
     if (m_nextFrame >= m_ringEnd) {
       m_nextFrame = m_ringBase;
     }
+    __builtin_prefetch(m_nextFrame, 0, 3);  // read, highest temporal locality
   }
 
 private:
-  SocketOps m_socketHandler;
+  // HOT: accessed every tryReceive()/release(), packed into one cache line (28 bytes)
   std::uint8_t* m_nextFrame;
   std::uint8_t* m_ringBase;
   std::uint8_t* m_ringEnd;
   std::uint32_t m_frameSize;
+  // COLD: constructor/destructor only
+  SocketOps     m_socketHandler;
 };
 
 #endif // ABTRDA3_PACKETMMAPRX_H
