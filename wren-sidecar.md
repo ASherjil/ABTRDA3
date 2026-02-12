@@ -178,6 +178,28 @@ but individual packets are simpler and perfectly adequate.
 For normal events this latency is irrelevant (seconds of lead time available).
 For zero-lead emergency events this is the worst-case forwarding delay.
 
+## CPU Core Selection (Critical)
+
+The app and NIC IRQ **must** be on the same core. When a packet arrives, the IRQ
+handler writes to the mmap ring and our spin loop reads it — same-core means L1
+cache hit (~1ns). Cross-core means L3 roundtrip (~30-40ns per packet) and
+occasional 10ms+ spikes from inter-processor interrupts.
+
+**How to find which core the NIC IRQ is on:**
+```bash
+# Find the IRQ number(s) for the interface
+grep eno2 /proc/interrupts    # e.g. IRQ 142: eno2-TxRx-0
+
+# Check which core it's assigned to
+cat /proc/irq/142/smp_affinity_list   # e.g. "4"
+```
+
+Choose that core for `taskset -c <core>`. If you need a different core, pin
+the IRQ to match: `echo <core> > /proc/irq/142/smp_affinity_list`.
+
+`NicTuner` handles this automatically — it finds the NIC IRQs via
+`/proc/interrupts`, pins them to `kCpuCore`, and moves all other IRQs off.
+
 ## Optimizations
 - TX side: `PACKET_QDISC_BYPASS` setsockopt (bypass kernel traffic control)
 - RX side: `ethtool -C eno2 rx-usecs 0` (was 3µs — eliminated 6µs RTT penalty)
@@ -255,16 +277,16 @@ setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)); // or TX_RING
 ### Measured Performance (Feb 2026)
 Hardware: CERN FECs (cfc-865-mkdev30 ↔ cfc-865-mkdev16), 1GbE direct cable, igb driver
 Kernel: 5.10.245-rt139-fecos03 (PREEMPT_RT)
-200,000 packets, no kernel bypass (no XDP/DPDK)
+500,000 packets, no kernel bypass (no XDP/DPDK)
 
 | Metric | Value |
 |--------|-------|
 | Min RTT | 24 µs |
-| Median RTT | 25 µs |
-| P100 (Max) RTT | 78 µs |
-| Avg RTT | 30 µs |
-| **One-Way Latency (median)** | **~12.7 µs** |
-| **One-Way Latency (P100)** | **<40 µs** |
+| Median RTT | 33 µs |
+| P100 (Max) RTT | 77 µs |
+| Avg RTT | 33 µs |
+| **One-Way Latency (median)** | **~16 µs** |
+| **One-Way Latency (P100)** | **<39 µs** |
 
 ### RX Busy-Poll Hot Loop (V2)
 
