@@ -2,6 +2,7 @@ add_library(abtrda3 STATIC
     SocketOps.cpp
     PacketMmapRx.cpp
     PacketMmapTx.cpp
+    NicTuner.cpp
 )
 
 target_include_directories(abtrda3 PUBLIC

@@ -179,10 +179,14 @@ For normal events this latency is irrelevant (seconds of lead time available).
 For zero-lead emergency events this is the worst-case forwarding delay.
 
 ## Optimizations
-- TX side: `tc qdisc replace dev ethX root noqueue` (bypass qdisc)
-- RX side: `setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &1, 4)` + `sysctl net.core.busy_poll=1`
-- RX side: `ethtool -C ethX rx-usecs 0 rx-frames 1` (disable interrupt coalescing)
-- Both: isolated CPU core, SCHED_FIFO, mlockall(MCL_CURRENT|MCL_FUTURE)
+- TX side: `PACKET_QDISC_BYPASS` setsockopt (bypass kernel traffic control)
+- RX side: `ethtool -C eno2 rx-usecs 0` (was 3µs — eliminated 6µs RTT penalty)
+- NIC offloads: `ethtool -K eno2 gro off gso off tso off` (remove batching overhead)
+- Scheduling: `SCHED_FIFO:49` app, `SCHED_FIFO:50` ksoftirqd/4 (NAPI can preempt to deliver)
+- RT throttling: `sched_rt_runtime_us = -1` (prevents 50ms forced sleep every 1s)
+- CPU isolation: core 4 dedicated — irqbalance stopped, userspace tasks moved off, NIC IRQ pinned
+- Memory: `mlockall(MCL_CURRENT|MCL_FUTURE)`, `MAP_LOCKED` ring
+- Note: `SO_BUSY_POLL` has no effect — we spin on `tp_status` in mmap'd memory, never call `poll()`/`recv()`
 
 ## Safety Notes
 - NEVER write to IACK (0x34) -- that's the kernel driver's job
@@ -249,14 +253,18 @@ setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)); // or TX_RING
 ```
 
 ### Measured Performance (Feb 2026)
-Hardware: CERN FECs (cfc-865-mkdev30 <-> cfc-865-mkdev16)
-Optimization: `SCHED_FIFO` (99), `isolcpus`, `mlockall`
+Hardware: CERN FECs (cfc-865-mkdev30 ↔ cfc-865-mkdev16), 1GbE direct cable, igb driver
+Kernel: 5.10.245-rt139-fecos03 (PREEMPT_RT)
+200,000 packets, no kernel bypass (no XDP/DPDK)
 
 | Metric | Value |
 |--------|-------|
-| Min RTT | ~43 µs |
-| Avg RTT | ~57 µs |
-| **One-Way Latency** | **~28.5 µs** |
+| Min RTT | 24 µs |
+| Median RTT | 25 µs |
+| P100 (Max) RTT | 78 µs |
+| Avg RTT | 30 µs |
+| **One-Way Latency (median)** | **~12.7 µs** |
+| **One-Way Latency (P100)** | **<40 µs** |
 
 ### RX Busy-Poll Hot Loop (V2)
 
@@ -299,20 +307,29 @@ bool send_packet(const uint8_t* payload, size_t len) {
 }
 ```
 
-### System Tuning Checklist
+### Runtime Tuning Checklist (both machines, reverts on reboot)
 
 ```bash
-# 1. Enable Busy Polling (Critical for RX)
-sysctl -w net.core.busy_poll=1
-sysctl -w net.core.busy_read=1
+# 1. NIC tuning (eno2)
+ethtool -C eno2 rx-usecs 0 tx-usecs 0       # disable interrupt coalescing
+ethtool -K eno2 gro off gso off tso off      # disable NIC offloads
 
-# 2. Run with Real-Time Priority and CPU Pinning
-# (Test app now accepts --cpu <N> to handle pinning internally)
-sudo ./abtrda3_test --client --count 1000 --cpu 2
+# 2. CPU isolation for core 4
+systemctl stop irqbalance
+# Move all non-NIC IRQs off core 4
+for irq in $(ls /proc/irq/ | grep -E '^[0-9]+$' | grep -v '^142$'); do
+    echo 0-3,5 > /proc/irq/$irq/smp_affinity_list 2>/dev/null
+done
+# Move userspace tasks off core 4
+for pid in $(ps -eo pid,psr | awk '$2==4 {print $1}'); do
+    taskset -apc 0-3,5 $pid 2>/dev/null
+done
 
-# 3. Disable Interrupt Coalescing
-ethtool -C eth0 rx-usecs 0 rx-frames 1
+# 3. RT scheduling: ksoftirqd/4 must be above app priority
+chrt -f -p 50 $(pgrep -x ksoftirqd/4)       # NAPI delivery thread
+echo -1 > /proc/sys/kernel/sched_rt_runtime_us  # disable RT throttling
 
-# 4. Watchdog Safety
-# App automatically terminates after 30s to allow recovery if SSH locks up.
+# 4. Run (app sets SCHED_FIFO:49 internally, watchdog auto-stops after 30s)
+sudo taskset -c 4 ./abtrda3_test --server
+sudo taskset -c 4 ./abtrda3_test --client --count 200000
 ```

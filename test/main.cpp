@@ -6,6 +6,7 @@
 
 #include "PacketMmapTx.hpp"
 #include "PacketMmapRx.hpp"
+#include "NicTuner.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 // =============================================================================
 
 constexpr const char*   kInterface  = "eno2";
+constexpr int           kCpuCore    = 4;
 constexpr std::uint16_t kEtherType  = 0x88B5;   // IEEE local experimental
 
 // FEC-A: cfc-865-mkdev30 (eno2)
@@ -253,13 +255,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // NicTuner applies all system tuning (NAPI polling, interrupt coalescing,
+    // NIC offloads, RT throttling, ksoftirqd priority, IRQ affinity) and
+    // restores originals on destruction.
+    NicTuner tuner(kInterface, kCpuCore);
+
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         std::fprintf(stderr, "[Warn] mlockall failed\n");
     }
 
-    // SCHED_FIFO:49 — below ksoftirqd/4 (SCHED_FIFO:50) so NAPI can
-    // still deliver packets to the mmap ring on this RT kernel.
-    // Requires: sudo chrt -f -p 50 $(pgrep ksoftirqd/4) on BOTH machines.
+    // SCHED_FIFO:49 — below ksoftirqd (FIFO:50, set by NicTuner) so NAPI
+    // can still deliver packets to the mmap ring on this RT kernel.
     {
         sched_param sp{};
         sp.sched_priority = 49;
