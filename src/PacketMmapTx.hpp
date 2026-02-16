@@ -27,39 +27,66 @@ public:
 
   ~PacketMmapTx() = default;
 
-  // HOT PATH function set to inline
+  // ── Copy-based send (convenience API) ────────────────────────────
   [[nodiscard, gnu::always_inline]]
   bool send(std::span<const std::uint8_t> frame) noexcept {
-    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
-
-    // This is less frequently to trigger to let the compiler optimise it away
-    if (hdr->tp_status != TP_STATUS_AVAILABLE)[[unlikely]] {
+    auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
+    if (!dst) [[unlikely]]
       return false;
-    }
+    std::memcpy(dst, frame.data(), frame.size());
+    commit();
+    return true;
+  }
 
-    std::size_t currentFrameSize = frame.size();
-    // Let the compiler also optimise it away
-    if (currentFrameSize > m_frameSize - kDataOffset)[[unlikely]]{
-      return false;
-    }
-    std::memcpy(m_nextSlot + kDataOffset, frame.data(), currentFrameSize);
-    hdr->tp_len     = static_cast<std::uint32_t>(currentFrameSize);
-    hdr->tp_snaplen = static_cast<std::uint32_t>(currentFrameSize);
+  // ── Zero-copy acquire/commit API ───────────────────────────────
+  // acquire() returns a pointer directly into the TX ring slot.
+  // Write the full Ethernet frame (dst+src+ethertype+payload) there.
+  // Call commit() when done to trigger kernel transmission.
+  // Returns nullptr if the ring slot is not available.
+  [[nodiscard, gnu::always_inline]]
+  std::uint8_t* acquire(std::uint32_t frameLen) noexcept {
+    auto* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
+
+    if (hdr->tp_status != TP_STATUS_AVAILABLE) [[unlikely]]
+      return nullptr;
+    if (frameLen > m_frameSize - kDataOffset) [[unlikely]]
+      return nullptr;
+
+    hdr->tp_len     = frameLen;
+    hdr->tp_snaplen = frameLen;
+
+    return m_nextSlot + kDataOffset;
+  }
+
+  [[gnu::always_inline]]
+  void commit() noexcept {
+    auto* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
     std::atomic_thread_fence(std::memory_order_release);
     hdr->tp_status = TP_STATUS_SEND_REQUEST;
 
     ::send(m_fd, nullptr, 0, MSG_DONTWAIT);
 
-    // Advance: one add + one branch. No multiply and no modulo.
     m_nextSlot += m_frameSize;
-    if (m_nextSlot >= m_ringEnd) {// if the next slot reaches the end
-      m_nextSlot = m_ringBase;// reset it back to the start
-    }
-    __builtin_prefetch(m_nextSlot, 0, 3);  // read, highest temporal locality
-
-    return true;
+    if (m_nextSlot >= m_ringEnd)
+      m_nextSlot = m_ringBase;
+    __builtin_prefetch(m_nextSlot, 1, 3);  // WRITE prefetch: RFO into M-state
   }
+
+  // ── Ring pre-fill (call once at startup) ─────────────────────────
+  // Stamps a fixed frame template into every AVAILABLE ring slot.
+  // The kernel never touches the data area on recycle (only tp_status),
+  // so the template persists across sends — hot path only writes the
+  // bytes that actually change.
+  void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept {
+    for (auto* slot = m_ringBase; slot < m_ringEnd; slot += m_frameSize) {
+      auto* hdr = reinterpret_cast<tpacket2_hdr*>(slot);
+      if (hdr->tp_status == TP_STATUS_AVAILABLE) {
+        std::memcpy(slot + kDataOffset, frameTemplate.data(), frameTemplate.size());
+      }
+    }
+  }
+
 private:
   // HOT: accessed every send(), packed into one cache line (32 bytes)
   std::uint8_t* m_nextSlot;    // points directly into the ring
