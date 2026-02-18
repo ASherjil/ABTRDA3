@@ -115,7 +115,6 @@ static void run_server() {
     PacketMmapRx rx(rx_cfg);
     PacketMmapTx tx(tx_cfg);
 
-    std::array<std::uint8_t, kFrameSize> buffer{};
     std::uint64_t packet_count = 0;
 
     // Outer loop checks g_running; inner loop spins tight without volatile reads
@@ -125,16 +124,20 @@ static void run_server() {
             if (rxf.data.empty()) continue;
 
             if (rxf.data.size() >= kFrameSize) {
-                // Swap MACs directly from RX ring, copy payload
-                std::memcpy(&buffer[0],  &rxf.data[6],  6);
-                std::memcpy(&buffer[6],  &rxf.data[0],  6);
-                std::memcpy(&buffer[12], &rxf.data[12], kFrameSize - 12);
+                // Zero-copy: write directly into TX ring slot
+                auto* dst = tx.acquire(kFrameSize);
+                while (!dst) {
+                    if (!g_running) { rx.release(); return; }
+                    dst = tx.acquire(kFrameSize);
+                }
+
+                // Swap MACs from RX ring directly into TX slot, copy payload
+                std::memcpy(dst,      &rxf.data[6],  6);   // dst MAC = RX src
+                std::memcpy(dst + 6,  &rxf.data[0],  6);   // src MAC = RX dst
+                std::memcpy(dst + 12, &rxf.data[12], kFrameSize - 12);
 
                 rx.release();  // free RX slot before TX syscall
-
-                while (!tx.send(buffer)) {
-                    if (!g_running) return;
-                }
+                tx.commit();
                 packet_count++;
             } else {
                 rx.release();
@@ -176,12 +179,13 @@ static void run_client(std::uint32_t count) {
     PacketMmapTx tx(tx_cfg);
     PacketMmapRx rx(rx_cfg);
 
-    // Pre-fill ethernet header
-    std::array<std::uint8_t, kFrameSize> frame{};
-    std::memcpy(&frame[0], kFecB_MAC.data(), 6);  // Dst
-    std::memcpy(&frame[6], kFecA_MAC.data(), 6);  // Src
-    frame[12] = static_cast<std::uint8_t>(kEtherType >> 8);
-    frame[13] = static_cast<std::uint8_t>(kEtherType & 0xFF);
+    // Pre-fill ethernet header into every TX ring slot (zero-copy: hot path only writes payload)
+    std::array<std::uint8_t, kFrameSize> frameTemplate{};
+    std::memcpy(&frameTemplate[0], kFecB_MAC.data(), 6);  // Dst
+    std::memcpy(&frameTemplate[6], kFecA_MAC.data(), 6);  // Src
+    frameTemplate[12] = static_cast<std::uint8_t>(kEtherType >> 8);
+    frameTemplate[13] = static_cast<std::uint8_t>(kEtherType & 0xFF);
+    tx.prefillRing(frameTemplate);
 
     std::vector<std::uint64_t> latencies_ns;
     latencies_ns.reserve(count);
@@ -191,14 +195,17 @@ static void run_client(std::uint32_t count) {
     for (std::uint32_t i = 0; i < count && g_running; ++i) {
         std::uint64_t t1 = now_ns();
 
-        // Embed sequence number in payload
-        std::uint32_t seq_net = htonl(i);
-        std::memcpy(&frame[14], &seq_net, sizeof(seq_net));
-
-        if (!tx.send(frame)) {
+        // Zero-copy: write seq number directly into TX ring slot
+        auto* dst = tx.acquire(kFrameSize);
+        if (!dst) {
             std::fprintf(stderr, "TX ring full, skipping packet %u\n", i);
             continue;
         }
+
+        // Ethernet header already in slot from prefillRing() — only write payload
+        std::uint32_t seq_net = htonl(i);
+        std::memcpy(dst + 14, &seq_net, sizeof(seq_net));
+        tx.commit();
 
         // Spin-wait for echo. Check timeout every 65536 spins (~300us).
         bool received = false;
