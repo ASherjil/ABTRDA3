@@ -6,7 +6,6 @@
 #define ABTRDA3_PACKETMMAPRX_H
 
 #include "SocketOps.hpp"
-#include <cstdint>
 #include <span>
 #include <atomic>
 #include <linux/if_packet.h>
@@ -40,7 +39,10 @@ public:
     // If we're already inside a block, return the current packet
     tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextFrame);
 
-    if ((hdr->tp_status & TP_STATUS_USER) == 0) [[likely]] {
+    // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
+    std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
+    const std::uint32_t loadedStatus = currentStatus.load(std::memory_order_acquire);
+    if ((loadedStatus & TP_STATUS_USER) == 0) [[likely]] {
       return {};
     }
 
@@ -49,7 +51,7 @@ public:
       .data = {reinterpret_cast<const std::uint8_t*>(hdr) + hdr->tp_mac, hdr->tp_snaplen},
       .sec  = hdr->tp_sec,
       .nsec = hdr->tp_nsec,
-      .status = hdr->tp_status
+      .status = loadedStatus // we reuse the previosuly loaded value
     };
   }
 
@@ -58,16 +60,18 @@ public:
   void release() noexcept {
     tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextFrame);
 
-    // 1. Mark frame as free for the Kernal to use again
-    std::atomic_thread_fence(std::memory_order_release);
-    hdr->tp_status = TP_STATUS_KERNEL;
+    // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
+    std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
+
+    // Hand it back to the kernel
+    currentStatus.store(TP_STATUS_KERNEL,std::memory_order_release);
 
     // Move along to the next frame in the buffer
     m_nextFrame += m_frameSize;
     if (m_nextFrame >= m_ringEnd) {
       m_nextFrame = m_ringBase;
     }
-    __builtin_prefetch(m_nextFrame, 0, 3);  // read, highest temporal locality
+    __builtin_prefetch(m_nextFrame, 0, 3);  // read, highest temporal locality(ONLY FOR HIGH THROUGHPUT)
   }
 
 private:

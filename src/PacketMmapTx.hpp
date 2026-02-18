@@ -6,7 +6,6 @@
 #define ABTRDA3_PACKETMMAPTX_H
 
 #include "SocketOps.hpp"
-#include <cstdint>
 #include <cstring>
 #include <span>
 #include <atomic>
@@ -45,9 +44,11 @@ public:
   // Returns nullptr if the ring slot is not available.
   [[nodiscard, gnu::always_inline]]
   std::uint8_t* acquire(std::uint32_t frameLen) noexcept {
-    auto* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
-    if (hdr->tp_status != TP_STATUS_AVAILABLE) [[unlikely]]
+    // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
+    std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
+    if (currentStatus.load(std::memory_order_acquire) != TP_STATUS_AVAILABLE) [[unlikely]]
       return nullptr;
     if (frameLen > m_frameSize - kDataOffset) [[unlikely]]
       return nullptr;
@@ -60,10 +61,11 @@ public:
 
   [[gnu::always_inline]]
   void commit() noexcept {
-    auto* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
-    std::atomic_thread_fence(std::memory_order_release);
-    hdr->tp_status = TP_STATUS_SEND_REQUEST;
+    // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
+    std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
+    currentStatus.store(TP_STATUS_SEND_REQUEST,std::memory_order_release);
 
     ::send(m_fd, nullptr, 0, MSG_DONTWAIT);
 
