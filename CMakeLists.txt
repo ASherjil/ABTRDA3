@@ -43,13 +43,14 @@ target_compile_options(abtrda3_flags INTERFACE
 )
 
 # Architecture-specific flags
-if(CMAKE_CROSSCOMPILING)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-        target_compile_options(abtrda3_flags INTERFACE -march=armv8-a)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        target_compile_options(abtrda3_flags INTERFACE -march=x86-64 -mtune=generic)
-    endif()
+# Detect from compiler path so this works even when CLion sets the compiler
+# directly without a toolchain file (CMAKE_CROSSCOMPILING not set).
+if(CMAKE_CXX_COMPILER MATCHES "aarch64-linux-gnu")
+    target_compile_options(abtrda3_flags INTERFACE -march=armv8-a)
+elseif(CMAKE_CXX_COMPILER MATCHES "x86_64-linux-gnu")
+    target_compile_options(abtrda3_flags INTERFACE -march=x86-64 -mtune=generic)
 else()
+    # Native compiler — optimise for the host CPU
     target_compile_options(abtrda3_flags INTERFACE -march=native -mtune=native)
 endif()
 
@@ -58,7 +59,7 @@ target_compile_options(abtrda3_flags INTERFACE
     $<$<CONFIG:Release>:
         -O3
         -DNDEBUG
-        -flto
+        -flto=auto
     >
 )
 
@@ -74,7 +75,7 @@ target_compile_options(abtrda3_flags INTERFACE
 
 target_link_options(abtrda3_flags INTERFACE
     $<$<CONFIG:Debug>:-fsanitize=address,undefined>
-    $<$<CONFIG:Release>:-flto>
+    $<$<CONFIG:Release>:-flto=auto>
 )
 
 # =============================================================================
