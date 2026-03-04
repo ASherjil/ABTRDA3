@@ -213,14 +213,6 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
     throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
   }
 
-  // 12. Busy-poll — spin in NAPI context on recv instead of waiting for softirq
-  {
-    int busy_us = 50;
-    ::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_us, sizeof(busy_us));
-    int prefer = 1;
-    ::setsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
-  }
-
   std::fprintf(stderr, "[AFXDPSocket] fd=%d ifindex=%d queue=%u flags=0x%x umem=%p frames=%u+%u\n",
                m_fd, m_ifindex, cfg.queueId, sxdp.sxdp_flags,
                static_cast<void*>(m_umem), m_txFrameCount, m_rxFrameCount);
