@@ -1,47 +1,32 @@
 #pragma once
 
-#include "PacketMmapTx.hpp"
-#include "PacketMmapRx.hpp"
+#include "RingConcepts.hpp"
 #include "TestConfig.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <stop_token>
 
-inline void run_server(const TestConfig& cfg, std::stop_token stop) {
-    RingConfig rx_cfg{};
-    rx_cfg.interface   = cfg.server.interface.c_str();
-    rx_cfg.direction   = RingDirection::RX;
-    rx_cfg.blockSize   = cfg.blockSize;
-    rx_cfg.blockNumber = cfg.blockNumber;
-    rx_cfg.protocol    = cfg.etherType;
-    rx_cfg.hwTimeStamp = false;
-
-    RingConfig tx_cfg{};
-    tx_cfg.interface     = cfg.server.interface.c_str();
-    tx_cfg.direction     = RingDirection::TX;
-    tx_cfg.blockSize     = cfg.blockSize;
-    tx_cfg.blockNumber   = cfg.blockNumber;
-    tx_cfg.protocol      = cfg.etherType;
-    tx_cfg.packetVersion = TPACKET_V2;
-    tx_cfg.qdiscBypass   = true;
-
-    PacketMmapRx rx(rx_cfg);
-    PacketMmapTx tx(tx_cfg);
-
+template<TxRing Tx, RxRing Rx>
+inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop) {
     std::uint64_t packet_count = 0;
 
     // Outer loop checks stop token; inner loop spins tight without atomic reads
     while (true) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
             RxFrame rxf = rx.tryReceive();
-            if (rxf.data.empty()) continue;
+            if (rxf.data.empty())[[likely]] {
+                continue;
+            }
 
             if (rxf.data.size() >= cfg.frameSize) {
                 // Zero-copy: write directly into TX ring slot
                 auto* dst = tx.acquire(cfg.frameSize);
                 while (!dst) {
-                    if (stop.stop_requested()) { rx.release(); return; }
+                    if (stop.stop_requested())[[unlikely]]{
+                        rx.release();
+                        return;
+                    }
                     dst = tx.acquire(cfg.frameSize);
                 }
 
@@ -53,7 +38,8 @@ inline void run_server(const TestConfig& cfg, std::stop_token stop) {
                 rx.release();  // free RX slot before TX syscall
                 tx.commit();
                 packet_count++;
-            } else {
+            }
+            else {
                 rx.release();
             }
         }

@@ -1,6 +1,7 @@
 # ABTRDA3 Ping-Pong Test Configuration
 
 [general]
+transport    = "af_xdp" # "packet_mmap" or "af_xdp"
 watchdog_sec = 30
 ether_type   = 0x88B5       # IEEE local experimental
 block_size   = 4096
@@ -16,3 +17,10 @@ cpu_core  = 4
 interface = "eno2"
 mac       = "20:87:56:b6:33:67"
 cpu_core  = 4
+
+[af_xdp]
+queue_id        = 0
+umem_frame_size = 4096 # UMEM frame size, must be 2048/4096
+frame_count     = 64  # total UMEM frames(split half TX/RX)
+zero_copy       = false
+need_wakeup     = true

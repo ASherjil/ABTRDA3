@@ -1,12 +1,10 @@
 #pragma once
 
-#include "PacketMmapTx.hpp"
-#include "PacketMmapRx.hpp"
+#include "RingConcepts.hpp"
 #include "TestConfig.hpp"
 
 #include <cstdio>
 #include <cstring>
-#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <stop_token>
@@ -21,28 +19,8 @@ inline std::uint64_t now_ns() noexcept {
          + static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
-inline void run_client(const TestConfig& cfg, std::uint32_t count, std::stop_token stop) {
-    RingConfig tx_cfg{};
-    tx_cfg.interface     = cfg.client.interface.c_str();
-    tx_cfg.direction     = RingDirection::TX;
-    tx_cfg.blockSize     = cfg.blockSize;
-    tx_cfg.blockNumber   = cfg.blockNumber;
-    tx_cfg.protocol      = cfg.etherType;
-    tx_cfg.packetVersion = TPACKET_V2;
-    tx_cfg.qdiscBypass   = true;
-
-    RingConfig rx_cfg{};
-    rx_cfg.interface     = cfg.client.interface.c_str();
-    rx_cfg.direction     = RingDirection::RX;
-    rx_cfg.blockSize     = cfg.blockSize;
-    rx_cfg.blockNumber   = cfg.blockNumber;
-    rx_cfg.protocol      = cfg.etherType;
-    rx_cfg.packetVersion = TPACKET_V2;
-    rx_cfg.hwTimeStamp   = false;
-
-    PacketMmapTx tx(tx_cfg);
-    PacketMmapRx rx(rx_cfg);
-
+template<TxRing Tx, RxRing Rx>
+inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t count, std::stop_token stop) {
     // Pre-fill ethernet header into every TX ring slot (zero-copy: hot path only writes payload)
     std::vector<std::uint8_t> frameTemplate(cfg.frameSize, 0);
     std::memcpy(&frameTemplate[0], cfg.server.mac.data(), 6);  // Dst = server
@@ -61,7 +39,7 @@ inline void run_client(const TestConfig& cfg, std::uint32_t count, std::stop_tok
 
         // Zero-copy: write seq number directly into TX ring slot
         auto* dst = tx.acquire(cfg.frameSize);
-        if (!dst) {
+        if (!dst)[[unlikely]] {
             std::fprintf(stderr, "TX ring full, skipping packet %u\n", i);
             continue;
         }

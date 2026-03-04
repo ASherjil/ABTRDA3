@@ -1,5 +1,6 @@
 # IDE
 .idea/
+.cache/
 
 # Build artifacts
 build/

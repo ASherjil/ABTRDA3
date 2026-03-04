@@ -1,298 +1,273 @@
-# ABTRDA3 & ABTWREN — TOML Config File Plan
+# AF_XDP Implementation Plan for ABTRDA3
 
-## Design Principle
+## Context
 
-**Libraries define structs. Applications own config files.**
+ABTRDA3 currently uses `packet_mmap` for ultra-low-latency timing event TX/RX. We're adding AF_XDP as an alternative transport to potentially achieve even lower latency. The XDP eBPF filter is **safety-critical** — the target machines boot from NFS over the same NIC, so the filter must only redirect our custom EtherType (0x88B5) to userspace and pass everything else to the kernel stack.
 
-The core ABTRDA3 library (`src/`) has **zero dependency on TOML++**. It only defines plain C++ structs (`RingConfig`, and in the future `TransportConfig` when AF_XDP lands). Applications that use ABTRDA3 — whether ABTWREN, the ping-pong test tool, or anything else — each parse their own TOML config file and populate those structs.
+**Target:** cfc-865-mkdev16/mkdev30, Debian 12 FECOS, kernel 5.10-rt, eno2 = Intel I350 (`igb` driver, native XDP, 4 queues).
 
-```
-┌─────────────────────────────────────────────┐
-│ ABTRDA3 core library (src/)                 │
-│                                             │
-│  RingConfig {                               │
-│    interface, direction, blockSize,         │
-│    blockNumber, protocol, packetVersion,    │
-│    hwTimeStamp, qdiscBypass                 │
-│  }                                          │
-│                                             │
-│  PacketMmapTx, PacketMmapRx, NicTuner,     │
-│  SocketOps                                  │
-│                                             │
-│  *** NO TOML dependency ***                 │
-└───────────────┬─────────────────────────────┘
-                │ populates struct
-        ┌───────┴───────┐
-        │               │
-        ▼               ▼
-┌──────────────┐  ┌──────────────────┐
-│ test tool    │  │ ABTWREN          │
-│ (test/)      │  │ (separate repo)  │
-│              │  │                  │
-│ Parses its   │  │ Parses its own   │
-│ own TOML     │  │ abtwren.toml     │
-│              │  │                  │
-│ toml++ dep   │  │ toml++ dep       │
-│ lives HERE   │  │ lives HERE       │
-└──────────────┘  └──────────────────┘
-```
+## Architecture
 
-## What Changes in ABTRDA3
+- **Separate classes, same hot-path API** — `AfXdpTx` / `AfXdpRx` satisfy the same `TxRing` / `RxRing` C++20 concepts as `PacketMmapTx` / `PacketMmapRx`
+- **Shared socket** — AF_XDP requires TX and RX to share one socket + UMEM on the same queue. `AfXdpSocket` handles setup; `AfXdpTx(sock)` and `AfXdpRx(sock)` attach to its rings
+- **Embedded BPF** — XDP filter compiled at build time with clang, embedded as C byte array
+- **FetchContent for libbpf** — built as static lib from source, no system package needed
+- **Compile-time selection** — `#ifdef ABTRDA3_HAS_AF_XDP`, templates constrained by concepts, zero virtual dispatch
 
-### Core library (`src/`) — NO changes needed
+## File Layout
 
-`RingConfig` already exists in `SocketOps.hpp` and is a plain struct. Applications already create it by hand. Nothing to change here.
+### New files
 
-### Test tool (`test/main.cpp`) — Add TOML config
+| File | Purpose | ~Lines |
+|------|---------|--------|
+| `src/RxFrame.hpp` | `RxFrame` struct (extracted from PacketMmapRx.hpp) | 15 |
+| `src/RingConcepts.hpp` | `TxRing`, `RxRing` C++20 concepts | 40 |
+| `src/AfXdpSocket.hpp` | `XdpConfig` struct + `AfXdpSocket` RAII class decl | 100 |
+| `src/AfXdpSocket.cpp` | Socket/UMEM/ring-mmap/BPF-load/attach/bind | 250 |
+| `src/AfXdpTx.hpp` | `AfXdpTx` class (inline hot path) | 120 |
+| `src/AfXdpTx.cpp` | Constructor (init free stack, wire pointers), move ops | 80 |
+| `src/AfXdpRx.hpp` | `AfXdpRx` class (inline hot path) | 90 |
+| `src/AfXdpRx.cpp` | Constructor (pre-fill Fill ring), move ops | 70 |
+| `src/bpf/xdp_filter.bpf.c` | XDP EtherType filter eBPF program | 50 |
+| `cmake/BpfCompile.cmake` | CMake function: `.bpf.c` → `.bpf.o` → `.h` embed | 50 |
+| `cmake/BinToHeader.cmake` | Binary-to-C-header conversion script | 40 |
+| `cmake/BuildLibbpf.cmake` | Build libbpf as CMake static library | 40 |
 
-The test tool currently has all values hardcoded:
+### Files to modify
 
-```cpp
-// Current hardcoded values in test/main.cpp:
-constexpr const char*   kInterface   = "eno2";
-constexpr int           kCpuCore     = 4;
-constexpr std::uint16_t kEtherType   = 0x88B5;
-constexpr std::array<std::uint8_t, 6> kFecA_MAC = {0xd4, 0xf5, 0x27, 0x2a, 0xa9, 0x59};
-constexpr std::array<std::uint8_t, 6> kFecB_MAC = {0x20, 0x87, 0x56, 0xb6, 0x33, 0x67};
-constexpr std::uint32_t kBlockSize   = 4096;
-constexpr std::uint32_t kBlockNumber = 64;
-```
+| File | Change |
+|------|--------|
+| `src/PacketMmapRx.hpp` | Move `RxFrame` out, include `RxFrame.hpp` |
+| `src/PacketMmapTx.hpp` | Add `static_assert(TxRing<PacketMmapTx>)` |
+| `src/CMakeLists.txt` | Add AF_XDP sources, libbpf FetchContent, BPF compile |
+| `CMakeLists.txt` | Add `ABTRDA3_ENABLE_AF_XDP` option, `enable_language(C)` |
+| `test/TestConfig.hpp` | Add `Transport` enum, `AfXdpTestConfig`, parse `[af_xdp]` |
+| `test/Client.hpp` | Template on `TxRing`/`RxRing`, take TX/RX by reference |
+| `test/Server.hpp` | Template on `TxRing`/`RxRing`, take TX/RX by reference |
+| `test/main.cpp` | Construct TX/RX in main, dispatch on transport |
+| `test/abtrda3_test.toml` | Add `transport` field and `[af_xdp]` section |
 
-These move into `test/abtrda3_test.toml`:
+## XDP eBPF Filter — Safety-Critical
 
-```toml
-[network]
-interface    = "eno2"
-ether_type   = 0x88B5
-block_size   = 4096
-block_number = 64
-frame_size   = 64
-cpu_core     = 4
+```c
+// src/bpf/xdp_filter.bpf.c — DEFAULT IS XDP_PASS (safe)
+SEC("xdp")
+int xdp_filter_ethertype(struct xdp_md *ctx) {
+    struct ethhdr *eth = (void *)(long)ctx->data;
+    if ((void *)(eth + 1) > (void *)(long)ctx->data_end)
+        return XDP_PASS;                    // too short → kernel
 
-[network.fec_a]
-mac = "d4:f5:27:2a:a9:59"
+    if (eth->h_proto != bpf_htons(target_ethertype))
+        return XDP_PASS;                    // not ours → kernel (NFS/SSH safe)
 
-[network.fec_b]
-mac = "20:87:56:b6:33:67"
-```
-
-### CMake changes
-
-toml++ is added only to the **test target**, not to the core library:
-
-```cmake
-# In test/CMakeLists.txt (not src/CMakeLists.txt!)
-FetchContent_Declare(
-    tomlplusplus
-    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-    GIT_TAG        v3.4.0
-)
-FetchContent_MakeAvailable(tomlplusplus)
-
-add_executable(abtrda3_test main.cpp)
-target_link_libraries(abtrda3_test PRIVATE abtrda3 abtrda3_flags tomlplusplus::tomlplusplus)
-```
-
-The `abtrda3` static library target in `src/CMakeLists.txt` remains untouched — no TOML link.
-
-### Test tool config parsing
-
-A small `loadConfig()` function in `test/main.cpp` (or a separate `test/Config.hpp` if preferred) parses the TOML and populates `RingConfig`:
-
-```cpp
-#include <toml++/toml.hpp>
-
-struct TestConfig {
-    std::string interface;
-    int         cpuCore;
-    std::uint16_t etherType;
-    std::array<std::uint8_t, 6> fecA_MAC;
-    std::array<std::uint8_t, 6> fecB_MAC;
-    std::uint32_t blockSize;
-    std::uint32_t blockNumber;
-    std::size_t   frameSize;
-};
-
-TestConfig loadConfig(const char* path) {
-    auto tbl = toml::parse_file(path);
-    TestConfig cfg{};
-    cfg.interface   = tbl["network"]["interface"].value_or("eno2"s);
-    cfg.cpuCore     = tbl["network"]["cpu_core"].value_or(4);
-    cfg.etherType   = static_cast<uint16_t>(tbl["network"]["ether_type"].value_or(0x88B5));
-    cfg.blockSize   = tbl["network"]["block_size"].value_or(4096u);
-    cfg.blockNumber = tbl["network"]["block_number"].value_or(64u);
-    cfg.frameSize   = tbl["network"]["frame_size"].value_or(64u);
-    cfg.fecA_MAC    = parseMac(tbl["network"]["fec_a"]["mac"].value_or(""s));
-    cfg.fecB_MAC    = parseMac(tbl["network"]["fec_b"]["mac"].value_or(""s));
-    return cfg;
+    return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
+    //                                     fallback: XDP_PASS ─────────^
 }
 ```
 
-Then `RingConfig` is populated from `TestConfig`:
+**Safety guarantees:**
+- Default action is always `XDP_PASS` — packets go to normal kernel stack
+- Only `EtherType == 0x88B5` gets redirected to AF_XDP socket
+- If XSK socket not ready → `XDP_PASS` fallback, no drops
+- Never uses `XDP_DROP` — we never discard any packet
+- `target_ethertype` configurable via libbpf global variable rewrite at load time
 
-```cpp
-RingConfig rx_cfg{};
-rx_cfg.interface   = cfg.interface.c_str();
-rx_cfg.direction   = RingDirection::RX;
-rx_cfg.blockSize   = cfg.blockSize;
-rx_cfg.blockNumber = cfg.blockNumber;
-rx_cfg.protocol    = cfg.etherType;
-// ... etc
+## AF_XDP Ring Architecture
+
+```
+                    ┌─────────────┐
+                    │   UMEM      │  Contiguous mmap'd memory
+                    │ (N frames)  │  Split: first half TX, second half RX
+                    └──────┬──────┘
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+    ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
+    │  TX Ring   │   │Completion │   │  RX Ring   │   ┌──────────┐
+    │ user→kern  │   │ kern→user │   │ kern→user  │   │Fill Ring │
+    │ (AfXdpTx)  │   │ (AfXdpTx) │   │ (AfXdpRx)  │   │user→kern │
+    └────────────┘   └───────────┘   └────────────┘   │(AfXdpRx) │
+                                                       └──────────┘
 ```
 
-## What Changes in ABTWREN
+## Key Class APIs
 
-ABTWREN does the same pattern but with a richer config file. It parses its own `abtwren.toml` and populates `RingConfig` (from ABTRDA3) plus its own application-specific structs.
-
-### `abtwren.toml` layout
-
-```toml
-[general]
-watchdog_sec = 30
-
-[network]
-interface    = "eno2"
-ether_type   = 0x88B5
-block_size   = 4096
-block_number = 64
-
-[network.tx_mac]
-mac = "d4:f5:27:2a:a9:59"    # mkdev30 (transmitter)
-
-[network.rx_mac]
-mac = "20:87:56:b6:33:67"    # mkdev16 (receiver)
-
-[transmitter]
-cpu_core = 4
-
-[transmitter.pcie]
-vendor_id = 0x10DC
-device_id = 0x0455
-bar       = 1
-
-# CTIM event subscriptions: event_id + pulser channel for 0-offset actions
-[[transmitter.ctim]]
-event_id   = 142
-pulser_idx = 24    # PIX.AMCLO-CT
-
-[[transmitter.ctim]]
-event_id   = 143
-pulser_idx = 25    # PIX.F900-CT
-
-[[transmitter.ctim]]
-event_id   = 138
-pulser_idx = 26    # PI2X.F900-CT
-
-[[transmitter.ctim]]
-event_id   = 156
-pulser_idx = 27    # PX.SCY-CT (Start Cycle)
-
-# LTIM targets: event_id + slot + delay for enriched FIRE metadata
-[[transmitter.ltim]]
-event_id = 142
-slot     = 23
-delay_ns = 50_000_000     # 50ms
-
-[[transmitter.ltim]]
-event_id = 143
-slot     = 20
-delay_ns = 10_000_000     # 10ms
-
-[[transmitter.ltim]]
-event_id = 143
-slot     = 21
-delay_ns = 100_000_000    # 100ms
-
-[[transmitter.ltim]]
-event_id = 143
-slot     = 22
-delay_ns = 900_000_000    # 900ms
-
-[[transmitter.ltim]]
-event_id = 138
-slot     = 21
-delay_ns = 100_000_000    # 100ms
-
-[[transmitter.ltim]]
-event_id = 138
-slot     = 22
-delay_ns = 900_000_000    # 900ms
-
-[receiver]
-poller_core    = 4
-processor_core = 5
-queue_capacity = 4096
-shm_name       = "/abtwren_events"
-```
-
-### ABTWREN `AppConfig` struct
+### AfXdpSocket (cold path — construction only)
 
 ```cpp
-struct AppConfig {
-    // [general]
-    int watchdogSec = 30;
+struct XdpConfig {
+    const char* interface;
+    uint32_t queueId     = 0;
+    uint32_t frameSize   = 4096;  // UMEM frame size
+    uint32_t frameCount  = 64;    // total frames (split TX/RX)
+    uint16_t etherType   = 0x88B5;
+    bool     zeroCopy    = false;
+    bool     needWakeup  = true;
+};
 
-    // [network]
-    std::string interface = "eno2";
-    std::uint16_t etherType = 0x88B5;
-    std::uint32_t blockSize = 4096;
-    std::uint32_t blockNumber = 64;
-    std::array<std::uint8_t, 6> txMac{};
-    std::array<std::uint8_t, 6> rxMac{};
-
-    // [transmitter]
-    int txCore = 4;
-    std::uint16_t pcieVendor = 0x10DC;
-    std::uint16_t pcieDevice = 0x0455;
-    int pcieBar = 1;
-    std::vector<CtimTarget> ctimTargets;
-    std::vector<LtimTarget> ltimTargets;
-
-    // [receiver]
-    int pollerCore = 4;
-    int processorCore = 5;
-    std::size_t queueCapacity = 4096;
-    std::string shmName = "/abtwren_events";
+class AfXdpSocket {
+public:
+    explicit AfXdpSocket(const XdpConfig& cfg);
+    ~AfXdpSocket();  // detaches XDP program, unmaps, closes
+    // Move-only
+    // Exposes: fd, umemBase, ring pointers, offsets, frameSize, etc.
 };
 ```
 
-### ABTWREN CMake
+**Constructor steps:**
+1. `socket(AF_XDP, SOCK_RAW, 0)`
+2. `mmap(MAP_ANONYMOUS | MAP_POPULATE)` for UMEM
+3. `setsockopt(XDP_UMEM_REG)` — register UMEM
+4. `setsockopt(XDP_TX_RING, XDP_RX_RING, XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING)`
+5. `getsockopt(XDP_MMAP_OFFSETS)` → mmap each ring
+6. Load embedded BPF object via libbpf, set `target_ethertype`
+7. `bpf_xdp_attach()` (idempotent — detect if already attached)
+8. `bpf_map_update_elem(xsks_map, queueId, fd)`
+9. `bind(fd, sockaddr_xdp{AF_XDP, ifindex, queueId})`
 
-toml++ links to `abtwren` executable only (not to `wren_transmitter` or `wren_receiver` static libs):
+### AfXdpTx (hot path — inline in header)
 
-```cmake
-FetchContent_Declare(
-    tomlplusplus
-    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-    GIT_TAG        v3.4.0
-)
-FetchContent_MakeAvailable(... tomlplusplus)
+```cpp
+class AfXdpTx {
+public:
+    explicit AfXdpTx(AfXdpSocket& sock);  // wires TX + Completion ring pointers
+    uint8_t* acquire(uint32_t frameLen) noexcept;  // pop from free stack
+    void commit() noexcept;                         // push to TX ring, sendto()
+    bool send(std::span<const uint8_t>) noexcept;   // acquire + memcpy + commit
+    void prefillRing(std::span<const uint8_t>) noexcept; // stamp all UMEM TX frames
 
-target_link_libraries(abtwren
-    PRIVATE wren_transmitter wren_receiver abtwren_flags tomlplusplus::tomlplusplus
-)
+private:
+    void reclaimCompleted() noexcept;  // drain Completion ring → free stack
+    // Hot members: umemBase, txDescs, txProducer, freeStack, fd, ringMask (~64 bytes)
+};
 ```
 
-### CLI change
+**Key difference from PacketMmapTx:** Uses a **free-stack** instead of a simple ring cursor, because the Completion ring returns frames out-of-order. `acquire()` calls `reclaimCompleted()` first to refill the free stack.
 
+### AfXdpRx (hot path — inline in header)
+
+```cpp
+class AfXdpRx {
+public:
+    explicit AfXdpRx(AfXdpSocket& sock);  // wires RX + Fill ring, pre-fills Fill ring
+    RxFrame tryReceive() noexcept;        // check RX ring producer
+    void release() noexcept;              // return frame addr to Fill ring
+
+private:
+    // Hot members: umemBase, rxDescs, rxProducer, fillDescs, fillProducer (~60 bytes)
+};
 ```
-# Before:
-sudo ./abtwren --tx
-sudo ./abtwren --rx
 
-# After:
-sudo ./abtwren --tx --config /path/to/abtwren.toml
-sudo ./abtwren --rx --config /path/to/abtwren.toml
+**Key difference from PacketMmapRx:** `release()` puts the frame address back on the **Fill ring** (so kernel can reuse it), instead of writing `TP_STATUS_KERNEL`. If the Fill ring empties, the kernel drops packets.
 
-# Falls back to ./abtwren.toml in CWD if --config is not given
+## C++20 Concepts — `src/RingConcepts.hpp`
+
+```cpp
+template<typename T>
+concept TxRing = requires(T t, std::span<const uint8_t> f, uint32_t len) {
+    { t.send(f) } noexcept -> std::same_as<bool>;
+    { t.acquire(len) } noexcept -> std::same_as<uint8_t*>;
+    { t.commit() } noexcept;
+    { t.prefillRing(f) } noexcept;
+};
+
+template<typename T>
+concept RxRing = requires(T t) {
+    { t.tryReceive() } noexcept -> std::same_as<RxFrame>;
+    { t.release() } noexcept;
+};
+
+// Verified at compile time:
+// static_assert(TxRing<PacketMmapTx> && TxRing<AfXdpTx>);
+// static_assert(RxRing<PacketMmapRx> && RxRing<AfXdpRx>);
 ```
 
-## Summary
+## Test Code Changes
 
-| Component | TOML dependency? | Config file | Who parses? |
-|-----------|-----------------|-------------|-------------|
-| ABTRDA3 core (`src/`) | No | None | N/A — just defines `RingConfig` |
-| ABTRDA3 test (`test/`) | Yes | `abtrda3_test.toml` | `test/main.cpp` |
-| ABTWREN executable | Yes | `abtwren.toml` | `src/main.cpp` via `AppConfig` |
+### TOML config addition
+```toml
+[general]
+transport    = "packet_mmap"    # or "af_xdp"
+# ... existing fields ...
 
-The key insight: **ABTRDA3 core never touches TOML**. It exposes `RingConfig` as a plain struct. Every application that uses ABTRDA3 is responsible for filling that struct however it wants — from a TOML file, from command-line args, or from hardcoded values.
+[af_xdp]
+queue_id     = 0
+zero_copy    = false
+need_wakeup  = true
+```
+
+### Templated Server/Client
+```cpp
+// Server.hpp — templates on concept, TX/RX passed by reference
+template<TxRing Tx, RxRing Rx>
+void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop);
+
+// Client.hpp — same pattern
+template<TxRing Tx, RxRing Rx>
+void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, uint32_t count, std::stop_token stop);
+```
+
+### main.cpp dispatch
+```cpp
+if (cfg.transport == Transport::PacketMmap) {
+    PacketMmapTx tx(tx_cfg);  PacketMmapRx rx(rx_cfg);
+    if (is_server) run_server(tx, rx, cfg, stop);
+    else           run_client(tx, rx, cfg, count, stop);
+}
+#ifdef ABTRDA3_HAS_AF_XDP
+else {
+    AfXdpSocket sock(xdp_cfg);
+    AfXdpTx tx(sock);  AfXdpRx rx(sock);
+    if (is_server) run_server(tx, rx, cfg, stop);
+    else           run_client(tx, rx, cfg, count, stop);
+}
+#endif
+```
+
+## Implementation Phases
+
+### Phase 1: Infrastructure (no functional change)
+1. Extract `RxFrame` → `src/RxFrame.hpp`, update includes
+2. Create `src/RingConcepts.hpp` with concepts + static_asserts
+3. Template `test/Server.hpp` and `test/Client.hpp`
+4. Update `test/main.cpp` to construct TX/RX and pass to templates
+5. **Verify:** existing packet_mmap test still builds and works
+
+### Phase 2: CMake + BPF pipeline
+1. Create `cmake/BpfCompile.cmake`, `cmake/BinToHeader.cmake`, `cmake/BuildLibbpf.cmake`
+2. Add `ABTRDA3_ENABLE_AF_XDP` option to root `CMakeLists.txt`
+3. Add FetchContent(libbpf v1.5.0) + BPF compile step to `src/CMakeLists.txt`
+4. Create `src/bpf/xdp_filter.bpf.c`
+5. **Verify:** BPF program compiles and embeds (`xdp_filter_embed.h` generated)
+
+### Phase 3: AF_XDP core classes
+1. Create `AfXdpSocket.hpp/.cpp` — UMEM + socket + BPF lifecycle
+2. Create `AfXdpTx.hpp/.cpp` — TX ring + Completion ring + free stack
+3. Create `AfXdpRx.hpp/.cpp` — RX ring + Fill ring
+4. Add sources + libbpf link to `src/CMakeLists.txt`
+5. **Verify:** library builds with `ABTRDA3_ENABLE_AF_XDP=ON`
+
+### Phase 4: Test integration
+1. Update `test/TestConfig.hpp` — Transport enum, AfXdpTestConfig
+2. Update `test/abtrda3_test.toml` — add transport + [af_xdp] section
+3. Update `test/main.cpp` — runtime dispatch
+4. **Verify:** `transport = "packet_mmap"` still works (regression)
+5. **Verify:** `transport = "af_xdp"` on eno2 between mkdev16/mkdev30
+
+## Build Dependencies
+
+| Dependency | Source | Available on build machine? |
+|-----------|--------|---------------------------|
+| libbpf v1.5.0 | FetchContent (GitHub) | N/A — fetched at build time |
+| libelf | System (`/usr/lib64/libelf.so`) | Yes |
+| zlib | System (`/usr/lib64/libz.so`) | Yes |
+| clang (BPF target) | System (`/bin/clang` v19.1.7) | Yes |
+| linux/if_xdp.h | System (`/usr/include/linux/`) | Yes |
+
+## Risks and Mitigations
+
+1. **NFS crash from bad XDP filter** — Mitigated by default `XDP_PASS`, no `XDP_DROP`, EtherType-only match, `XDP_PASS` fallback on redirect failure
+2. **libbpf CMake build fragility** — Pin to v1.5.0 tag, list exact source files
+3. **Cross-compile BPF** — BPF bytecode is arch-independent; always compiled with host clang
+4. **Kernel 5.10 features** — Avoid newer AF_XDP features (multi-buffer, tx metadata). `XDP_USE_NEED_WAKEUP` supported since 5.4
+5. **igb driver XDP support** — Intel igb supports native XDP since kernel 5.3; verified on target

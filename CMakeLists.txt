@@ -79,6 +79,19 @@ target_link_options(abtrda3_flags INTERFACE
 )
 
 # =============================================================================
+# AF_XDP Transport (optional)
+# =============================================================================
+
+option(ABTRDA3_ENABLE_AF_XDP "Enable AF_XDP transport (requires clang, libelf, zlib)" OFF)
+
+if(ABTRDA3_ENABLE_AF_XDP)
+    enable_language(C)
+    message(STATUS "AF_XDP transport: ENABLED")
+else()
+    message(STATUS "AF_XDP transport: disabled")
+endif()
+
+# =============================================================================
 # Library
 # =============================================================================
 
@@ -100,7 +113,11 @@ endif()
 
 message(STATUS "")
 message(STATUS "Targets:")
-message(STATUS "  - abtrda3      : Packet MMAP library (STATIC)")
+if(ABTRDA3_ENABLE_AF_XDP)
+    message(STATUS "  - abtrda3      : Packet MMAP + AF_XDP library (STATIC)")
+else()
+    message(STATUS "  - abtrda3      : Packet MMAP library (STATIC)")
+endif()
 if(ABTRDA3_BUILD_TESTS)
     message(STATUS "  - abtrda3_test : Ping-pong / burst test binary")
 endif()

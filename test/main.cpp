@@ -9,9 +9,16 @@
 #include "TestConfig.hpp"
 #include "Server.hpp"
 #include "Client.hpp"
+#include "SocketOps.hpp"
+#include "PacketMmapRx.hpp"
+#include "PacketMmapTx.hpp"
+#ifdef ABTRDA3_HAS_AF_XDP
+#include "AFXDPSocket.hpp"
+#include "AFXDPTx.hpp"
+#include "AFXDPRx.hpp"
+#endif
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <csignal>
@@ -129,13 +136,63 @@ int main(int argc, char* argv[]) {
                 is_server ? "Server" : "Client", cfg.watchdogSec);
     spawn_watchdog(cfg.watchdogSec);
 
-    if (is_server) {
-        std::printf("[Server] Listening on %s (Reflector)\n", role.interface.c_str());
-        run_server(cfg, g_stop.get_token());
-    } else {
-        std::printf("[Client] Sending %u packets to measure RTT\n", count);
-        run_client(cfg, count, g_stop.get_token());
-    }
 
-    return 0;
+      // ── Transport dispatch ──────────────────────────────────────────────
+      if (cfg.transport == Transport::PacketMmap) {
+          // Build packet_mmap ring configs
+          RingConfig tx_cfg{};
+          tx_cfg.interface     = role.interface.c_str();
+          tx_cfg.direction     = RingDirection::TX;
+          tx_cfg.blockSize     = cfg.blockSize;
+          tx_cfg.blockNumber   = cfg.blockNumber;
+          tx_cfg.protocol      = cfg.etherType;
+          tx_cfg.packetVersion = TPACKET_V2;
+          tx_cfg.qdiscBypass   = true;
+
+          RingConfig rx_cfg{};
+          rx_cfg.interface     = role.interface.c_str();
+          rx_cfg.direction     = RingDirection::RX;
+          rx_cfg.blockSize     = cfg.blockSize;
+          rx_cfg.blockNumber   = cfg.blockNumber;
+          rx_cfg.protocol      = cfg.etherType;
+          rx_cfg.hwTimeStamp   = false;
+
+          PacketMmapTx tx(tx_cfg);
+          PacketMmapRx rx(rx_cfg);
+
+          std::printf("[%s] Transport: packet_mmap on %s\n",
+                      is_server ? "Server" : "Client", role.interface.c_str());
+
+          if (is_server) run_server(tx, rx, cfg, g_stop.get_token());
+          else           run_client(tx, rx, cfg, count, g_stop.get_token());
+      }
+  #ifdef ABTRDA3_HAS_AF_XDP
+      else if (cfg.transport == Transport::AfXdp) {
+          XdpConfig xdp_cfg{};
+          xdp_cfg.interface  = role.interface.c_str();
+          xdp_cfg.queueId    = cfg.xdpQueueId;
+          xdp_cfg.frameSize  = cfg.xdpUmemFrameSize;
+          xdp_cfg.frameCount = cfg.xdpFrameCount;
+          xdp_cfg.etherType  = cfg.etherType;
+          xdp_cfg.zeroCopy   = cfg.xdpZeroCopy;
+          xdp_cfg.needWakeup = cfg.xdpNeedWakeup;
+
+          AFXDPSocket sock(xdp_cfg);
+          AFXDPTx tx(sock);
+          AFXDPRx rx(sock);
+
+          std::printf("[%s] Transport: af_xdp on %s (queue %u, %s mode)\n",
+                      is_server ? "Server" : "Client", role.interface.c_str(),
+                      cfg.xdpQueueId, cfg.xdpZeroCopy ? "zero-copy" : "copy");
+
+          if (is_server) run_server(tx, rx, cfg, g_stop.get_token());
+          else           run_client(tx, rx, cfg, count, g_stop.get_token());
+      }
+  #endif
+      else {
+          std::fprintf(stderr, "Error: unknown transport (AF_XDP not compiled in?)\n");
+          return 1;
+      }
+
+      return 0;
 }

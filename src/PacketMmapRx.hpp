@@ -6,17 +6,9 @@
 #define ABTRDA3_PACKETMMAPRX_H
 
 #include "SocketOps.hpp"
-#include <span>
+#include "RxFrame.hpp"
 #include <atomic>
 #include <linux/if_packet.h>
-
-
-struct RxFrame {
-  std::span<const std::uint8_t> data;
-  std::uint32_t sec;
-  std::uint32_t nsec;
-  std::uint32_t status;
-};
 
 class PacketMmapRx {
 public:
