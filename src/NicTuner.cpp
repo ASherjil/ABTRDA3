@@ -118,6 +118,34 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
 
     char path[128];
 
+    // --- 0b. Hold /dev/cpu_dma_latency at 0 to prevent deep C-states ---
+    // The kernel grants the requested latency as long as the fd stays open.
+    // C3/C6 wakeup can add 10-30µs of jitter; this keeps cores in C0/C1.
+    m_dmaLatencyFd = ::open("/dev/cpu_dma_latency", O_WRONLY);
+    if (m_dmaLatencyFd >= 0) {
+        std::int32_t lat = 0;
+        if (::write(m_dmaLatencyFd, &lat, sizeof(lat)) == sizeof(lat))
+            std::fprintf(stderr, "[NicTuner] cpu_dma_latency: 0 (C-states disabled)\n");
+    }
+
+    // --- 0c. CPU frequency governor → performance ---
+    std::snprintf(path, sizeof(path),
+                  "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpuCore);
+    auto oldGov = readFile(path);
+    if (writeFile(path, "performance"))
+        std::fprintf(stderr, "[NicTuner] CPU%d governor: %s -> performance\n",
+                     cpuCore, oldGov.c_str());
+
+    // --- 0d. Kernel busy-poll: enable NAPI polling from socket context ---
+    // net.core.busy_poll  = time (µs) to busy-poll in poll()/select()
+    // net.core.busy_read  = time (µs) to busy-poll in blocking recv()
+    auto oldBusyPoll = readFile("/proc/sys/net/core/busy_poll");
+    auto oldBusyRead = readFile("/proc/sys/net/core/busy_read");
+    writeFile("/proc/sys/net/core/busy_poll", "50");
+    writeFile("/proc/sys/net/core/busy_read", "50");
+    std::fprintf(stderr, "[NicTuner] net.core.busy_poll: %s -> 50, busy_read: %s -> 50\n",
+                 oldBusyPoll.c_str(), oldBusyRead.c_str());
+
     // --- 1. Interrupt coalescing: zero delay ---
     if (m_ethtoolFd >= 0) {
         ethtool_coalesce ec{};
@@ -147,6 +175,35 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
         disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
         disable(ETHTOOL_GGSO, ETHTOOL_SGSO, "GSO");
         disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
+
+        // --- 2b. RSS: steer all RX traffic to queue 0 ---
+        // First, query the indirection table size
+        ethtool_rxnfc rxnfc{};
+        rxnfc.cmd = ETHTOOL_GRXRINGS;
+        std::uint32_t numQueues = 0;
+        if (ethtoolIoctl(m_ethtoolFd, interface, &rxnfc))
+            numQueues = static_cast<std::uint32_t>(rxnfc.data);
+
+        if (numQueues > 0) {
+            // Get current table size
+            ethtool_rxfh_indir indirHdr{};
+            indirHdr.cmd = ETHTOOL_GRXFHINDIR;
+            indirHdr.size = 0;  // query size first
+            ethtoolIoctl(m_ethtoolFd, interface, &indirHdr);
+
+            if (indirHdr.size > 0) {
+                // Allocate and fill: all entries point to queue 0
+                auto bytes = sizeof(ethtool_rxfh_indir) + indirHdr.size * sizeof(std::uint32_t);
+                auto* indir = static_cast<ethtool_rxfh_indir*>(std::calloc(1, bytes));
+                indir->cmd  = ETHTOOL_SRXFHINDIR;
+                indir->size = indirHdr.size;
+                // All entries already 0 from calloc → all traffic to queue 0
+
+                if (ethtoolIoctl(m_ethtoolFd, interface, indir))
+                    std::fprintf(stderr, "[NicTuner] RSS: all %u buckets -> queue 0\n", indir->size);
+                std::free(indir);
+            }
+        }
     }
 
     // --- 3. RT throttling: disable 50ms forced sleep ---
@@ -213,6 +270,7 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
 // =============================================================================
 
 NicTuner::~NicTuner() {
+    if (m_dmaLatencyFd >= 0) ::close(m_dmaLatencyFd);  // restores default C-state policy
     if (m_ethtoolFd >= 0) ::close(m_ethtoolFd);
     std::fprintf(stderr, "[NicTuner] Done. Settings persist until reboot.\n");
 }

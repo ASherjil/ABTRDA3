@@ -16,7 +16,8 @@ AFXDPRx::AFXDPRx(const AFXDPSocket& sock)
     m_fillProdPtr{sock.fillRing.producer},
     m_fillMask{sock.fillRing.mask},
     m_fillFlags{sock.fillRing.flags},
-    m_fd{sock.fd()} {
+    m_fd{sock.fd()},
+    m_needWakeup{sock.needWakeup()} {
 
   // Pre-fill the Fill ring with RX frame addresses.
   // RX frames use the second half of UMEM.
@@ -47,6 +48,7 @@ AFXDPRx::AFXDPRx(AFXDPRx&& other) noexcept
       m_fillMask{std::exchange(other.m_fillMask, 0)},
       m_fillFlags{std::exchange(other.m_fillFlags, nullptr)},
       m_fd{std::exchange(other.m_fd, -1)},
+      m_needWakeup{other.m_needWakeup},
       m_pendingAddr{other.m_pendingAddr} {}
 
 AFXDPRx& AFXDPRx::operator=(AFXDPRx&& other) noexcept {
@@ -63,6 +65,7 @@ AFXDPRx& AFXDPRx::operator=(AFXDPRx&& other) noexcept {
     m_fillMask    = std::exchange(other.m_fillMask, 0);
     m_fillFlags   = std::exchange(other.m_fillFlags, nullptr);
     m_fd          = std::exchange(other.m_fd, -1);
+    m_needWakeup  = other.m_needWakeup;
     m_pendingAddr = other.m_pendingAddr;
   }
   return *this;

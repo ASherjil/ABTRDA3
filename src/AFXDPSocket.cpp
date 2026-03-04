@@ -155,10 +155,14 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
 
 
   // 9. Attach the XDP program to the network interface
-  // Try native (driver) mode first — fastest, runs inside the NIC driver
-  // before sk_buff allocation. If the driver doesn't support it (like eno1),
-  // fall back to generic (SKB) mode — runs later in the stack but still
-  // faster than packet_mmap.
+  //
+  // We always use generic/SKB mode when in copy mode. Native/DRV mode on igb
+  // (kernel 5.10) causes __dev_direct_xmit() to find TX queues stopped after
+  // the driver reconfigures them for XDP, returning EBUSY on every sendto().
+  // SKB mode still runs the XDP filter in the kernel stack (before socket
+  // delivery) and leaves the driver's TX path untouched.
+  //
+  // For zero-copy mode (future), we'd need native/DRV mode + driver XSK support.
   m_ifindex = static_cast<int>(::if_nametoindex(cfg.interface));
   if (m_ifindex == 0)
     throw std::system_error(errno, std::generic_category(), "if_nametoindex");
@@ -174,13 +178,12 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
     return e;
   };
 
-  m_xdpFlags = XDP_FLAGS_DRV_MODE;
+  m_xdpFlags = cfg.zeroCopy ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE;
   int err = tryAttach(m_xdpFlags);
   if (err) {
-    m_xdpFlags = XDP_FLAGS_SKB_MODE;
-    err = tryAttach(m_xdpFlags);
-    if (err)
-      throw std::runtime_error("bpf_xdp_attach failed (native and generic)");
+    throw std::runtime_error(
+      std::string("bpf_xdp_attach failed in ") +
+      (cfg.zeroCopy ? "native/DRV" : "generic/SKB") + " mode");
   }
   m_xdpAttached = true;
 
@@ -209,6 +212,20 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
   if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) < 0) {
     throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
   }
+
+  // 12. Busy-poll — spin in NAPI context on recv instead of waiting for softirq
+  {
+    int busy_us = 50;
+    ::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_us, sizeof(busy_us));
+    int prefer = 1;
+    ::setsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+  }
+
+  std::fprintf(stderr, "[AFXDPSocket] fd=%d ifindex=%d queue=%u flags=0x%x umem=%p frames=%u+%u\n",
+               m_fd, m_ifindex, cfg.queueId, sxdp.sxdp_flags,
+               static_cast<void*>(m_umem), m_txFrameCount, m_rxFrameCount);
+  std::fprintf(stderr, "[AFXDPSocket] XDP attached: %s mode\n",
+               (m_xdpFlags == XDP_FLAGS_DRV_MODE) ? "native/DRV" : "generic/SKB");
 }
 
 AFXDPSocket::AFXDPSocket(AFXDPSocket&& other) noexcept

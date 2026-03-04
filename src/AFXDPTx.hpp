@@ -78,12 +78,17 @@ public:
     std::atomic_ref<std::uint32_t> prod(*m_txProdPtr);
     prod.store(m_txProd, std::memory_order_release);
 
-    // Only kick the kernel when it signals it has gone idle.
-    // In steady-state sending, the kernel stays in its NAPI poll loop
-    // and the flag stays clear — no syscall needed (~300ns saved per packet).
-    if (std::atomic_ref<std::uint32_t>(*m_txFlags).load(std::memory_order_relaxed)
-        & XDP_RING_NEED_WAKEUP) [[unlikely]]
-      ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+    // Kick the kernel to transmit. If NEED_WAKEUP is supported by the driver,
+    // only kick when the kernel signals it has gone idle (~300ns saved per packet).
+    // Without driver support, always kick.
+    if (!m_needWakeup ||
+        (std::atomic_ref<std::uint32_t>(*m_txFlags).load(std::memory_order_relaxed)
+         & XDP_RING_NEED_WAKEUP)) [[unlikely]] {
+      int rc = ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+      if (rc < 0) [[unlikely]]
+        std::fprintf(stderr, "[TX DEBUG] sendto fd=%d errno=%d (%s) prod=%u addr=%lu len=%u\n",
+                     m_fd, errno, std::strerror(errno), m_txProd, m_pendingAddr, m_pendingLen);
+    }
   }
 
   void prefillRing(std::span<const std::uint8_t> frameTemplate) const noexcept {
@@ -121,6 +126,7 @@ private:
   std::uint32_t  m_freeTop{};        // free stack pointer (next pop position)
   int            m_fd{-1};           // socket fd (for sendto kick)
   std::uint32_t* m_txFlags{};        // TX ring flags (kernel sets XDP_RING_NEED_WAKEUP here)
+  bool           m_needWakeup{};     // driver supports NEED_WAKEUP optimisation
   std::uint64_t  m_pendingAddr{};    // frame addr from last acquire()
   std::uint32_t  m_pendingLen{};     // frame len from last acquire()
 

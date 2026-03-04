@@ -64,9 +64,11 @@ public:
         std::atomic_ref<std::uint32_t> fprod(*m_fillProdPtr);
         fprod.store(m_fillProd, std::memory_order_release);
 
-        // Only wake the kernel if it has gone idle waiting for fill buffers.
-        if (std::atomic_ref<std::uint32_t>(*m_fillFlags).load(std::memory_order_relaxed)
-            & XDP_RING_NEED_WAKEUP) [[unlikely]]
+        // Wake the kernel to refill RX buffers. With NEED_WAKEUP driver support,
+        // only kick when idle. Without it, always kick.
+        if (!m_needWakeup ||
+            (std::atomic_ref<std::uint32_t>(*m_fillFlags).load(std::memory_order_relaxed)
+             & XDP_RING_NEED_WAKEUP)) [[unlikely]]
           ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
     }
 private:
@@ -84,6 +86,7 @@ private:
   std::uint32_t  m_fillMask{};       // Fill ring index mask
   std::uint32_t* m_fillFlags{};      // Fill ring flags (kernel sets XDP_RING_NEED_WAKEUP)
   int            m_fd{-1};           // socket fd (for recvfrom wakeup)
+  bool           m_needWakeup{};     // driver supports NEED_WAKEUP optimisation
 
   std::uint64_t  m_pendingAddr{};    // frame addr to recycle on release()
 };

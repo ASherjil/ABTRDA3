@@ -20,7 +20,7 @@ struct XdpConfig {
   std::uint32_t  frameCount  = 64;     // total UMEM frames (split half TX, half RX)
   std::uint16_t  etherType   = 0x88B5;
   bool           zeroCopy    = false;
-  bool           needWakeup  = true;
+  bool           needWakeup  = false;  // requires driver ndo_xsk_wakeup (igb 5.10 lacks it)
 };
 
 // ── Ring pointer bundles ─────────────────────────────────────────────────

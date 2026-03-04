@@ -12,4 +12,5 @@ public:
 
 private:
     int m_ethtoolFd = -1;
+    int m_dmaLatencyFd = -1;  // /dev/cpu_dma_latency — held open to keep C-states disabled
 };

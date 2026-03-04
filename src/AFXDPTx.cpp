@@ -13,6 +13,7 @@ AFXDPTx::AFXDPTx(const AFXDPSocket& sock)
     m_txMask{sock.txRing.mask},
     m_fd{sock.fd()},
     m_txFlags{sock.txRing.flags},
+    m_needWakeup{sock.needWakeup()},
     m_compDescs{sock.compRing.descs},
     m_compProdPtr{sock.compRing.producer},
     m_compConsPtr{sock.compRing.consumer},
@@ -42,6 +43,7 @@ AFXDPTx::AFXDPTx(AFXDPTx&& other) noexcept
     m_freeTop{std::exchange(other.m_freeTop, 0)},
     m_fd{std::exchange(other.m_fd, -1)},
     m_txFlags{std::exchange(other.m_txFlags, nullptr)},
+    m_needWakeup{other.m_needWakeup},
     m_pendingAddr{other.m_pendingAddr},
     m_pendingLen{other.m_pendingLen},
     m_compDescs{std::exchange(other.m_compDescs, nullptr)},
@@ -64,6 +66,7 @@ AFXDPTx& AFXDPTx::operator=(AFXDPTx&& other) noexcept {
       m_freeTop       = std::exchange(other.m_freeTop, 0);
       m_fd            = std::exchange(other.m_fd, -1);
       m_txFlags       = std::exchange(other.m_txFlags, nullptr);
+      m_needWakeup    = other.m_needWakeup;
       m_pendingAddr   = other.m_pendingAddr;
       m_pendingLen    = other.m_pendingLen;
       m_compDescs     = std::exchange(other.m_compDescs, nullptr);

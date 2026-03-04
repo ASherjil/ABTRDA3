@@ -103,6 +103,15 @@ SocketOps::SocketOps(const RingConfig& ringConfig) {
 	::setsockopt(m_fd, SOL_PACKET, PACKET_TIMESTAMP, &val, sizeof(val));
   }
 
+  // Step 7: Busy-poll — let recv()/poll() spin in NAPI context instead of
+  // waiting for softirq. Eliminates interrupt→softirq→wakeup latency (~3-8µs).
+  {
+    int busy_us = 50;  // µs to busy-poll before blocking
+    ::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_us, sizeof(busy_us));
+    int prefer = 1;
+    ::setsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+  }
+
 }
 
 SocketOps::SocketOps(SocketOps&& other) noexcept
