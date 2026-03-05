@@ -21,6 +21,7 @@ struct TestConfig {
   std::uint32_t blockNumber;     // packet_mmap only
   std::uint32_t frameSize;       // Ethernet frame size (both transports)
   int           watchdogSec;
+  bool          skipNicTuner = false;  // skip NicTuner (safe for NFS-boot interfaces)
   RoleConfig    server;
   RoleConfig    client;
 
@@ -68,7 +69,8 @@ inline TestConfig loadConfig(const char* path) {
   cfg.blockSize   = static_cast<std::uint32_t>(tbl["general"]["block_size"].value_or(4096));
   cfg.blockNumber = static_cast<std::uint32_t>(tbl["general"]["block_number"].value_or(64));
   cfg.frameSize   = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
-  cfg.watchdogSec = tbl["general"]["watchdog_sec"].value_or(30);
+  cfg.watchdogSec    = tbl["general"]["watchdog_sec"].value_or(30);
+  cfg.skipNicTuner   = tbl["general"]["skip_nic_tuner"].value_or(false);
 
   cfg.server = loadRole(tbl, "server");
   cfg.client = loadRole(tbl, "client");

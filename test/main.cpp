@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <thread>
 #include <chrono>
+#include <optional>
 
 // =============================================================================
 // Global stop source — single cancellation point for signal + watchdog
@@ -61,6 +62,11 @@ static void spawn_watchdog(int timeout_sec) {
             std::fprintf(stderr, "\n[Watchdog] %ds timeout. Stopping...\n", timeout_sec);
             g_stop.request_stop();
         }
+
+        // Hard exit if graceful shutdown hangs (e.g. bpf_xdp_detach blocks)
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        std::fprintf(stderr, "[Watchdog] Graceful shutdown stuck. Force exit.\n");
+        std::_Exit(0);
     }).detach();
 }
 
@@ -113,12 +119,31 @@ int main(int argc, char* argv[]) {
 
     // NicTuner applies all system tuning (NAPI polling, interrupt coalescing,
     // NIC offloads, RT throttling, ksoftirqd priority, IRQ affinity) and
-    // restores originals on destruction.
-    NicTuner tuner(role.interface.c_str(), role.cpuCore);
+    // restores originals on destruction. Skipped for NFS-boot interfaces.
+    std::optional<NicTuner> tuner;
+    if (!cfg.skipNicTuner) {
+        tuner.emplace(role.interface.c_str(), role.cpuCore);
+    } else {
+        std::fprintf(stderr, "[Config] NicTuner skipped (skip_nic_tuner = true)\n");
+    }
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         std::fprintf(stderr, "[Warn] mlockall failed\n");
     }
+
+    std::signal(SIGINT, sigint_handler);
+
+    // Spawn watchdog BEFORE SCHED_FIFO. The watchdog thread inherits the
+    // current (normal) scheduling policy so it can immediately migrate to
+    // core 0 and sleep. If we set FIFO first, the watchdog inherits FIFO:49
+    // on the same core and may never get CPU time to run its setup.
+    std::printf("[%s] Watchdog: auto-shutdown in %d seconds\n",
+                is_server ? "Server" : "Client", cfg.watchdogSec);
+    spawn_watchdog(cfg.watchdogSec);
+
+    // Brief yield so the watchdog thread runs its setup (move to core 0,
+    // drop to SCHED_OTHER) before we go FIFO and never yield again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // SCHED_FIFO:49 — below ksoftirqd (FIFO:50, set by NicTuner) so NAPI
     // can still deliver packets to the mmap ring on this RT kernel.
@@ -129,12 +154,6 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "[Warn] SCHED_FIFO:49 failed: %s\n", std::strerror(errno));
         }
     }
-
-    std::signal(SIGINT, sigint_handler);
-
-    std::printf("[%s] Watchdog: auto-shutdown in %d seconds\n",
-                is_server ? "Server" : "Client", cfg.watchdogSec);
-    spawn_watchdog(cfg.watchdogSec);
 
 
       // ── Transport dispatch ──────────────────────────────────────────────

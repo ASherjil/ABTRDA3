@@ -1,21 +1,22 @@
 # ABTRDA3 Ping-Pong Test Configuration
 
 [general]
-transport    = "af_xdp" # "packet_mmap" or "af_xdp"
+transport    = "packet_mmap" # "packet_mmap" or "af_xdp"
 watchdog_sec = 30
 ether_type   = 0x88B5       # IEEE local experimental
 block_size   = 4096
 block_number = 64
 frame_size   = 64            # Minimum ethernet frame
+skip_nic_tuner = true       # set true for NFS-boot interfaces (e.g. eno1)
 
-[server]                     # cfc-865-mkdev16 (runs --server)
-interface = "eno2"
-mac       = "20:87:56:b6:33:67"
+[server]
+interface = "eno1"
+mac       = "20:87:56:b6:6a:27"
 cpu_core  = 4
 
-[client]                     # cfc-865-mkdev30 (runs --client)
-interface = "eno2"
-mac       = "d4:f5:27:2a:a9:59"
+[client]
+interface = "eno1"
+mac       = "d4:f5:27:2a:69:f1"
 cpu_core  = 4
 
 [af_xdp]
