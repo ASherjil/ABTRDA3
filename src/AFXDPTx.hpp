@@ -84,10 +84,12 @@ public:
     if (!m_needWakeup ||
         (std::atomic_ref<std::uint32_t>(*m_txFlags).load(std::memory_order_relaxed)
          & XDP_RING_NEED_WAKEUP)) [[unlikely]] {
-      int rc = ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-      if (rc < 0) [[unlikely]]
-        std::fprintf(stderr, "[TX DEBUG] sendto fd=%d errno=%d (%s) prod=%u addr=%lu len=%u\n",
-                     m_fd, errno, std::strerror(errno), m_txProd, m_pendingAddr, m_pendingLen);
+      // Retry on EAGAIN/EBUSY — kernel TX queue momentarily full.
+      // Reclaim completed frames between retries to free ring space.
+      while (::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0) < 0) {
+        if (errno != EAGAIN && errno != EBUSY) [[unlikely]] break;
+        reclaimCompleted();
+      }
     }
   }
 

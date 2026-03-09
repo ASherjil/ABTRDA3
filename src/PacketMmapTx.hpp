@@ -67,7 +67,10 @@ public:
     std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
     currentStatus.store(TP_STATUS_SEND_REQUEST,std::memory_order_release);
 
-    ::send(m_fd, nullptr, 0, MSG_DONTWAIT);
+    // Retry on EAGAIN/EBUSY — kernel TX queue momentarily full
+    while (::send(m_fd, nullptr, 0, MSG_DONTWAIT) < 0) {
+      if (errno != EAGAIN && errno != EBUSY) [[unlikely]] break;
+    }
 
     m_nextSlot += m_frameSize;
     if (m_nextSlot >= m_ringEnd)

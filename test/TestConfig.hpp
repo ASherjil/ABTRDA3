@@ -22,6 +22,8 @@ struct TestConfig {
   std::uint32_t frameSize;       // Ethernet frame size (both transports)
   int           watchdogSec;
   bool          skipNicTuner = false;  // skip NicTuner (safe for NFS-boot interfaces)
+  std::uint32_t sendIntervalUs = 0;   // µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
+  std::string   outputPath;           // latency output file (empty = no file)
   RoleConfig    server;
   RoleConfig    client;
 
@@ -71,6 +73,8 @@ inline TestConfig loadConfig(const char* path) {
   cfg.frameSize   = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
   cfg.watchdogSec    = tbl["general"]["watchdog_sec"].value_or(30);
   cfg.skipNicTuner   = tbl["general"]["skip_nic_tuner"].value_or(false);
+  cfg.sendIntervalUs = static_cast<std::uint32_t>(tbl["general"]["send_interval_us"].value_or(0));
+  cfg.outputPath     = tbl["general"]["output"].value_or(std::string{});
 
   cfg.server = loadRole(tbl, "server");
   cfg.client = loadRole(tbl, "client");

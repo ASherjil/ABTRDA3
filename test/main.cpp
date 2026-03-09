@@ -182,8 +182,13 @@ int main(int argc, char* argv[]) {
           std::printf("[%s] Transport: packet_mmap on %s\n",
                       is_server ? "Server" : "Client", role.interface.c_str());
 
-          if (is_server) run_server(tx, rx, cfg, g_stop.get_token());
-          else           run_client(tx, rx, cfg, count, g_stop.get_token());
+          if (is_server) {
+              run_server(tx, rx, cfg, g_stop.get_token());
+          } else {
+              run_client(tx, rx, cfg, count, g_stop.get_token());
+              std::fflush(stdout);
+              std::_Exit(0);  // skip destructors — close() can block on same-machine loopback
+          }
       }
   #ifdef ABTRDA3_HAS_AF_XDP
       else if (cfg.transport == Transport::AfXdp) {
@@ -204,8 +209,13 @@ int main(int argc, char* argv[]) {
                       is_server ? "Server" : "Client", role.interface.c_str(),
                       cfg.xdpQueueId, cfg.xdpZeroCopy ? "zero-copy" : "copy");
 
-          if (is_server) run_server(tx, rx, cfg, g_stop.get_token());
-          else           run_client(tx, rx, cfg, count, g_stop.get_token());
+          if (is_server) {
+              run_server(tx, rx, cfg, g_stop.get_token());
+          } else {
+              run_client(tx, rx, cfg, count, g_stop.get_token());
+              std::fflush(stdout);
+              std::_Exit(0);  // skip destructors — synchronize_rcu() in xsk_release() blocks on RT kernels
+          }
       }
   #endif
       else {

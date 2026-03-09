@@ -272,6 +272,13 @@ AFXDPSocket::~AFXDPSocket() {
   cleanup();
 }
 
+void AFXDPSocket::detachXdp() noexcept {
+  if (m_xdpAttached && m_ifindex > 0) {
+    bpf_xdp_detach(m_ifindex, m_xdpFlags, nullptr);
+    m_xdpAttached = false;
+  }
+}
+
 void AFXDPSocket::cleanup() noexcept {
   if (m_xdpAttached && m_ifindex > 0)
     bpf_xdp_detach(m_ifindex, m_xdpFlags, nullptr);

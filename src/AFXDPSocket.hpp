@@ -75,6 +75,10 @@ public:
   std::uint32_t  rxFrames() const noexcept;
   bool           needWakeup() const noexcept;
 
+  // Detach the XDP BPF program only — no munmap, no close.
+  // Use before _Exit(0) when the full destructor would block.
+  void detachXdp() noexcept;
+
   // Helper functions - static
   static void* mapRing(int fd, std::size_t size, off_t pgoff);
   static void  wireAddrRing(void* base, const xdp_ring_offset& off, std::uint32_t size, XdpAddrRing& ring);

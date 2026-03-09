@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.21)
 project(ABTRDA3
         VERSION 0.1.0
         DESCRIPTION "packet_mmap TX/RX for WREN timing sidecar"
-        LANGUAGES CXX
+        LANGUAGES CXX C
 )
 
 # =============================================================================
@@ -85,7 +85,6 @@ target_link_options(abtrda3_flags INTERFACE
 option(ABTRDA3_ENABLE_AF_XDP "Enable AF_XDP transport (requires clang, libelf, zlib)" OFF)
 
 if(ABTRDA3_ENABLE_AF_XDP)
-    enable_language(C)
     message(STATUS "AF_XDP transport: ENABLED")
 else()
     message(STATUS "AF_XDP transport: disabled")

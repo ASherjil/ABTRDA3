@@ -2,26 +2,34 @@
 
 [general]
 transport    = "packet_mmap" # "packet_mmap" or "af_xdp"
-watchdog_sec = 30
+watchdog_sec = 50000000
 ether_type   = 0x88B5       # IEEE local experimental
 block_size   = 4096
-block_number = 64
+block_number = 256
 frame_size   = 64            # Minimum ethernet frame
-skip_nic_tuner = true       # set true for NFS-boot interfaces (e.g. eno1)
+skip_nic_tuner = false       # set true for NFS-boot interfaces (e.g. eno1)
+send_interval_us = 1000     # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
+output       = "/tmp/latencies.txt"  # latency output file (empty string = no file)
 
 [server]
-interface = "eno1"
-mac       = "20:87:56:b6:6a:27"
+interface = "eno2"
+mac       = "20:87:56:b6:33:67"
 cpu_core  = 4
 
 [client]
-interface = "eno1"
-mac       = "d4:f5:27:2a:69:f1"
+interface = "eno2"
+mac       = "d4:f5:27:2a:a9:59"
 cpu_core  = 4
 
 [af_xdp]
 queue_id        = 0
-umem_frame_size = 4096 # UMEM frame size, must be 2048/4096
-frame_count     = 64  # total UMEM frames(split half TX/RX)
+umem_frame_size = 2048 # UMEM frame size, must be 2048/4096
+frame_count     = 512  # total UMEM frames(split half TX/RX)
 zero_copy       = false
 need_wakeup     = true   # skip sendto() when kernel is actively draining TX ring
+
+# Server (terminal 1):
+# sudo taskset -c 4 ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
+
+# Client (terminal 2):
+# sudo taskset -c 4 ./abtrda3_test --client --count 50000000 --config ../../../test/abtrda3_test.toml
