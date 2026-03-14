@@ -5,3 +5,6 @@
 # Build artifacts
 build/
 cmake-build-*/
+
+# Latency analysis — track plots and scripts, not raw data
+test/latency_analysis/*.txt

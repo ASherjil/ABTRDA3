@@ -66,10 +66,9 @@ public:
 
         // Wake the kernel to refill RX buffers. With NEED_WAKEUP driver support,
         // only kick when idle. Without it, always kick.
-        if (!m_needWakeup ||
-            (std::atomic_ref<std::uint32_t>(*m_fillFlags).load(std::memory_order_relaxed)
-             & XDP_RING_NEED_WAKEUP)) [[unlikely]]
-          ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+        if ((std::atomic_ref<std::uint32_t>(*m_fillFlags).load(std::memory_order_relaxed) & XDP_RING_NEED_WAKEUP) || !m_needWakeup) {
+            ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+        }
     }
 private:
   // ── Hot members ──────────────────────────────────────────────────────

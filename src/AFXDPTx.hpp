@@ -81,9 +81,7 @@ public:
     // Kick the kernel to transmit. If NEED_WAKEUP is supported by the driver,
     // only kick when the kernel signals it has gone idle (~300ns saved per packet).
     // Without driver support, always kick.
-    if (!m_needWakeup ||
-        (std::atomic_ref<std::uint32_t>(*m_txFlags).load(std::memory_order_relaxed)
-         & XDP_RING_NEED_WAKEUP)) [[unlikely]] {
+    if ((std::atomic_ref<std::uint32_t>(*m_txFlags).load(std::memory_order_relaxed) & XDP_RING_NEED_WAKEUP) || !m_needWakeup) {
       // Retry on EAGAIN/EBUSY — kernel TX queue momentarily full.
       // Reclaim completed frames between retries to free ring space.
       while (::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0) < 0) {
