@@ -32,7 +32,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::vector<std::uint64_t> latencies_ns;
     latencies_ns.reserve(count);
 
-    constexpr std::uint64_t kTimeoutNs = 1'000'000'000; // 1 second
+    constexpr std::uint64_t kTimeoutNs = 2'000'000; // 2ms
 
     // Pacing: use CLOCK_MONOTONIC absolute sleeps for drift-free timing
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
@@ -65,21 +65,28 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         // Ethernet header already in slot from prefillRing() — only write payload
         std::uint32_t seq_net = htonl(i);
         std::memcpy(dst + 14, &seq_net, sizeof(seq_net));
-        tx.commit();
+        tx.commit(); // send the frame
 
-        // Spin-wait for echo. Check timeout every 65536 spins (~300us).
+        // Spin-wait for echo with matching sequence number.
+        // Discard stale echoes and outgoing copies (packet_mmap RX sees TX copies).
         bool received = false;
         std::uint32_t spins = 0;
 
         while (true) {
             RxFrame rxf = rx.tryReceive();
-            if (!rxf.data.empty()) {
-                if (rxf.data.size() >= cfg.frameSize) {
-                    std::uint64_t t2 = now_ns();
-                    latencies_ns.push_back(t2 - t1);
-                    received = true;
-                    rx.release();
-                    break;
+            if (!rxf.data.empty()) [[unlikely]]{
+                if (rxf.data.size() >= cfg.frameSize)[[likely]] {
+                    // Verify sequence number matches current packet
+                    std::uint32_t rx_seq;
+                    std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
+                    if (rx_seq == seq_net)[[likely]] {
+                        rx.release();
+                        std::uint64_t t2 = now_ns();
+                        latencies_ns.push_back(t2 - t1);
+                        received = true;
+                        break;
+                    }
+                    // Wrong sequence — stale echo or outgoing copy, discard
                 }
                 rx.release();
             }
