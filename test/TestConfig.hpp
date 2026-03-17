@@ -12,6 +12,7 @@ struct RoleConfig {
   std::string   interface;
   std::array<std::uint8_t, 6> mac;
   int           cpuCore;
+  std::uint32_t xdpQueueId = 0;   // AF_XDP queue to bind (per-interface, e.g. ntuple steered queue)
 };
 
 struct TestConfig {
@@ -30,11 +31,9 @@ struct TestConfig {
   std::uint32_t mmapBlockSize   = 4096;
   std::uint32_t mmapBlockNumber = 512;
 
-  // AF_XDP-specific
-  std::uint32_t xdpQueueId       = 0;
+  // AF_XDP-specific (mode auto-detected: native+zerocopy → native+copy → generic+copy)
   std::uint32_t xdpUmemFrameSize = 4096;
   std::uint32_t xdpFrameCount    = 64;
-  bool          xdpZeroCopy      = false;
   bool          xdpNeedWakeup    = true;
 };
 
@@ -56,6 +55,7 @@ inline RoleConfig loadRole(const toml::table& tbl, const char* role) {
     rc.interface = tbl[role]["interface"].value_or("eno2"s);
     rc.mac       = parseMac(tbl[role]["mac"].value_or(""s));
     rc.cpuCore   = tbl[role]["cpu_core"].value_or(4);
+    rc.xdpQueueId = static_cast<std::uint32_t>(tbl[role]["xdp_queue_id"].value_or(0));
     return rc;
 }
 
@@ -88,10 +88,8 @@ inline TestConfig loadConfig(const char* path) {
   cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));
 
   // AF_XDP settings
-  cfg.xdpQueueId       = static_cast<std::uint32_t>(tbl["af_xdp"]["queue_id"].value_or(0));
   cfg.xdpUmemFrameSize = static_cast<std::uint32_t>(tbl["af_xdp"]["umem_frame_size"].value_or(4096));
   cfg.xdpFrameCount    = static_cast<std::uint32_t>(tbl["af_xdp"]["frame_count"].value_or(64));
-  cfg.xdpZeroCopy      = tbl["af_xdp"]["zero_copy"].value_or(false);
   cfg.xdpNeedWakeup    = tbl["af_xdp"]["need_wakeup"].value_or(true);
 
   return cfg;

@@ -209,20 +209,19 @@ int main(int argc, char* argv[]) {
       else if (cfg.transport == Transport::AfXdp) {
           XdpConfig xdp_cfg{};
           xdp_cfg.interface  = role.interface.c_str();
-          xdp_cfg.queueId    = cfg.xdpQueueId;
+          xdp_cfg.queueId    = role.xdpQueueId;
           xdp_cfg.frameSize  = cfg.xdpUmemFrameSize;
           xdp_cfg.frameCount = cfg.xdpFrameCount;
           xdp_cfg.etherType  = cfg.etherType;
-          xdp_cfg.zeroCopy   = cfg.xdpZeroCopy;
           xdp_cfg.needWakeup = cfg.xdpNeedWakeup;
 
           AFXDPSocket sock(xdp_cfg);
           AFXDPTx tx(sock);
           AFXDPRx rx(sock);
 
-          std::printf("[%s] Transport: af_xdp on %s (queue %u, %s mode)\n",
+          std::printf("[%s] Transport: af_xdp on %s (queue %u)\n",
                       is_server ? "Server" : "Client", role.interface.c_str(),
-                      cfg.xdpQueueId, cfg.xdpZeroCopy ? "zero-copy" : "copy");
+                      role.xdpQueueId);
 
           if (is_server) {
               run_server(tx, rx, cfg, g_stop.get_token());

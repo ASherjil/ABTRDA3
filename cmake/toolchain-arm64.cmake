@@ -15,6 +15,9 @@ set(CMAKE_CXX_COMPILER "${TOOLCHAIN_ROOT}/aarch64-linux-gnu-g++")
 set(CMAKE_AR            "${TOOLCHAIN_ROOT}/aarch64-linux-gnu-gcc-ar")
 set(CMAKE_RANLIB        "${TOOLCHAIN_ROOT}/aarch64-linux-gnu-gcc-ranlib")
 
+# Target sysroot (contains ARM64 libraries and headers)
+set(CMAKE_SYSROOT "/acc/sys/cdk/debian/12/aarch64/sysroots/target")
+
 # Search paths for cross-compilation
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

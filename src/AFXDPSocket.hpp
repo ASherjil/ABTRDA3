@@ -19,8 +19,8 @@ struct XdpConfig {
   std::uint32_t  frameSize   = 4096;   // UMEM frame size (must be 2048 or 4096)
   std::uint32_t  frameCount  = 64;     // total UMEM frames (split half TX, half RX)
   std::uint16_t  etherType   = 0x88B5;
-  bool           zeroCopy    = false;
   bool           needWakeup  = true;   // skip sendto()/recvfrom() when kernel is actively polling
+  // XDP mode is auto-detected: native+zerocopy → native+copy → generic/SKB+copy
 };
 
 // ── Ring pointer bundles ─────────────────────────────────────────────────

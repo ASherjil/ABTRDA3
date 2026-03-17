@@ -1,273 +1,198 @@
-# AF_XDP Implementation Plan for ABTRDA3
+# ABTRDA3 — Current State & Next Steps
 
-## Context
+## Overview
 
-ABTRDA3 currently uses `packet_mmap` for ultra-low-latency timing event TX/RX. We're adding AF_XDP as an alternative transport to potentially achieve even lower latency. The XDP eBPF filter is **safety-critical** — the target machines boot from NFS over the same NIC, so the filter must only redirect our custom EtherType (0x88B5) to userspace and pass everything else to the kernel stack.
+ABTRDA3 is an ultra-low-latency timing library using `packet_mmap` (TPACKET_V2) and `AF_XDP` for raw Ethernet TX/RX. The XDP eBPF filter is safety-critical — target machines boot from NFS over the same NIC, so the filter only redirects EtherType 0x88B5 to userspace and passes everything else to the kernel stack.
 
-**Target:** cfc-865-mkdev16/mkdev30, Debian 12 FECOS, kernel 5.10-rt, eno2 = Intel I350 (`igb` driver, native XDP, 4 queues).
+## Target Hardware
 
-## Architecture
+### x86_64 — cfc-865-mkdev16 / mkdev30
 
-- **Separate classes, same hot-path API** — `AfXdpTx` / `AfXdpRx` satisfy the same `TxRing` / `RxRing` C++20 concepts as `PacketMmapTx` / `PacketMmapRx`
-- **Shared socket** — AF_XDP requires TX and RX to share one socket + UMEM on the same queue. `AfXdpSocket` handles setup; `AfXdpTx(sock)` and `AfXdpRx(sock)` attach to its rings
-- **Embedded BPF** — XDP filter compiled at build time with clang, embedded as C byte array
-- **FetchContent for libbpf** — built as static lib from source, no system package needed
-- **Compile-time selection** — `#ifdef ABTRDA3_HAS_AF_XDP`, templates constrained by concepts, zero virtual dispatch
+| Property | eno1 (NFS boot) | eno2 (dedicated LAN) |
+|----------|-----------------|---------------------|
+| Driver | e1000e (Intel I219) | igb (Intel I350) |
+| Queues | 1 RX, 1 TX | 4 RX, 4 TX |
+| XDP mode | Generic/SKB only | Generic/SKB only (igb native broken on 5.14-rt) |
+| Zero-copy AF_XDP | No (`ndo_xsk_wakeup` not implemented) | No |
+| ntuple filters | Not supported (`off [fixed]`) | Supported but not needed (dedicated) |
+| RSS | Not supported (single queue) | Supported (we steer all to queue 0) |
+| Kernel | 5.14.0-570.52.1.el9_6.x86_64 PREEMPT_RT | Same |
 
-## File Layout
+### ARM64 — cfd-865-mkdev50
 
-### New files
+| Property | end0 (NFS boot) |
+|----------|----------------|
+| Driver | macb (Cadence/Xilinx GEM on Zynq UltraScale+) |
+| Queues | **2 RX, 2 TX** |
+| XDP mode | **Native/DRV supported** (macb implements `ndo_bpf`) |
+| Zero-copy AF_XDP | No (`ndo_xsk_wakeup` not implemented) |
+| ntuple filters | **Supported** (`off` but can be enabled) |
+| RSS | Not supported (`receive-hashing: off [fixed]`) |
+| Kernel | 6.6.40-xlnxLTS20242 |
+| Cores | 4 (cores 0-3) |
+| NIC IRQ | IRQ 51, primarily on core 0 |
 
-| File | Purpose | ~Lines |
-|------|---------|--------|
-| `src/RxFrame.hpp` | `RxFrame` struct (extracted from PacketMmapRx.hpp) | 15 |
-| `src/RingConcepts.hpp` | `TxRing`, `RxRing` C++20 concepts | 40 |
-| `src/AfXdpSocket.hpp` | `XdpConfig` struct + `AfXdpSocket` RAII class decl | 100 |
-| `src/AfXdpSocket.cpp` | Socket/UMEM/ring-mmap/BPF-load/attach/bind | 250 |
-| `src/AfXdpTx.hpp` | `AfXdpTx` class (inline hot path) | 120 |
-| `src/AfXdpTx.cpp` | Constructor (init free stack, wire pointers), move ops | 80 |
-| `src/AfXdpRx.hpp` | `AfXdpRx` class (inline hot path) | 90 |
-| `src/AfXdpRx.cpp` | Constructor (pre-fill Fill ring), move ops | 70 |
-| `src/bpf/xdp_filter.bpf.c` | XDP EtherType filter eBPF program | 50 |
-| `cmake/BpfCompile.cmake` | CMake function: `.bpf.c` → `.bpf.o` → `.h` embed | 50 |
-| `cmake/BinToHeader.cmake` | Binary-to-C-header conversion script | 40 |
-| `cmake/BuildLibbpf.cmake` | Build libbpf as CMake static library | 40 |
+#### ARM64 ntuple flow steering — verified working
 
-### Files to modify
+```bash
+# Enable ntuple filters
+$ sudo ethtool -K end0 ntuple on
 
-| File | Change |
-|------|--------|
-| `src/PacketMmapRx.hpp` | Move `RxFrame` out, include `RxFrame.hpp` |
-| `src/PacketMmapTx.hpp` | Add `static_assert(TxRing<PacketMmapTx>)` |
-| `src/CMakeLists.txt` | Add AF_XDP sources, libbpf FetchContent, BPF compile |
-| `CMakeLists.txt` | Add `ABTRDA3_ENABLE_AF_XDP` option, `enable_language(C)` |
-| `test/TestConfig.hpp` | Add `Transport` enum, `AfXdpTestConfig`, parse `[af_xdp]` |
-| `test/Client.hpp` | Template on `TxRing`/`RxRing`, take TX/RX by reference |
-| `test/Server.hpp` | Template on `TxRing`/`RxRing`, take TX/RX by reference |
-| `test/main.cpp` | Construct TX/RX in main, dispatch on transport |
-| `test/abtrda3_test.toml` | Add `transport` field and `[af_xdp]` section |
+# Steer ethertype 0x88B5 to RX queue 1
+$ sudo ethtool -N end0 flow-type ether proto 0x88b5 action 1
+Added rule with ID 0
 
-## XDP eBPF Filter — Safety-Critical
+# Verify
+$ ethtool -n end0
+2 RX rings available
+Total 1 rules
 
-```c
-// src/bpf/xdp_filter.bpf.c — DEFAULT IS XDP_PASS (safe)
-SEC("xdp")
-int xdp_filter_ethertype(struct xdp_md *ctx) {
-    struct ethhdr *eth = (void *)(long)ctx->data;
-    if ((void *)(eth + 1) > (void *)(long)ctx->data_end)
-        return XDP_PASS;                    // too short → kernel
-
-    if (eth->h_proto != bpf_htons(target_ethertype))
-        return XDP_PASS;                    // not ours → kernel (NFS/SSH safe)
-
-    return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
-    //                                     fallback: XDP_PASS ─────────^
-}
+Filter: 0
+    Flow Type: Raw Ethernet
+    Src MAC addr: 00:00:00:00:00:00 mask: FF:FF:FF:FF:FF:FF
+    Dest MAC addr: 00:00:00:00:00:00 mask: FF:FF:FF:FF:FF:FF
+    Ethertype: 0x88B5 mask: 0x0
+    Action: Direct to queue 1
 ```
 
-**Safety guarantees:**
-- Default action is always `XDP_PASS` — packets go to normal kernel stack
-- Only `EtherType == 0x88B5` gets redirected to AF_XDP socket
-- If XSK socket not ready → `XDP_PASS` fallback, no drops
-- Never uses `XDP_DROP` — we never discard any packet
-- `target_ethertype` configurable via libbpf global variable rewrite at load time
+#### ARM64 driver/queue verification
 
-## AF_XDP Ring Architecture
+```bash
+$ ethtool -i end0
+driver: macb
+version: 6.6.40-xlnxLTS20242-fecos03-1-g
+bus-info: ff0b0000.ethernet
 
-```
-                    ┌─────────────┐
-                    │   UMEM      │  Contiguous mmap'd memory
-                    │ (N frames)  │  Split: first half TX, second half RX
-                    └──────┬──────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-    ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
-    │  TX Ring   │   │Completion │   │  RX Ring   │   ┌──────────┐
-    │ user→kern  │   │ kern→user │   │ kern→user  │   │Fill Ring │
-    │ (AfXdpTx)  │   │ (AfXdpTx) │   │ (AfXdpRx)  │   │user→kern │
-    └────────────┘   └───────────┘   └────────────┘   │(AfXdpRx) │
-                                                       └──────────┘
+$ ls /sys/class/net/end0/queues/
+rx-0  rx-1  tx-0  tx-1
+
+$ cat /proc/interrupts | grep end0
+ 51:    3487283          0          0      81145     GICv2  89 Level     end0, end0
 ```
 
-## Key Class APIs
+## Benchmark Results
 
-### AfXdpSocket (cold path — construction only)
+### x86_64 — eno2 direct LAN (mkdev30 → mkdev16), 50M packets, 1ms interval
 
-```cpp
-struct XdpConfig {
-    const char* interface;
-    uint32_t queueId     = 0;
-    uint32_t frameSize   = 4096;  // UMEM frame size
-    uint32_t frameCount  = 64;    // total frames (split TX/RX)
-    uint16_t etherType   = 0x88B5;
-    bool     zeroCopy    = false;
-    bool     needWakeup  = true;
-};
+| Metric | packet_mmap | AF_XDP (SKB/copy) |
+|--------|------------|-------------------|
+| Min RTT | 43.31 us | 43.76 us |
+| Median | 79.40 us | 79.70 us |
+| P99 | 80.80 us | 81.00 us |
+| P99.9 | 82.54 us | 87.68 us |
+| P100 | 136.83 us | 139.39 us |
+| Packet loss | 0 | 0 |
+| Duration | ~13.9 hrs | ~13.9 hrs |
 
-class AfXdpSocket {
-public:
-    explicit AfXdpSocket(const XdpConfig& cfg);
-    ~AfXdpSocket();  // detaches XDP program, unmaps, closes
-    // Move-only
-    // Exposes: fd, umemBase, ring pointers, offsets, frameSize, etc.
-};
+**One-way P100: ~70us on dedicated interface.** Both transports are equivalent at SKB/copy mode on igb.
+
+### ARM64 — end0 NFS boot (30s test, 20K packets, no NIC tuning, core 1)
+
+| Metric | packet_mmap | AF_XDP (SKB/copy) |
+|--------|------------|-------------------|
+| Min RTT | 75.26 us | 74.68 us |
+| Median | 93.06 us | 93.46 us |
+| P99 | 113.00 us | 105.86 us |
+| P100 | 146.26 us | 153.12 us |
+
+AF_XDP in SKB/copy mode provides no advantage on ARM64 NFS boot — same kernel path.
+
+## Completed Work
+
+- AF_XDP transport (SKB/copy mode) — fully implemented and tested
+- packet_mmap transport with EAGAIN/EBUSY retry loops
+- Sequence number validation in client (eliminates ghost frames from AF_PACKET TX copies)
+- NicTuner: irqbalance stop, kernel thread migration to core 0, workqueue migration, cpu_dma_latency, performance governor, busy_poll, vm.stat_interval, interrupt coalescing, GRO/GSO/TSO disable, RSS steering, RT throttle disable, ksoftirqd FIFO:50, IRQ pinning
+- CPU pinning via sched_setaffinity (no more taskset -c)
+- TOML config: separate [packet_mmap] and [af_xdp] sections, client count, output path, send_interval_us
+- Python plot script with auto-save PNG
+- ARM64 cross-compilation (with AF_XDP when sysroot has libelf/zlib)
+
+## NIC Tuning — What We Tried
+
+### Runtime tuning (implemented in NicTuner)
+All applied, all effective on dedicated eno2:
+- Stop irqbalance, migrate kernel threads + workqueues to core 0
+- cpu_dma_latency = 0, performance governor, vm.stat_interval = 120
+- Interrupt coalescing = 0, GRO/GSO/TSO off, RSS all→queue 0
+- sched_rt_runtime_us = -1, ksoftirqd FIFO:50
+- NIC IRQs pinned to app core, other IRQs moved off
+
+### Not applicable on target hardware
+- **THP, NUMA balancing, KSM**: compiled out of the kernel
+- **busy_poll/busy_read**: `/proc/sys/net/core/busy_poll` doesn't exist (CONFIG_NET_RX_BUSY_POLL not enabled)
+- **RPS**: redundant (IRQs already pinned to app core)
+- **RFS**: AF_PACKET doesn't call recv(), no flow tracking
+- **Accelerated RFS**: neither e1000e nor igb implements ndo_rx_flow_steer
+- **ntuple flow steering on x86**: e1000e doesn't support it, igb doesn't need it (dedicated interface)
+- **RSS on eno1**: single queue, impossible
+- **Adding queues to eno1**: e1000e is single-queue silicon, hardware limitation
+
+### Requires kernel boot parameters (not possible on diskless NFS boot)
+- `isolcpus`, `nohz_full`, `rcu_nocbs`: would eliminate scheduler ticks and kernel threads on app cores
+- `mitigations=off`: 5-30% perf gain from disabling Spectre/Meltdown mitigations
+- `transparent_hugepage=never`: only if THP were enabled
+
+## Next Steps — AF_XDP Native Mode on ARM64
+
+The ARM64 mkdev50 (macb driver, kernel 6.6) is the most promising target for significant latency improvement. It uniquely supports:
+
+1. **Native XDP** (DRV mode) — BPF runs in the driver's NAPI handler, before skb allocation
+2. **ntuple flow steering** — hardware-level ethertype→queue steering
+3. **2 RX queues** — enables full NFS/timing traffic separation
+
+### Architecture on ARM64 (end0)
+
+```
+                NIC (macb, 2 queues)
+                      │
+         ┌────────────┴────────────┐
+         │                         │
+    RX Queue 0                RX Queue 1
+    (NFS/SSH/ARP)             (0x88B5 timing)
+    ntuple: default           ntuple: ether proto 0x88B5 action 1
+         │                         │
+    IRQ → Core 0              IRQ → Core 1
+    ksoftirqd/0               XDP native redirect
+    kernel stack              AF_XDP socket (copy mode)
+         │                         │
+    NFS client                Our app (SCHED_FIFO:49)
+    (SCHED_OTHER)             pinned to core 1
 ```
 
-**Constructor steps:**
-1. `socket(AF_XDP, SOCK_RAW, 0)`
-2. `mmap(MAP_ANONYMOUS | MAP_POPULATE)` for UMEM
-3. `setsockopt(XDP_UMEM_REG)` — register UMEM
-4. `setsockopt(XDP_TX_RING, XDP_RX_RING, XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING)`
-5. `getsockopt(XDP_MMAP_OFFSETS)` → mmap each ring
-6. Load embedded BPF object via libbpf, set `target_ethertype`
-7. `bpf_xdp_attach()` (idempotent — detect if already attached)
-8. `bpf_map_update_elem(xsks_map, queueId, fd)`
-9. `bind(fd, sockaddr_xdp{AF_XDP, ifindex, queueId})`
+### Implementation tasks
 
-### AfXdpTx (hot path — inline in header)
+#### 1. Separate XDP attach mode from AF_XDP bind mode
 
-```cpp
-class AfXdpTx {
-public:
-    explicit AfXdpTx(AfXdpSocket& sock);  // wires TX + Completion ring pointers
-    uint8_t* acquire(uint32_t frameLen) noexcept;  // pop from free stack
-    void commit() noexcept;                         // push to TX ring, sendto()
-    bool send(std::span<const uint8_t>) noexcept;   // acquire + memcpy + commit
-    void prefillRing(std::span<const uint8_t>) noexcept; // stamp all UMEM TX frames
+Currently `zero_copy = true` sets both `XDP_FLAGS_DRV_MODE` (BPF attach) and `XDP_ZEROCOPY` (socket bind). We need:
+- `XDP_FLAGS_DRV_MODE` attach (native XDP) + `XDP_COPY` bind (copy-mode AF_XDP)
+- New config option: `xdp_native = true` (controls BPF attach mode, independent of zero_copy)
+- `zero_copy` only controls the socket bind flags
 
-private:
-    void reclaimCompleted() noexcept;  // drain Completion ring → free stack
-    // Hot members: umemBase, txDescs, txProducer, freeStack, fd, ringMask (~64 bytes)
-};
-```
-
-**Key difference from PacketMmapTx:** Uses a **free-stack** instead of a simple ring cursor, because the Completion ring returns frames out-of-order. `acquire()` calls `reclaimCompleted()` first to refill the free stack.
-
-### AfXdpRx (hot path — inline in header)
-
-```cpp
-class AfXdpRx {
-public:
-    explicit AfXdpRx(AfXdpSocket& sock);  // wires RX + Fill ring, pre-fills Fill ring
-    RxFrame tryReceive() noexcept;        // check RX ring producer
-    void release() noexcept;              // return frame addr to Fill ring
-
-private:
-    // Hot members: umemBase, rxDescs, rxProducer, fillDescs, fillProducer (~60 bytes)
-};
-```
-
-**Key difference from PacketMmapRx:** `release()` puts the frame address back on the **Fill ring** (so kernel can reuse it), instead of writing `TP_STATUS_KERNEL`. If the Fill ring empties, the kernel drops packets.
-
-## C++20 Concepts — `src/RingConcepts.hpp`
-
-```cpp
-template<typename T>
-concept TxRing = requires(T t, std::span<const uint8_t> f, uint32_t len) {
-    { t.send(f) } noexcept -> std::same_as<bool>;
-    { t.acquire(len) } noexcept -> std::same_as<uint8_t*>;
-    { t.commit() } noexcept;
-    { t.prefillRing(f) } noexcept;
-};
-
-template<typename T>
-concept RxRing = requires(T t) {
-    { t.tryReceive() } noexcept -> std::same_as<RxFrame>;
-    { t.release() } noexcept;
-};
-
-// Verified at compile time:
-// static_assert(TxRing<PacketMmapTx> && TxRing<AfXdpTx>);
-// static_assert(RxRing<PacketMmapRx> && RxRing<AfXdpRx>);
-```
-
-## Test Code Changes
-
-### TOML config addition
 ```toml
-[general]
-transport    = "packet_mmap"    # or "af_xdp"
-# ... existing fields ...
-
 [af_xdp]
-queue_id     = 0
-zero_copy    = false
-need_wakeup  = true
+queue_id        = 1          # bind to queue 1 (timing traffic steered here)
+xdp_native      = true       # attach BPF in native/DRV mode (requires driver support)
+zero_copy       = false      # copy-mode bind (macb doesn't support zero-copy)
 ```
 
-### Templated Server/Client
-```cpp
-// Server.hpp — templates on concept, TX/RX passed by reference
-template<TxRing Tx, RxRing Rx>
-void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop);
+#### 2. Add ntuple flow steering to NicTuner
 
-// Client.hpp — same pattern
-template<TxRing Tx, RxRing Rx>
-void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, uint32_t count, std::stop_token stop);
-```
+When the NIC supports ntuple and has multiple queues:
+- Enable ntuple: `ethtool -K <iface> ntuple on`
+- Add rule: `ethtool -N <iface> flow-type ether proto 0x88b5 action <queue>`
+- Pin the timing queue's IRQ to the app core
+- Leave NFS traffic on queue 0 / core 0
 
-### main.cpp dispatch
-```cpp
-if (cfg.transport == Transport::PacketMmap) {
-    PacketMmapTx tx(tx_cfg);  PacketMmapRx rx(rx_cfg);
-    if (is_server) run_server(tx, rx, cfg, stop);
-    else           run_client(tx, rx, cfg, count, stop);
-}
-#ifdef ABTRDA3_HAS_AF_XDP
-else {
-    AfXdpSocket sock(xdp_cfg);
-    AfXdpTx tx(sock);  AfXdpRx rx(sock);
-    if (is_server) run_server(tx, rx, cfg, stop);
-    else           run_client(tx, rx, cfg, count, stop);
-}
-#endif
-```
+#### 3. Test on ARM64
 
-## Implementation Phases
+- Run AF_XDP native mode + ntuple steering on mkdev50
+- Compare against packet_mmap and AF_XDP SKB mode
+- Overnight test to validate P100 stability
 
-### Phase 1: Infrastructure (no functional change)
-1. Extract `RxFrame` → `src/RxFrame.hpp`, update includes
-2. Create `src/RingConcepts.hpp` with concepts + static_asserts
-3. Template `test/Server.hpp` and `test/Client.hpp`
-4. Update `test/main.cpp` to construct TX/RX and pass to templates
-5. **Verify:** existing packet_mmap test still builds and works
+### Expected benefit
 
-### Phase 2: CMake + BPF pipeline
-1. Create `cmake/BpfCompile.cmake`, `cmake/BinToHeader.cmake`, `cmake/BuildLibbpf.cmake`
-2. Add `ABTRDA3_ENABLE_AF_XDP` option to root `CMakeLists.txt`
-3. Add FetchContent(libbpf v1.5.0) + BPF compile step to `src/CMakeLists.txt`
-4. Create `src/bpf/xdp_filter.bpf.c`
-5. **Verify:** BPF program compiles and embeds (`xdp_filter_embed.h` generated)
-
-### Phase 3: AF_XDP core classes
-1. Create `AfXdpSocket.hpp/.cpp` — UMEM + socket + BPF lifecycle
-2. Create `AfXdpTx.hpp/.cpp` — TX ring + Completion ring + free stack
-3. Create `AfXdpRx.hpp/.cpp` — RX ring + Fill ring
-4. Add sources + libbpf link to `src/CMakeLists.txt`
-5. **Verify:** library builds with `ABTRDA3_ENABLE_AF_XDP=ON`
-
-### Phase 4: Test integration
-1. Update `test/TestConfig.hpp` — Transport enum, AfXdpTestConfig
-2. Update `test/abtrda3_test.toml` — add transport + [af_xdp] section
-3. Update `test/main.cpp` — runtime dispatch
-4. **Verify:** `transport = "packet_mmap"` still works (regression)
-5. **Verify:** `transport = "af_xdp"` on eno2 between mkdev16/mkdev30
-
-## Build Dependencies
-
-| Dependency | Source | Available on build machine? |
-|-----------|--------|---------------------------|
-| libbpf v1.5.0 | FetchContent (GitHub) | N/A — fetched at build time |
-| libelf | System (`/usr/lib64/libelf.so`) | Yes |
-| zlib | System (`/usr/lib64/libz.so`) | Yes |
-| clang (BPF target) | System (`/bin/clang` v19.1.7) | Yes |
-| linux/if_xdp.h | System (`/usr/include/linux/`) | Yes |
-
-## Risks and Mitigations
-
-1. **NFS crash from bad XDP filter** — Mitigated by default `XDP_PASS`, no `XDP_DROP`, EtherType-only match, `XDP_PASS` fallback on redirect failure
-2. **libbpf CMake build fragility** — Pin to v1.5.0 tag, list exact source files
-3. **Cross-compile BPF** — BPF bytecode is arch-independent; always compiled with host clang
-4. **Kernel 5.10 features** — Avoid newer AF_XDP features (multi-buffer, tx metadata). `XDP_USE_NEED_WAKEUP` supported since 5.4
-5. **igb driver XDP support** — Intel igb supports native XDP since kernel 5.3; verified on target
+On ARM64 with native XDP + ntuple steering:
+- Timing packets bypass the entire kernel network stack (no skb allocation)
+- NFS traffic on a completely separate queue/core — zero contention
+- Should approach the dedicated-LAN baseline (~70us one-way P100)

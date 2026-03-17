@@ -156,13 +156,9 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
 
   // 9. Attach the XDP program to the network interface
   //
-  // We always use generic/SKB mode when in copy mode. Native/DRV mode on igb
-  // (kernel 5.10) causes __dev_direct_xmit() to find TX queues stopped after
-  // the driver reconfigures them for XDP, returning EBUSY on every sendto().
-  // SKB mode still runs the XDP filter in the kernel stack (before socket
-  // delivery) and leaves the driver's TX path untouched.
-  //
-  // For zero-copy mode (future), we'd need native/DRV mode + driver XSK support.
+  // Auto-detect the best mode by trying from best to worst:
+  //   1. Native/DRV mode — BPF runs in driver NAPI handler (fastest)
+  //   2. Generic/SKB mode — BPF runs in kernel net stack (universal fallback)
   m_ifindex = static_cast<int>(::if_nametoindex(cfg.interface));
   if (m_ifindex == 0)
     throw std::system_error(errno, std::generic_category(), "if_nametoindex");
@@ -170,54 +166,71 @@ AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
   auto tryAttach = [&](std::uint32_t flags) -> int {
     int e = bpf_xdp_attach(m_ifindex, prog_fd, flags, nullptr);
     if (e == -EEXIST) {
-      // Another XDP program is already attached (maybe from a crash).
-      // Detach it first, then retry.
       bpf_xdp_detach(m_ifindex, flags, nullptr);
       e = bpf_xdp_attach(m_ifindex, prog_fd, flags, nullptr);
     }
     return e;
   };
 
-  m_xdpFlags = cfg.zeroCopy ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE;
-  int err = tryAttach(m_xdpFlags);
-  if (err) {
-    throw std::runtime_error(
-      std::string("bpf_xdp_attach failed in ") +
-      (cfg.zeroCopy ? "native/DRV" : "generic/SKB") + " mode");
+  // Try native XDP first, fall back to generic/SKB
+  m_xdpFlags = XDP_FLAGS_DRV_MODE;
+  if (tryAttach(m_xdpFlags) != 0) {
+    m_xdpFlags = XDP_FLAGS_SKB_MODE;
+    if (tryAttach(m_xdpFlags) != 0)
+      throw std::runtime_error("bpf_xdp_attach failed in both native and generic mode");
   }
   m_xdpAttached = true;
+  bool nativeXdp = (m_xdpFlags == XDP_FLAGS_DRV_MODE);
 
+  // In generic/SKB mode, always bind to queue 0 — the kernel ignores
+  // hardware queue assignments and only delivers to queue-0-bound sockets.
+  // ntuple steering still provides interrupt isolation at the hardware level.
+  std::uint32_t bindQueue = nativeXdp ? cfg.queueId : 0;
 
-  // 10. Register our socket in XSKMAP
-  // The XDP program does: bpf_redirect_map(&xsks_map, queue_index, XDP_PASS)
-  // We insert our socket fd at key=queueId so the redirect finds us.
-  std::uint32_t key = cfg.queueId;
-  int val = m_fd;
-  if (bpf_map_update_elem(xsks_map_fd, &key, &val, 0) < 0)
-    throw std::system_error(errno, std::generic_category(), "bpf_map_update_elem(xsks_map)");
+  // 10. Register our socket in XSKMAP at the queue we will bind to.
+  {
+    int val = m_fd;
+    std::uint32_t key = bindQueue;
+    if (bpf_map_update_elem(xsks_map_fd, &key, &val, 0) < 0)
+      throw std::system_error(errno, std::generic_category(), "bpf_map_update_elem(xsks_map)");
+  }
 
   // 11. Bind socket to interface & queue
   //
-  // This is the final step — binds the AF_XDP socket to a specific NIC
-  // queue. After this, the XDP program can redirect matching packets to us.
+  // Auto-detect bind mode (best to worst):
+  //   1. XDP_ZEROCOPY — zero-copy DMA (requires driver ndo_xsk_wakeup, native XDP only)
+  //   2. XDP_COPY     — kernel copies to/from UMEM (universal)
+
   sockaddr_xdp sxdp{};
   sxdp.sxdp_family   = AF_XDP;
   sxdp.sxdp_ifindex  = static_cast<std::uint32_t>(m_ifindex);
-  sxdp.sxdp_queue_id = cfg.queueId;
-  sxdp.sxdp_flags    = cfg.zeroCopy ? XDP_ZEROCOPY : XDP_COPY;
-  if (cfg.needWakeup) {
-    sxdp.sxdp_flags |= XDP_USE_NEED_WAKEUP;
+  sxdp.sxdp_queue_id = bindQueue;
+
+  const char* bindMode = "copy";
+  bool bound = false;
+
+  // Only try zero-copy if we got native XDP (zero-copy requires DRV mode)
+  if (nativeXdp) {
+    sxdp.sxdp_flags = XDP_ZEROCOPY;
+    if (cfg.needWakeup) sxdp.sxdp_flags |= XDP_USE_NEED_WAKEUP;
+    if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) == 0) {
+      bindMode = "zero-copy";
+      bound = true;
+    }
   }
 
-  if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) < 0) {
-    throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
+  // Fall back to copy mode
+  if (!bound) {
+    sxdp.sxdp_flags = XDP_COPY;
+    if (cfg.needWakeup) sxdp.sxdp_flags |= XDP_USE_NEED_WAKEUP;
+    if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) < 0)
+      throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
   }
 
-  std::fprintf(stderr, "[AFXDPSocket] fd=%d ifindex=%d queue=%u flags=0x%x umem=%p frames=%u+%u\n",
-               m_fd, m_ifindex, cfg.queueId, sxdp.sxdp_flags,
-               static_cast<void*>(m_umem), m_txFrameCount, m_rxFrameCount);
-  std::fprintf(stderr, "[AFXDPSocket] XDP attached: %s mode\n",
-               (m_xdpFlags == XDP_FLAGS_DRV_MODE) ? "native/DRV" : "generic/SKB");
+  std::fprintf(stderr, "[AFXDPSocket] %s XDP, %s | fd=%d queue=%u frames=%u+%u\n",
+               nativeXdp ? "native" : "generic",
+               bindMode,
+               m_fd, bindQueue, m_txFrameCount, m_rxFrameCount);
 }
 
 AFXDPSocket::AFXDPSocket(AFXDPSocket&& other) noexcept
