@@ -28,7 +28,7 @@ public:
 
   // ── Copy-based send (convenience API) ────────────────────────────
   [[nodiscard, gnu::always_inline]]
-  bool send(std::span<const std::uint8_t> frame) noexcept {
+  inline bool send(std::span<const std::uint8_t> frame) noexcept {
     auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
     if (!dst) [[unlikely]]
       return false;
@@ -43,7 +43,7 @@ public:
   // Call commit() when done to trigger kernel transmission.
   // Returns nullptr if the ring slot is not available.
   [[nodiscard, gnu::always_inline]]
-  std::uint8_t* acquire(std::uint32_t frameLen) noexcept {
+  inline std::uint8_t* acquire(std::uint32_t frameLen) const noexcept {
     tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
     // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
@@ -60,7 +60,7 @@ public:
   }
 
   [[gnu::always_inline]]
-  void commit() noexcept {
+  inline void commit() noexcept {
     tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextSlot);
 
     // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
@@ -83,14 +83,7 @@ public:
   // The kernel never touches the data area on recycle (only tp_status),
   // so the template persists across sends — hot path only writes the
   // bytes that actually change.
-  void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept {
-    for (auto* slot = m_ringBase; slot < m_ringEnd; slot += m_frameSize) {
-      auto* hdr = reinterpret_cast<tpacket2_hdr*>(slot);
-      if (hdr->tp_status == TP_STATUS_AVAILABLE) {
-        std::memcpy(slot + kDataOffset, frameTemplate.data(), frameTemplate.size());
-      }
-    }
-  }
+  void prefillRing(std::span<const std::uint8_t> frameTemplate) const noexcept;
 
 private:
   // HOT: accessed every send(), packed into one cache line (32 bytes)

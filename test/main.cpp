@@ -1,9 +1,9 @@
 // ABTRDA3 - Ultra-Low Latency Ping-Pong Test
 //
 // Usage:
-//   Server (Reflector): sudo taskset -c 4 ./abtrda3_test --server
-//   Client (Measurer):  sudo taskset -c 4 ./abtrda3_test --client --count 1000
-//   Custom config:      sudo taskset -c 4 ./abtrda3_test --server --config /path/to/config.toml
+//   Server:  sudo ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
+//   Client:  sudo ./abtrda3_test --client --config ../../../test/abtrda3_test.toml
+//   Override count: sudo ./abtrda3_test --client --count 1000 --config ../../../test/abtrda3_test.toml
 
 #include "NicTuner.hpp"
 #include "TestConfig.hpp"
@@ -76,7 +76,7 @@ static void spawn_watchdog(int timeout_sec) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::printf("Usage:\n  %s --server [--config <file>]\n  %s --client --count <N> [--config <file>]\n",
+        std::printf("Usage:\n  %s --server [--config <file>]\n  %s --client [--count <N>] [--config <file>]\n",
                     argv[0], argv[0]);
         return 1;
     }
@@ -84,7 +84,7 @@ int main(int argc, char* argv[]) {
     // Parse CLI args
     const char* config_path = "abtrda3_test.toml";
     const char* mode = nullptr;
-    std::uint32_t count = 10;
+    std::int64_t count_override = -1;  // -1 = use config value
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -94,7 +94,7 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--client") == 0) {
             mode = "client";
         } else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
-            count = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+            count_override = std::atol(argv[++i]);
         }
     }
 
@@ -111,6 +111,11 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Config error: %s\n", e.what());
         return 1;
     }
+
+    // CLI --count overrides config value
+    std::uint32_t count = cfg.clientCount;
+    if (count_override >= 0)
+        count = static_cast<std::uint32_t>(count_override);
 
     std::printf("[Config] Loaded from %s\n", config_path);
 
@@ -145,6 +150,18 @@ int main(int argc, char* argv[]) {
     // drop to SCHED_OTHER) before we go FIFO and never yield again.
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+    // Pin to the configured CPU core (replaces taskset -c on the command line)
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(role.cpuCore, &cpuset);
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
+            std::fprintf(stderr, "[Warn] sched_setaffinity(core %d) failed: %s\n",
+                         role.cpuCore, std::strerror(errno));
+        else
+            std::fprintf(stderr, "[RT] Pinned to core %d\n", role.cpuCore);
+    }
+
     // SCHED_FIFO:49 — below ksoftirqd (FIFO:50, set by NicTuner) so NAPI
     // can still deliver packets to the mmap ring on this RT kernel.
     {
@@ -162,8 +179,8 @@ int main(int argc, char* argv[]) {
           RingConfig tx_cfg{};
           tx_cfg.interface     = role.interface.c_str();
           tx_cfg.direction     = RingDirection::TX;
-          tx_cfg.blockSize     = cfg.blockSize;
-          tx_cfg.blockNumber   = cfg.blockNumber;
+          tx_cfg.blockSize     = cfg.mmapBlockSize;
+          tx_cfg.blockNumber   = cfg.mmapBlockNumber;
           tx_cfg.protocol      = cfg.etherType;
           tx_cfg.packetVersion = TPACKET_V2;
           tx_cfg.qdiscBypass   = true;
@@ -171,8 +188,8 @@ int main(int argc, char* argv[]) {
           RingConfig rx_cfg{};
           rx_cfg.interface     = role.interface.c_str();
           rx_cfg.direction     = RingDirection::RX;
-          rx_cfg.blockSize     = cfg.blockSize;
-          rx_cfg.blockNumber   = cfg.blockNumber;
+          rx_cfg.blockSize     = cfg.mmapBlockSize;
+          rx_cfg.blockNumber   = cfg.mmapBlockNumber;
           rx_cfg.protocol      = cfg.etherType;
           rx_cfg.hwTimeStamp   = false;
 
@@ -186,8 +203,6 @@ int main(int argc, char* argv[]) {
               run_server(tx, rx, cfg, g_stop.get_token());
           } else {
               run_client(tx, rx, cfg, count, g_stop.get_token());
-              std::fflush(stdout);
-              std::_Exit(0);  // skip destructors — close() can block on same-machine loopback
           }
       }
   #ifdef ABTRDA3_HAS_AF_XDP
@@ -213,8 +228,6 @@ int main(int argc, char* argv[]) {
               run_server(tx, rx, cfg, g_stop.get_token());
           } else {
               run_client(tx, rx, cfg, count, g_stop.get_token());
-              std::fflush(stdout);
-              std::_Exit(0);  // skip destructors — synchronize_rcu() in xsk_release() blocks on RT kernels
           }
       }
   #endif

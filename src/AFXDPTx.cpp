@@ -81,4 +81,9 @@ AFXDPTx& AFXDPTx::operator=(AFXDPTx&& other) noexcept {
   return *this;
 }
 
-
+void AFXDPTx::prefillRing(std::span<const std::uint8_t> frameTemplate) const noexcept {
+  for (std::uint32_t i = 0; i < m_txFrameCount; ++i) {
+    auto addr = static_cast<std::uint64_t>(i) * m_frameSize;
+    std::memcpy(m_umem + addr, frameTemplate.data(), frameTemplate.size());
+  }
+}

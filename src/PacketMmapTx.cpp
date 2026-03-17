@@ -41,3 +41,11 @@ PacketMmapTx& PacketMmapTx::operator=(PacketMmapTx&& other) noexcept{
   return *this;
 }
 
+void PacketMmapTx::prefillRing(std::span<const std::uint8_t> frameTemplate) const noexcept {
+  for (auto* slot = m_ringBase; slot < m_ringEnd; slot += m_frameSize) {
+    auto* hdr = reinterpret_cast<tpacket2_hdr*>(slot);
+    if (hdr->tp_status == TP_STATUS_AVAILABLE) {
+      std::memcpy(slot + kDataOffset, frameTemplate.data(), frameTemplate.size());
+    }
+  }
+}

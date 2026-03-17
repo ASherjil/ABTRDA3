@@ -100,6 +100,55 @@ std::string cpuListExcluding(int core) {
     return result;
 }
 
+// Move all kernel threads (children of kthreadd, PID 2) to core 0.
+int migrateKernelThreads() {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+
+    int moved = 0;
+    DIR* dir = ::opendir("/proc");
+    if (!dir) return 0;
+    while (auto* entry = ::readdir(dir)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        int pid = std::atoi(entry->d_name);
+        if (pid <= 2) continue;
+
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        auto stat = readFile(path);
+        if (stat.empty()) continue;
+
+        auto* closeParen = std::strrchr(stat.c_str(), ')');
+        if (!closeParen) continue;
+        int ppid = 0;
+        if (std::sscanf(closeParen + 2, "%*c %d", &ppid) != 1) continue;
+        if (ppid != 2) continue;
+
+        if (::sched_setaffinity(pid, sizeof(cpuset), &cpuset) == 0)
+            moved++;
+    }
+    ::closedir(dir);
+    return moved;
+}
+
+// Redirect all kernel workqueues to core 0 (cpumask 0x1).
+int migrateWorkqueues() {
+    int moved = 0;
+    DIR* dir = ::opendir("/sys/devices/virtual/workqueue");
+    if (!dir) return 0;
+    while (auto* entry = ::readdir(dir)) {
+        if (entry->d_name[0] == '.') continue;
+        char path[256];
+        std::snprintf(path, sizeof(path),
+                      "/sys/devices/virtual/workqueue/%s/cpumask", entry->d_name);
+        if (writeFile(path, "1"))
+            moved++;
+    }
+    ::closedir(dir);
+    return moved;
+}
+
 } // namespace
 
 // =============================================================================
@@ -109,56 +158,58 @@ std::string cpuListExcluding(int core) {
 NicTuner::NicTuner(const char* interface, int cpuCore)
 {
     // --- 0. Stop irqbalance ---
-    if (std::system("systemctl stop irqbalance 2>/dev/null") == 0)
-        std::fprintf(stderr, "[NicTuner] irqbalance stopped\n");
+    std::system("systemctl stop irqbalance 2>/dev/null");
+
+    // --- 0a. Move all kernel threads to core 0 ---
+    if (migrateKernelThreads() == 0)
+        std::fprintf(stderr, "[NicTuner] FAIL: could not migrate any kernel threads to core 0\n");
+
+    // --- 0b. Move all kernel workqueues to core 0 ---
+    if (migrateWorkqueues() == 0)
+        std::fprintf(stderr, "[NicTuner] FAIL: could not redirect any workqueues to core 0\n");
 
     m_ethtoolFd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (m_ethtoolFd < 0)
-        std::fprintf(stderr, "[NicTuner] Warning: socket() failed: %s\n", std::strerror(errno));
+        std::fprintf(stderr, "[NicTuner] FAIL: socket() for ethtool: %s\n", std::strerror(errno));
 
     char path[128];
 
-    // --- 0b. Hold /dev/cpu_dma_latency at 0 to prevent deep C-states ---
-    // The kernel grants the requested latency as long as the fd stays open.
-    // C3/C6 wakeup can add 10-30µs of jitter; this keeps cores in C0/C1.
+    // --- 0c. Hold /dev/cpu_dma_latency at 0 to prevent deep C-states ---
     m_dmaLatencyFd = ::open("/dev/cpu_dma_latency", O_WRONLY);
     if (m_dmaLatencyFd >= 0) {
         std::int32_t lat = 0;
-        if (::write(m_dmaLatencyFd, &lat, sizeof(lat)) == sizeof(lat))
-            std::fprintf(stderr, "[NicTuner] cpu_dma_latency: 0 (C-states disabled)\n");
+        if (::write(m_dmaLatencyFd, &lat, sizeof(lat)) != sizeof(lat))
+            std::fprintf(stderr, "[NicTuner] FAIL: cpu_dma_latency write\n");
+    } else {
+        std::fprintf(stderr, "[NicTuner] FAIL: open /dev/cpu_dma_latency: %s\n", std::strerror(errno));
     }
 
-    // --- 0c. CPU frequency governor → performance ---
+    // --- 0d. CPU frequency governor → performance ---
     std::snprintf(path, sizeof(path),
                   "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpuCore);
-    auto oldGov = readFile(path);
-    if (writeFile(path, "performance"))
-        std::fprintf(stderr, "[NicTuner] CPU%d governor: %s -> performance\n",
-                     cpuCore, oldGov.c_str());
+    if (!writeFile(path, "performance"))
+        std::fprintf(stderr, "[NicTuner] FAIL: set governor on CPU%d\n", cpuCore);
 
-    // --- 0d. Kernel busy-poll: enable NAPI polling from socket context ---
-    // net.core.busy_poll  = time (µs) to busy-poll in poll()/select()
-    // net.core.busy_read  = time (µs) to busy-poll in blocking recv()
-    auto oldBusyPoll = readFile("/proc/sys/net/core/busy_poll");
-    auto oldBusyRead = readFile("/proc/sys/net/core/busy_read");
-    writeFile("/proc/sys/net/core/busy_poll", "50");
-    writeFile("/proc/sys/net/core/busy_read", "50");
-    std::fprintf(stderr, "[NicTuner] net.core.busy_poll: %s -> 50, busy_read: %s -> 50\n",
-                 oldBusyPoll.c_str(), oldBusyRead.c_str());
+    // --- 0e. Kernel busy-poll ---
+    if (!writeFile("/proc/sys/net/core/busy_poll", "50"))
+        std::fprintf(stderr, "[NicTuner] FAIL: set net.core.busy_poll\n");
+    if (!writeFile("/proc/sys/net/core/busy_read", "50"))
+        std::fprintf(stderr, "[NicTuner] FAIL: set net.core.busy_read\n");
+
+    // --- 0f. Reduce VM stat timer from 1s to 120s ---
+    if (!writeFile("/proc/sys/vm/stat_interval", "120"))
+        std::fprintf(stderr, "[NicTuner] FAIL: set vm.stat_interval\n");
 
     // --- 1. Interrupt coalescing: zero delay ---
     if (m_ethtoolFd >= 0) {
         ethtool_coalesce ec{};
         ec.cmd = ETHTOOL_GCOALESCE;
         if (ethtoolIoctl(m_ethtoolFd, interface, &ec)) {
-            auto oldRx = ec.rx_coalesce_usecs;
-            auto oldTx = ec.tx_coalesce_usecs;
             ec.cmd = ETHTOOL_SCOALESCE;
             ec.rx_coalesce_usecs = 0;
             ec.tx_coalesce_usecs = 0;
-            if (ethtoolIoctl(m_ethtoolFd, interface, &ec))
-                std::fprintf(stderr, "[NicTuner] rx-usecs: %u -> 0, tx-usecs: %u -> 0\n",
-                             oldRx, oldTx);
+            if (!ethtoolIoctl(m_ethtoolFd, interface, &ec))
+                std::fprintf(stderr, "[NicTuner] FAIL: set interrupt coalescing to 0\n");
         }
 
         // --- 2. NIC offloads: disable GRO, GSO, TSO ---
@@ -168,8 +219,8 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
             if (ethtoolIoctl(m_ethtoolFd, interface, &ev) && ev.data != 0) {
                 ev.cmd = set;
                 ev.data = 0;
-                if (ethtoolIoctl(m_ethtoolFd, interface, &ev))
-                    std::fprintf(stderr, "[NicTuner] %s: on -> off\n", name);
+                if (!ethtoolIoctl(m_ethtoolFd, interface, &ev))
+                    std::fprintf(stderr, "[NicTuner] FAIL: disable %s\n", name);
             }
         };
         disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
@@ -177,7 +228,6 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
         disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
 
         // --- 2b. RSS: steer all RX traffic to queue 0 ---
-        // First, query the indirection table size
         ethtool_rxnfc rxnfc{};
         rxnfc.cmd = ETHTOOL_GRXRINGS;
         std::uint32_t numQueues = 0;
@@ -185,33 +235,26 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
             numQueues = static_cast<std::uint32_t>(rxnfc.data);
 
         if (numQueues > 0) {
-            // Get current table size
             ethtool_rxfh_indir indirHdr{};
             indirHdr.cmd = ETHTOOL_GRXFHINDIR;
-            indirHdr.size = 0;  // query size first
+            indirHdr.size = 0;
             ethtoolIoctl(m_ethtoolFd, interface, &indirHdr);
 
             if (indirHdr.size > 0) {
-                // Allocate and fill: all entries point to queue 0
                 auto bytes = sizeof(ethtool_rxfh_indir) + indirHdr.size * sizeof(std::uint32_t);
                 auto* indir = static_cast<ethtool_rxfh_indir*>(std::calloc(1, bytes));
                 indir->cmd  = ETHTOOL_SRXFHINDIR;
                 indir->size = indirHdr.size;
-                // All entries already 0 from calloc → all traffic to queue 0
-
-                if (ethtoolIoctl(m_ethtoolFd, interface, indir))
-                    std::fprintf(stderr, "[NicTuner] RSS: all %u buckets -> queue 0\n", indir->size);
+                if (!ethtoolIoctl(m_ethtoolFd, interface, indir))
+                    std::fprintf(stderr, "[NicTuner] FAIL: set RSS indirection table\n");
                 std::free(indir);
             }
         }
     }
 
     // --- 3. RT throttling: disable 50ms forced sleep ---
-    int oldRt = 0;
-    auto s = readFile("/proc/sys/kernel/sched_rt_runtime_us");
-    if (!s.empty()) oldRt = std::atoi(s.c_str());
-    if (writeInt("/proc/sys/kernel/sched_rt_runtime_us", -1))
-        std::fprintf(stderr, "[NicTuner] sched_rt_runtime_us: %d -> -1\n", oldRt);
+    if (!writeInt("/proc/sys/kernel/sched_rt_runtime_us", -1))
+        std::fprintf(stderr, "[NicTuner] FAIL: disable RT throttling\n");
 
     // --- 4. Raise ksoftirqd on target core to SCHED_FIFO:50 ---
     char ksoftName[32];
@@ -219,35 +262,32 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
     int kpid = findPidByComm(ksoftName);
     if (kpid > 0) {
         sched_param sp{};
-        int oldPrio = 0;
-        sched_getparam(kpid, &sp);
-        oldPrio = sp.sched_priority;
         sp.sched_priority = 50;
-        if (sched_setscheduler(kpid, SCHED_FIFO, &sp) == 0)
-            std::fprintf(stderr, "[NicTuner] %s (pid %d): prio %d -> FIFO:50\n",
-                         ksoftName, kpid, oldPrio);
+        if (sched_setscheduler(kpid, SCHED_FIFO, &sp) != 0)
+            std::fprintf(stderr, "[NicTuner] FAIL: ksoftirqd/%d SCHED_FIFO:50: %s\n",
+                         cpuCore, std::strerror(errno));
+    } else {
+        std::fprintf(stderr, "[NicTuner] FAIL: ksoftirqd/%d not found\n", cpuCore);
     }
 
     // --- 5. Pin NIC IRQs to target core, move everything else off ---
     auto nicIrqs = findNicIrqs(interface);
-    auto isNicIrq = [&](int irq) {
-        for (int n : nicIrqs) if (n == irq) return true;
-        return false;
-    };
+    if (nicIrqs.empty())
+        std::fprintf(stderr, "[NicTuner] FAIL: no IRQs found for %s\n", interface);
 
-    // Pin NIC IRQ(s) to target core
     char coreStr[8];
     std::snprintf(coreStr, sizeof(coreStr), "%d", cpuCore);
     for (int irq : nicIrqs) {
         std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-        if (writeFile(path, coreStr))
-            std::fprintf(stderr, "[NicTuner] IRQ %d (%s) pinned to core %d\n",
-                         irq, interface, cpuCore);
+        if (!writeFile(path, coreStr))
+            std::fprintf(stderr, "[NicTuner] FAIL: pin IRQ %d to core %d\n", irq, cpuCore);
     }
 
-    // Move all other IRQs off target core
+    auto isNicIrq = [&](int irq) {
+        for (int n : nicIrqs) if (n == irq) return true;
+        return false;
+    };
     std::string mask = cpuListExcluding(cpuCore);
-    int moved = 0;
     DIR* irqDir = ::opendir("/proc/irq");
     if (irqDir) {
         while (auto* entry = ::readdir(irqDir)) {
@@ -255,14 +295,13 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
             int irq = std::atoi(entry->d_name);
             if (irq == 0 || isNicIrq(irq)) continue;
             std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-            if (writeFile(path, mask.c_str())) moved++;
+            writeFile(path, mask.c_str());
         }
         ::closedir(irqDir);
     }
-    if (moved > 0)
-        std::fprintf(stderr, "[NicTuner] Moved %d other IRQs off core %d\n", moved, cpuCore);
 
-    std::fprintf(stderr, "[NicTuner] Tuning applied for %s on core %d\n", interface, cpuCore);
+    // --- Summary ---
+    std::fprintf(stderr, "[NicTuner] Applied for %s on core %d\n", interface, cpuCore);
 }
 
 // =============================================================================
@@ -270,7 +309,6 @@ NicTuner::NicTuner(const char* interface, int cpuCore)
 // =============================================================================
 
 NicTuner::~NicTuner() {
-    if (m_dmaLatencyFd >= 0) ::close(m_dmaLatencyFd);  // restores default C-state policy
+    if (m_dmaLatencyFd >= 0) ::close(m_dmaLatencyFd);
     if (m_ethtoolFd >= 0) ::close(m_ethtoolFd);
-    std::fprintf(stderr, "[NicTuner] Done. Settings persist until reboot.\n");
 }

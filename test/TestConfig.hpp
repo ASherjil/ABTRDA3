@@ -17,15 +17,18 @@ struct RoleConfig {
 struct TestConfig {
   Transport     transport;
   std::uint16_t etherType;
-  std::uint32_t blockSize;       // packet_mmap only
-  std::uint32_t blockNumber;     // packet_mmap only
   std::uint32_t frameSize;       // Ethernet frame size (both transports)
   int           watchdogSec;
-  bool          skipNicTuner = false;  // skip NicTuner (safe for NFS-boot interfaces)
-  std::uint32_t sendIntervalUs = 0;   // µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
+  bool          skipNicTuner = false;
+  std::uint32_t sendIntervalUs = 0;   // µs between sends (0 = back-to-back, 1000 = 1ms)
   std::string   outputPath;           // latency output file (empty = no file)
   RoleConfig    server;
   RoleConfig    client;
+  std::uint32_t clientCount = 10;     // number of packets to send (client only)
+
+  // packet_mmap-specific
+  std::uint32_t mmapBlockSize   = 4096;
+  std::uint32_t mmapBlockNumber = 512;
 
   // AF_XDP-specific
   std::uint32_t xdpQueueId       = 0;
@@ -67,10 +70,8 @@ inline TestConfig loadConfig(const char* path) {
   else
       cfg.transport = Transport::PacketMmap;
 
-  cfg.etherType   = static_cast<std::uint16_t>(tbl["general"]["ether_type"].value_or(0x88B5));
-  cfg.blockSize   = static_cast<std::uint32_t>(tbl["general"]["block_size"].value_or(4096));
-  cfg.blockNumber = static_cast<std::uint32_t>(tbl["general"]["block_number"].value_or(64));
-  cfg.frameSize   = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
+  cfg.etherType      = static_cast<std::uint16_t>(tbl["general"]["ether_type"].value_or(0x88B5));
+  cfg.frameSize      = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
   cfg.watchdogSec    = tbl["general"]["watchdog_sec"].value_or(30);
   cfg.skipNicTuner   = tbl["general"]["skip_nic_tuner"].value_or(false);
   cfg.sendIntervalUs = static_cast<std::uint32_t>(tbl["general"]["send_interval_us"].value_or(0));
@@ -79,7 +80,14 @@ inline TestConfig loadConfig(const char* path) {
   cfg.server = loadRole(tbl, "server");
   cfg.client = loadRole(tbl, "client");
 
-  // AF_XDP settings (parsed regardless — only used when transport == AfXdp)
+  // Client count — from [client] section, overridable by --count CLI arg
+  cfg.clientCount = static_cast<std::uint32_t>(tbl["client"]["count"].value_or(10));
+
+  // packet_mmap settings
+  cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096));
+  cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));
+
+  // AF_XDP settings
   cfg.xdpQueueId       = static_cast<std::uint32_t>(tbl["af_xdp"]["queue_id"].value_or(0));
   cfg.xdpUmemFrameSize = static_cast<std::uint32_t>(tbl["af_xdp"]["umem_frame_size"].value_or(4096));
   cfg.xdpFrameCount    = static_cast<std::uint32_t>(tbl["af_xdp"]["frame_count"].value_or(64));
