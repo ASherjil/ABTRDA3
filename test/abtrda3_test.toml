@@ -2,25 +2,25 @@
 
 [general]
 transport        = "packet_mmap"  # "packet_mmap" or "af_xdp"
-watchdog_sec     = 30          # safety timeout (seconds)
+watchdog_sec     = 60000          # safety timeout (seconds)
 ether_type       = 0x88B5         # IEEE local experimental
 frame_size       = 64             # Minimum ethernet frame
-skip_nic_tuner   = true          # set true for NFS-boot interfaces (e.g. eno1)
+nic_tuner        = "nfs_safe"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
 send_interval_us = 1000           # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
-output           = ""
+output           = "/tmp/latencies_packet_mmap_2.txt"
 
 [server]
 interface    = "eno1"
 mac          = "20:87:56:b6:6a:27"
-cpu_core     = 4
+cpu_core     = 5
 xdp_queue_id = 0               # AF_XDP queue to bind (matches NIC queue for this interface)
 
 [client]
-interface    = "end0"
-mac          = "fc:0f:e7:1b:8b:55"
-cpu_core     = 1
+interface    = "eno1"
+mac          = "d4:f5:27:2a:69:f1"
+cpu_core     = 5
 xdp_queue_id = 1               # queue 1 = ntuple-steered timing traffic on macb
-count        = 20000            # number of packets to send (overridable with --count)
+count        = 50000000            # number of packets to send (overridable with --count)
 
 [packet_mmap]
 block_size   = 4096               # must be >= PAGE_SIZE (4096 on x86_64)

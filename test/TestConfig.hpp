@@ -1,5 +1,7 @@
 #pragma once
 
+#include "NicTuner.hpp"
+
 #include <toml++/toml.hpp>
 #include <array>
 #include <cstdio>
@@ -20,7 +22,7 @@ struct TestConfig {
   std::uint16_t etherType;
   std::uint32_t frameSize;       // Ethernet frame size (both transports)
   int           watchdogSec;
-  bool          skipNicTuner = false;
+  NicTunerMode  nicTunerMode = NicTunerMode::Full;
   std::uint32_t sendIntervalUs = 0;   // µs between sends (0 = back-to-back, 1000 = 1ms)
   std::string   outputPath;           // latency output file (empty = no file)
   RoleConfig    server;
@@ -73,7 +75,11 @@ inline TestConfig loadConfig(const char* path) {
   cfg.etherType      = static_cast<std::uint16_t>(tbl["general"]["ether_type"].value_or(0x88B5));
   cfg.frameSize      = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
   cfg.watchdogSec    = tbl["general"]["watchdog_sec"].value_or(30);
-  cfg.skipNicTuner   = tbl["general"]["skip_nic_tuner"].value_or(false);
+
+  auto nic_tuner_str = tbl["general"]["nic_tuner"].value_or(std::string("full"));
+  if (nic_tuner_str == "off")           cfg.nicTunerMode = NicTunerMode::Off;
+  else if (nic_tuner_str == "nfs_safe") cfg.nicTunerMode = NicTunerMode::NfsSafe;
+  else                                  cfg.nicTunerMode = NicTunerMode::Full;
   cfg.sendIntervalUs = static_cast<std::uint32_t>(tbl["general"]["send_interval_us"].value_or(0));
   cfg.outputPath     = tbl["general"]["output"].value_or(std::string{});
 

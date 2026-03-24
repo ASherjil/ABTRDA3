@@ -126,10 +126,10 @@ int main(int argc, char* argv[]) {
     // NIC offloads, RT throttling, ksoftirqd priority, IRQ affinity) and
     // restores originals on destruction. Skipped for NFS-boot interfaces.
     std::optional<NicTuner> tuner;
-    if (!cfg.skipNicTuner) {
-        tuner.emplace(role.interface.c_str(), role.cpuCore);
+    if (cfg.nicTunerMode != NicTunerMode::Off) {
+        tuner.emplace(role.interface.c_str(), role.cpuCore, cfg.nicTunerMode);
     } else {
-        std::fprintf(stderr, "[Config] NicTuner skipped (skip_nic_tuner = true)\n");
+        std::fprintf(stderr, "[NicTuner] Off\n");
     }
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
