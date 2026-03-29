@@ -46,9 +46,9 @@ target_compile_options(abtrda3_flags INTERFACE
 # Detect from compiler path so this works even when CLion sets the compiler
 # directly without a toolchain file (CMAKE_CROSSCOMPILING not set).
 if(CMAKE_CXX_COMPILER MATCHES "aarch64-linux-gnu")
-    target_compile_options(abtrda3_flags INTERFACE -march=armv8-a)
+    target_compile_options(abtrda3_flags INTERFACE -march=armv8-a+crc)
 elseif(CMAKE_CXX_COMPILER MATCHES "x86_64-linux-gnu")
-    target_compile_options(abtrda3_flags INTERFACE -march=x86-64 -mtune=generic)
+    target_compile_options(abtrda3_flags INTERFACE -march=x86-64-v3 -mtune=generic)
 else()
     # Native compiler — optimise for the host CPU
     target_compile_options(abtrda3_flags INTERFACE -march=native -mtune=native)
@@ -60,6 +60,7 @@ target_compile_options(abtrda3_flags INTERFACE
         -O3
         -DNDEBUG
         -flto=auto
+        -funroll-loops
     >
 )
 

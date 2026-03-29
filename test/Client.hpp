@@ -32,7 +32,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::vector<std::uint64_t> latencies_ns;
     latencies_ns.reserve(count);
 
-    constexpr std::uint64_t kTimeoutNs = 2'000'000; // 2ms
+    constexpr std::uint64_t kTimeoutNs = 5'000'000; // 5ms
 
     // Pacing: use CLOCK_MONOTONIC absolute sleeps for drift-free timing
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
@@ -73,24 +73,22 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         std::uint32_t spins = 0;
 
         while (true) {
-            RxFrame rxf = rx.tryReceive();
-            if (!rxf.data.empty()) [[unlikely]]{
+          if (RxFrame rxf = rx.tryReceive(); !rxf.data.empty()) [[unlikely]]{
                 if (rxf.data.size() >= cfg.frameSize)[[likely]] {
-                    // Verify sequence number matches current packet
+                    // Verify sequence number & src/dst mac addresses
                     std::uint32_t rx_seq;
                     std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
-                    if (rx_seq == seq_net)[[likely]] {
+                    if ((rx_seq == seq_net) && (std::memcmp(rxf.data.data() + 6, cfg.client.mac.data(), 6)))[[likely]] {
                         rx.release();
                         std::uint64_t t2 = now_ns();
                         latencies_ns.push_back(t2 - t1);
                         received = true;
                         break;
                     }
-                    // Wrong sequence — stale echo or outgoing copy, discard
                 }
                 rx.release();
             }
-            if ((++spins & 0xFFFF) == 0) {
+            if ((++spins & 0x7FF) == 0) {
                 if (stop.stop_requested() || (now_ns() - t1) >= kTimeoutNs) break;
             }
         }

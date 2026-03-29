@@ -48,10 +48,9 @@ public:
 
     // Be VERY CAREFULL. Its either reinterpret_cast<volatile T*> or std::atomic_ref
     std::atomic_ref<std::uint32_t> currentStatus(hdr->tp_status);
-    if (currentStatus.load(std::memory_order_acquire) != TP_STATUS_AVAILABLE) [[unlikely]]
+    if (currentStatus.load(std::memory_order_acquire) != TP_STATUS_AVAILABLE) [[unlikely]] {
       return nullptr;
-    if (frameLen > m_frameSize - kDataOffset) [[unlikely]]
-      return nullptr;
+    }
 
     hdr->tp_len     = frameLen;
     hdr->tp_snaplen = frameLen;

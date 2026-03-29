@@ -127,7 +127,7 @@ int main(int argc, char* argv[]) {
     // restores originals on destruction. Skipped for NFS-boot interfaces.
     std::optional<NicTuner> tuner;
     if (cfg.nicTunerMode != NicTunerMode::Off) {
-        tuner.emplace(role.interface.c_str(), role.cpuCore, cfg.nicTunerMode);
+        tuner.emplace(role.interface.c_str(), role.cpuCore, cfg.nicTunerMode, role.irqCore);
     } else {
         std::fprintf(stderr, "[NicTuner] Off\n");
     }

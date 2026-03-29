@@ -14,6 +14,7 @@ struct RoleConfig {
   std::string   interface;
   std::array<std::uint8_t, 6> mac;
   int           cpuCore;
+  int           irqCore = -1;     // nfs_safe: dedicated core for NIC IRQs (-1 = auto, use cpuCore-1)
   std::uint32_t xdpQueueId = 0;   // AF_XDP queue to bind (per-interface, e.g. ntuple steered queue)
 };
 
@@ -57,6 +58,7 @@ inline RoleConfig loadRole(const toml::table& tbl, const char* role) {
     rc.interface = tbl[role]["interface"].value_or("eno2"s);
     rc.mac       = parseMac(tbl[role]["mac"].value_or(""s));
     rc.cpuCore   = tbl[role]["cpu_core"].value_or(4);
+    rc.irqCore   = tbl[role]["irq_core"].value_or(-1);
     rc.xdpQueueId = static_cast<std::uint32_t>(tbl[role]["xdp_queue_id"].value_or(0));
     return rc;
 }

@@ -13,13 +13,15 @@ output           = "/tmp/latencies_packet_mmap_2.txt"
 interface    = "eno1"
 mac          = "20:87:56:b6:6a:27"
 cpu_core     = 5
-xdp_queue_id = 0               # AF_XDP queue to bind (matches NIC queue for this interface)
+irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
+xdp_queue_id = 0
 
 [client]
 interface    = "eno1"
 mac          = "d4:f5:27:2a:69:f1"
 cpu_core     = 5
-xdp_queue_id = 1               # queue 1 = ntuple-steered timing traffic on macb
+irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
+xdp_queue_id = 1
 count        = 50000000            # number of packets to send (overridable with --count)
 
 [packet_mmap]

@@ -153,7 +153,7 @@ int migrateWorkqueues() {
 // Constructor
 // =============================================================================
 
-NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
+NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int irqCore)
 {
     if (mode == NicTunerMode::Off) {
         std::fprintf(stderr, "[NicTuner] Off\n");
@@ -161,6 +161,11 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
     }
 
     const bool nfsSafe = (mode == NicTunerMode::NfsSafe);
+
+    // In nfs_safe mode, pick a dedicated core for NIC IRQ processing.
+    // Default (-1): use cpuCore - 1 (adjacent core, likely same L2 cache).
+    if (nfsSafe && irqCore < 0)
+        irqCore = (cpuCore > 1) ? cpuCore - 1 : 1;
 
     // ── Common to both modes ────────────────────────────────────────────
 
@@ -198,7 +203,7 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
     if (!writeFile("/proc/sys/vm/stat_interval", "120"))
         std::fprintf(stderr, "[NicTuner] FAIL: set vm.stat_interval\n");
 
-    // Interrupt coalescing: zero delay (safe for NFS — just increases interrupt rate)
+    // Interrupt coalescing: zero delay
     if (m_ethtoolFd >= 0) {
         ethtool_coalesce ec{};
         ec.cmd = ETHTOOL_GCOALESCE;
@@ -208,6 +213,25 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
             ec.tx_coalesce_usecs = 0;
             if (!ethtoolIoctl(m_ethtoolFd, interface, &ec))
                 std::fprintf(stderr, "[NicTuner] FAIL: set interrupt coalescing to 0\n");
+        }
+
+        // Disable GRO/GSO/TSO — reduces per-packet latency.
+        // Only in full mode: on NFS boot, disabling GRO causes ksoftirqd to
+        // monopolize the IRQ core processing the inflated packet rate, starving NFS.
+        if (!nfsSafe) {
+            auto disable = [&](std::uint32_t get, std::uint32_t set, const char* name) {
+                ethtool_value ev{};
+                ev.cmd = get;
+                if (ethtoolIoctl(m_ethtoolFd, interface, &ev) && ev.data != 0) {
+                    ev.cmd = set;
+                    ev.data = 0;
+                    if (!ethtoolIoctl(m_ethtoolFd, interface, &ev))
+                        std::fprintf(stderr, "[NicTuner] FAIL: disable %s\n", name);
+                }
+            };
+            disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
+            disable(ETHTOOL_GGSO, ETHTOOL_SGSO, "GSO");
+            disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
         }
     }
 
@@ -229,25 +253,9 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
         std::fprintf(stderr, "[NicTuner] FAIL: ksoftirqd/%d not found\n", cpuCore);
     }
 
-    // ── Full mode only ──────────────────────────────────────────────────
+    // ── Full mode only: RSS steering ────────────────────────────────────
 
     if (!nfsSafe && m_ethtoolFd >= 0) {
-        // Disable GRO/GSO/TSO — harmful on NFS boot (kills throughput)
-        auto disable = [&](std::uint32_t get, std::uint32_t set, const char* name) {
-            ethtool_value ev{};
-            ev.cmd = get;
-            if (ethtoolIoctl(m_ethtoolFd, interface, &ev) && ev.data != 0) {
-                ev.cmd = set;
-                ev.data = 0;
-                if (!ethtoolIoctl(m_ethtoolFd, interface, &ev))
-                    std::fprintf(stderr, "[NicTuner] FAIL: disable %s\n", name);
-            }
-        };
-        disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
-        disable(ETHTOOL_GGSO, ETHTOOL_SGSO, "GSO");
-        disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
-
-        // RSS: steer all RX traffic to queue 0
         ethtool_rxnfc rxnfc{};
         rxnfc.cmd = ETHTOOL_GRXRINGS;
         std::uint32_t numQueues = 0;
@@ -284,16 +292,42 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
     };
 
     if (nfsSafe) {
-        // NFS-safe: move ALL IRQs (including NIC) OFF the app core.
-        // NIC IRQs stay wherever they naturally are (typically core 0).
-        // This prevents NFS softirq processing from competing with our app.
-        std::string mask = cpuListExcluding(cpuCore);
+        // NFS-safe: pin NIC IRQs to a DEDICATED core (not app core, not core 0).
+        //   Core 0:       kernel threads, workqueues, NFS background work
+        //   irqCore:      NIC IRQs + ksoftirqd at FIFO:50 (fast packet processing)
+        //   cpuCore:      our app at FIFO:49 (clean, isolated)
+        char irqCoreStr[8];
+        std::snprintf(irqCoreStr, sizeof(irqCoreStr), "%d", irqCore);
+
+        for (int irq : nicIrqs) {
+            std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
+            if (!writeFile(path, irqCoreStr))
+                std::fprintf(stderr, "[NicTuner] FAIL: pin IRQ %d to irq_core %d\n", irq, irqCore);
+        }
+
+        // Do NOT boost ksoftirqd on the IRQ core — with constant NFS traffic,
+        // FIFO:50 ksoftirqd monopolizes the core and eventually stalls NFS RPC
+        // processing, killing the NFS mount after ~30 minutes.
+
+        // Performance governor on irqCore
+        std::snprintf(path, sizeof(path),
+                      "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", irqCore);
+        writeFile(path, "performance");
+
+        // Move ALL other IRQs off BOTH app core and irq core
+        std::string mask;
+        long nproc = ::sysconf(_SC_NPROCESSORS_ONLN);
+        for (int i = 0; i < nproc; ++i) {
+            if (i == cpuCore || i == irqCore) continue;
+            if (!mask.empty()) mask += ',';
+            mask += std::to_string(i);
+        }
         DIR* irqDir = ::opendir("/proc/irq");
         if (irqDir) {
             while (auto* entry = ::readdir(irqDir)) {
                 if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
                 int irq = std::atoi(entry->d_name);
-                if (irq == 0) continue;
+                if (irq == 0 || isNicIrq(irq)) continue;
                 std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
                 writeFile(path, mask.c_str());
             }
@@ -324,8 +358,13 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
         }
     }
 
-    std::fprintf(stderr, "[NicTuner] Applied (%s) for %s on core %d\n",
-                 nfsSafe ? "nfs_safe" : "full", interface, cpuCore);
+    // ── Summary ─────────────────────────────────────────────────────────
+
+    if (nfsSafe)
+        std::fprintf(stderr, "[NicTuner] Applied (nfs_safe) for %s | app=core %d, irq=core %d\n",
+                     interface, cpuCore, irqCore);
+    else
+        std::fprintf(stderr, "[NicTuner] Applied (full) for %s on core %d\n", interface, cpuCore);
 }
 
 // =============================================================================

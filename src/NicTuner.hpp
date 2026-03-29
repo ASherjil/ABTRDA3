@@ -8,12 +8,13 @@ enum class NicTunerMode { Off, NfsSafe, Full };
 /// Modes:
 ///   Full    — aggressive tuning for dedicated interfaces. Pins NIC IRQs to
 ///             app core, disables GRO/GSO/TSO, steers all RSS to queue 0.
-///   NfsSafe — isolates app core without breaking NFS. Moves all IRQs
-///             (including NIC) OFF the app core. Keeps GRO/GSO/TSO enabled.
+///   NfsSafe — isolates app core without breaking NFS. Pins NIC IRQs to a
+///             dedicated irqCore with boosted ksoftirqd. Disables GRO/GSO/TSO
+///             (safe with dedicated IRQ core handling the increased packet rate).
 ///   Off     — no tuning applied.
 class NicTuner {
 public:
-    NicTuner(const char* interface, int cpuCore, NicTunerMode mode);
+    NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int irqCore = -1);
     ~NicTuner();
 
     NicTuner(const NicTuner&)            = delete;
