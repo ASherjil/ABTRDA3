@@ -8,7 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <stop_token>
-#include <time.h>
+#include <ctime>
 #include <arpa/inet.h>
 
 [[gnu::always_inline]]
@@ -74,16 +74,20 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
 
         while (true) {
           if (RxFrame rxf = rx.tryReceive(); !rxf.data.empty()) [[unlikely]]{
-                if (rxf.data.size() >= cfg.frameSize)[[likely]] {
-                    // Verify sequence number & src/dst mac addresses
-                    std::uint32_t rx_seq;
-                    std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
-                    if ((rx_seq == seq_net) && (std::memcmp(rxf.data.data() + 6, cfg.client.mac.data(), 6)))[[likely]] {
-                        rx.release();
-                        std::uint64_t t2 = now_ns();
-                        latencies_ns.push_back(t2 - t1);
-                        received = true;
-                        break;
+                if (rxf.data.size() >= cfg.frameSize)[[likely]] { // Check 1: Bounds check ensure data is the correct size
+                    // Check 2: Check the dst mac address on the received frame. Is this packet for us ?
+                    if (std::memcmp(rxf.data.data(), cfg.client.mac.data(), 6) == 0)[[likely]]{
+                        std::uint32_t rx_seq;
+                        std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
+
+                        // Check 3: Check the sequence number to prevent packets from previous timeouts being recorded as genuine echo
+                        if (rx_seq == seq_net)[[likely]] {
+                            rx.release();
+                            std::uint64_t t2 = now_ns();
+                            latencies_ns.push_back(t2 - t1);
+                            received = true;
+                            break;
+                        }
                     }
                 }
                 rx.release();
@@ -122,7 +126,6 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::printf("P99 RTT:    %.2f us\n", to_us(p99));
     std::printf("P99.9 RTT:  %.2f us\n", to_us(p999));
     std::printf("Max RTT:    %.2f us\n", to_us(latencies_ns.back()));
-    std::printf("Avg RTT:    %.2f us\n", to_us(sum / n));
     std::printf("-----------------------------\n");
     std::printf("Est. One-Way Latency: %.2f us\n", to_us(p50) / 2.0);
 

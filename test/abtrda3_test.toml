@@ -2,17 +2,17 @@
 
 [general]
 transport        = "packet_mmap"  # "packet_mmap" or "af_xdp"
-watchdog_sec     = 60000          # safety timeout (seconds)
+watchdog_sec     = 30          # safety timeout (seconds)
 ether_type       = 0x88B5         # IEEE local experimental
 frame_size       = 64             # Minimum ethernet frame
-nic_tuner        = "nfs_safe"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
+nic_tuner        = "off"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
 send_interval_us = 1000           # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
-output           = "/tmp/latencies_packet_mmap_2.txt"
+output           = ""
 
 [server]
 interface    = "eno1"
 mac          = "20:87:56:b6:6a:27"
-cpu_core     = 5
+cpu_core     = 4
 irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
 xdp_queue_id = 0
 
@@ -21,8 +21,8 @@ interface    = "eno1"
 mac          = "d4:f5:27:2a:69:f1"
 cpu_core     = 5
 irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
-xdp_queue_id = 1
-count        = 50000000            # number of packets to send (overridable with --count)
+xdp_queue_id = 0
+count        = 100           # number of packets to send (overridable with --count)
 
 [packet_mmap]
 block_size   = 4096               # must be >= PAGE_SIZE (4096 on x86_64)
@@ -36,10 +36,10 @@ need_wakeup     = false           # mode auto-detected: native+zerocopy -> nativ
 
 # ip link show enoX
 # mkdev16 -> mac address
-# eno1 = 20:87:56:b6:6a:27, eno2 = 20:87:56:b6:33:67
+# eno1 = 20:87:56:b6:6a:27, eno2 = 20:87:56:b6:33:67, eno3 = 20:87:56:b6:33:68
 
 # mkdev30 -> mac address
-# eno1 = d4:f5:27:2a:69:f1, eno2 = d4:f5:27:2a:a9:59
+# eno1 = d4:f5:27:2a:69:f1, eno2 = d4:f5:27:2a:a9:59, eno3 = d4:f5:27:2a:a9:58
 
 # mkdev50 -> mac address
 # end0 = fc:0f:e7:1b:8b:55
