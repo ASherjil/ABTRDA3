@@ -89,6 +89,35 @@ std::vector<int> findNicIrqs(const char* iface) {
     return irqs;
 }
 
+int findSshdMasterPid() {
+    DIR* dir = ::opendir("/proc");
+    if (!dir) return -1;
+    while (auto* entry = ::readdir(dir)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        int pid = std::atoi(entry->d_name);
+        if (pid <= 1) continue;
+
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%s/comm", entry->d_name);
+        if (readFile(path) != "sshd") continue;
+
+        // Master sshd has ppid=1 (systemd)
+        std::snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
+        auto stat = readFile(path);
+        if (stat.empty()) continue;
+        auto* closeParen = std::strrchr(stat.c_str(), ')');
+        if (!closeParen) continue;
+        int ppid = 0;
+        if (std::sscanf(closeParen + 2, "%*c %d", &ppid) != 1) continue;
+        if (ppid == 1) {
+            ::closedir(dir);
+            return pid;
+        }
+    }
+    ::closedir(dir);
+    return -1;
+}
+
 std::string cpuListExcluding(int core) {
     long nproc = ::sysconf(_SC_NPROCESSORS_ONLN);
     std::string result;
@@ -153,7 +182,7 @@ int migrateWorkqueues() {
 // Constructor
 // =============================================================================
 
-NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int irqCore)
+NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
 {
     if (mode == NicTunerMode::Off) {
         std::fprintf(stderr, "[NicTuner] Off\n");
@@ -161,11 +190,6 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int ir
     }
 
     const bool nfsSafe = (mode == NicTunerMode::NfsSafe);
-
-    // In nfs_safe mode, pick a dedicated core for NIC IRQ processing.
-    // Default (-1): use cpuCore - 1 (adjacent core, likely same L2 cache).
-    if (nfsSafe && irqCore < 0)
-        irqCore = (cpuCore > 1) ? cpuCore - 1 : 1;
 
     // ── Common to both modes ────────────────────────────────────────────
 
@@ -216,23 +240,19 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int ir
         }
 
         // Disable GRO/GSO/TSO — reduces per-packet latency.
-        // Only in full mode: on NFS boot, disabling GRO causes ksoftirqd to
-        // monopolize the IRQ core processing the inflated packet rate, starving NFS.
-        if (!nfsSafe) {
-            auto disable = [&](std::uint32_t get, std::uint32_t set, const char* name) {
-                ethtool_value ev{};
-                ev.cmd = get;
-                if (ethtoolIoctl(m_ethtoolFd, interface, &ev) && ev.data != 0) {
-                    ev.cmd = set;
-                    ev.data = 0;
-                    if (!ethtoolIoctl(m_ethtoolFd, interface, &ev))
-                        std::fprintf(stderr, "[NicTuner] FAIL: disable %s\n", name);
-                }
-            };
-            disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
-            disable(ETHTOOL_GGSO, ETHTOOL_SGSO, "GSO");
-            disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
-        }
+        auto disable = [&](std::uint32_t get, std::uint32_t set, const char* name) {
+            ethtool_value ev{};
+            ev.cmd = get;
+            if (ethtoolIoctl(m_ethtoolFd, interface, &ev) && ev.data != 0) {
+                ev.cmd = set;
+                ev.data = 0;
+                if (!ethtoolIoctl(m_ethtoolFd, interface, &ev))
+                    std::fprintf(stderr, "[NicTuner] FAIL: disable %s\n", name);
+            }
+        };
+        disable(ETHTOOL_GGRO, ETHTOOL_SGRO, "GRO");
+        disable(ETHTOOL_GGSO, ETHTOOL_SGSO, "GSO");
+        disable(ETHTOOL_GTSO, ETHTOOL_STSO, "TSO");
     }
 
     if (!writeInt("/proc/sys/kernel/sched_rt_runtime_us", -1))
@@ -253,9 +273,9 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int ir
         std::fprintf(stderr, "[NicTuner] FAIL: ksoftirqd/%d not found\n", cpuCore);
     }
 
-    // ── Full mode only: RSS steering ────────────────────────────────────
+    // ── RSS steering ────────────────────────────────────────────────────
 
-    if (!nfsSafe && m_ethtoolFd >= 0) {
+    if (m_ethtoolFd >= 0) {
         ethtool_rxnfc rxnfc{};
         rxnfc.cmd = ETHTOOL_GRXRINGS;
         std::uint32_t numQueues = 0;
@@ -280,7 +300,9 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int ir
         }
     }
 
-    // ── IRQ handling (differs by mode) ──────────────────────────────────
+    // ── IRQ handling ─────────────────────────────────────────────────────
+    // Pin NIC IRQs TO the app core (same core = hot cache),
+    // move everything else OFF.
 
     auto nicIrqs = findNicIrqs(interface);
     if (nicIrqs.empty())
@@ -291,80 +313,49 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode, int ir
         return false;
     };
 
+    char coreStr[8];
+    std::snprintf(coreStr, sizeof(coreStr), "%d", cpuCore);
+    for (int irq : nicIrqs) {
+        std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
+        if (!writeFile(path, coreStr))
+            std::fprintf(stderr, "[NicTuner] FAIL: pin IRQ %d to core %d\n", irq, cpuCore);
+    }
+
+    std::string mask = cpuListExcluding(cpuCore);
+    DIR* irqDir = ::opendir("/proc/irq");
+    if (irqDir) {
+        while (auto* entry = ::readdir(irqDir)) {
+            if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+            int irq = std::atoi(entry->d_name);
+            if (irq == 0 || isNicIrq(irq)) continue;
+            std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
+            writeFile(path, mask.c_str());
+        }
+        ::closedir(irqDir);
+    }
+
+    // ── NfsSafe: boost sshd so SSH survives RT starvation ──────────────
+    // The master sshd (ppid=1) is boosted to SCHED_RR:1. Forked children
+    // (new SSH sessions) inherit the policy automatically.
+
     if (nfsSafe) {
-        // NFS-safe: pin NIC IRQs to a DEDICATED core (not app core, not core 0).
-        //   Core 0:       kernel threads, workqueues, NFS background work
-        //   irqCore:      NIC IRQs + ksoftirqd at FIFO:50 (fast packet processing)
-        //   cpuCore:      our app at FIFO:49 (clean, isolated)
-        char irqCoreStr[8];
-        std::snprintf(irqCoreStr, sizeof(irqCoreStr), "%d", irqCore);
-
-        for (int irq : nicIrqs) {
-            std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-            if (!writeFile(path, irqCoreStr))
-                std::fprintf(stderr, "[NicTuner] FAIL: pin IRQ %d to irq_core %d\n", irq, irqCore);
-        }
-
-        // Do NOT boost ksoftirqd on the IRQ core — with constant NFS traffic,
-        // FIFO:50 ksoftirqd monopolizes the core and eventually stalls NFS RPC
-        // processing, killing the NFS mount after ~30 minutes.
-
-        // Performance governor on irqCore
-        std::snprintf(path, sizeof(path),
-                      "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", irqCore);
-        writeFile(path, "performance");
-
-        // Move ALL other IRQs off BOTH app core and irq core
-        std::string mask;
-        long nproc = ::sysconf(_SC_NPROCESSORS_ONLN);
-        for (int i = 0; i < nproc; ++i) {
-            if (i == cpuCore || i == irqCore) continue;
-            if (!mask.empty()) mask += ',';
-            mask += std::to_string(i);
-        }
-        DIR* irqDir = ::opendir("/proc/irq");
-        if (irqDir) {
-            while (auto* entry = ::readdir(irqDir)) {
-                if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
-                int irq = std::atoi(entry->d_name);
-                if (irq == 0 || isNicIrq(irq)) continue;
-                std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-                writeFile(path, mask.c_str());
-            }
-            ::closedir(irqDir);
-        }
-    } else {
-        // Full: pin NIC IRQs TO the app core (same core = hot cache),
-        // move everything else OFF.
-        char coreStr[8];
-        std::snprintf(coreStr, sizeof(coreStr), "%d", cpuCore);
-        for (int irq : nicIrqs) {
-            std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-            if (!writeFile(path, coreStr))
-                std::fprintf(stderr, "[NicTuner] FAIL: pin IRQ %d to core %d\n", irq, cpuCore);
-        }
-
-        std::string mask = cpuListExcluding(cpuCore);
-        DIR* irqDir = ::opendir("/proc/irq");
-        if (irqDir) {
-            while (auto* entry = ::readdir(irqDir)) {
-                if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
-                int irq = std::atoi(entry->d_name);
-                if (irq == 0 || isNicIrq(irq)) continue;
-                std::snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
-                writeFile(path, mask.c_str());
-            }
-            ::closedir(irqDir);
+        int sshdPid = findSshdMasterPid();
+        if (sshdPid > 0) {
+            sched_param sp{};
+            sp.sched_priority = 1;
+            if (::sched_setscheduler(sshdPid, SCHED_RR, &sp) == 0)
+                std::fprintf(stderr, "[NicTuner] sshd (pid %d) → SCHED_RR:1\n", sshdPid);
+            else
+                std::fprintf(stderr, "[NicTuner] FAIL: sshd SCHED_RR:1: %s\n", std::strerror(errno));
+        } else {
+            std::fprintf(stderr, "[NicTuner] WARN: sshd master not found, SSH may be unresponsive\n");
         }
     }
 
     // ── Summary ─────────────────────────────────────────────────────────
 
-    if (nfsSafe)
-        std::fprintf(stderr, "[NicTuner] Applied (nfs_safe) for %s | app=core %d, irq=core %d\n",
-                     interface, cpuCore, irqCore);
-    else
-        std::fprintf(stderr, "[NicTuner] Applied (full) for %s on core %d\n", interface, cpuCore);
+    std::fprintf(stderr, "[NicTuner] Applied (%s) for %s on core %d\n",
+                 nfsSafe ? "nfs_safe" : "full", interface, cpuCore);
 }
 
 // =============================================================================
