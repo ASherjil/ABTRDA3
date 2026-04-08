@@ -17,6 +17,7 @@
 #include "AFXDPTx.hpp"
 #include "AFXDPRx.hpp"
 #endif
+#include "Intel_I210.hpp"
 
 #include <cstdio>
 #include <cstring>

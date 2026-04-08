@@ -1,12 +1,12 @@
 # =============================================================================
-# ABTRDA3 — Ultra-Low Latency Packet MMAP Library
+# ABTRDA3 — Ultra-Low Latency Network Library
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.21)
 
 project(ABTRDA3
         VERSION 0.1.0
-        DESCRIPTION "packet_mmap TX/RX for WREN timing sidecar"
+        DESCRIPTION "Multi-transport low-latency networking for WREN timing sidecar"
         LANGUAGES CXX C
 )
 
@@ -43,14 +43,11 @@ target_compile_options(abtrda3_flags INTERFACE
 )
 
 # Architecture-specific flags
-# Detect from compiler path so this works even when CLion sets the compiler
-# directly without a toolchain file (CMAKE_CROSSCOMPILING not set).
 if(CMAKE_CXX_COMPILER MATCHES "aarch64-linux-gnu")
     target_compile_options(abtrda3_flags INTERFACE -march=armv8-a+crc)
 elseif(CMAKE_CXX_COMPILER MATCHES "x86_64-linux-gnu")
     target_compile_options(abtrda3_flags INTERFACE -march=x86-64-v3 -mtune=generic)
 else()
-    # Native compiler — optimise for the host CPU
     target_compile_options(abtrda3_flags INTERFACE -march=native -mtune=native)
 endif()
 
@@ -80,16 +77,17 @@ target_link_options(abtrda3_flags INTERFACE
 )
 
 # =============================================================================
-# AF_XDP Transport (optional)
+# Dependencies
 # =============================================================================
 
-option(ABTRDA3_ENABLE_AF_XDP "Enable AF_XDP transport (requires clang, libelf, zlib)" OFF)
+include(FetchContent)
 
-if(ABTRDA3_ENABLE_AF_XDP)
-    message(STATUS "AF_XDP transport: ENABLED")
-else()
-    message(STATUS "AF_XDP transport: disabled")
-endif()
+# ABTEdge — kernel-bypass hardware access (Intel I210 DMA, hugepages)
+FetchContent_Declare(abtedge
+    GIT_REPOSITORY ssh://git@gitlab.cern.ch:7999/abt-projects/software/kitr/drivers/abtedge.git
+    GIT_TAG        master
+)
+FetchContent_MakeAvailable(abtedge)
 
 # =============================================================================
 # Library
@@ -113,11 +111,7 @@ endif()
 
 message(STATUS "")
 message(STATUS "Targets:")
-if(ABTRDA3_ENABLE_AF_XDP)
-    message(STATUS "  - abtrda3      : Packet MMAP + AF_XDP library (STATIC)")
-else()
-    message(STATUS "  - abtrda3      : Packet MMAP library (STATIC)")
-endif()
+message(STATUS "  - abtrda3      : Multi-transport networking library (STATIC)")
 if(ABTRDA3_BUILD_TESTS)
     message(STATUS "  - abtrda3_test : Ping-pong / burst test binary")
 endif()
