@@ -12,11 +12,10 @@
 #include "SocketOps.hpp"
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
-#ifdef ABTRDA3_HAS_AF_XDP
 #include "AFXDPSocket.hpp"
 #include "AFXDPTx.hpp"
 #include "AFXDPRx.hpp"
-#endif
+#include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 
 #include <cstdio>
@@ -175,7 +174,7 @@ int main(int argc, char* argv[]) {
 
 
       // ── Transport dispatch ──────────────────────────────────────────────
-      if (cfg.transport == Transport::PacketMmap) {
+      if (cfg.transport == "packet_mmap") {
           // Build packet_mmap ring configs
           RingConfig tx_cfg{};
           tx_cfg.interface     = role.interface.c_str();
@@ -206,8 +205,7 @@ int main(int argc, char* argv[]) {
               run_client(tx, rx, cfg, count, g_stop.get_token());
           }
       }
-  #ifdef ABTRDA3_HAS_AF_XDP
-      else if (cfg.transport == Transport::AfXdp) {
+      else if (cfg.transport == "af_xdp") {
           XdpConfig xdp_cfg{};
           xdp_cfg.interface  = role.interface.c_str();
           xdp_cfg.queueId    = role.xdpQueueId;
@@ -230,9 +228,43 @@ int main(int argc, char* argv[]) {
               run_client(tx, rx, cfg, count, g_stop.get_token());
           }
       }
-  #endif
+      else if (cfg.transport == "intel_i210") {
+
+        if (is_server) {
+            Intel_I210<DriverMode::RxTx> customPMD;
+            if (!ensureHugepages(16)) {
+                std::fprintf(stderr, "Error: hugepage allocation failed\n");
+                return 1;
+            }
+            if (!customPMD.init("0000:0c:00.0")) {
+                std::fprintf(stderr, "Error: I210 init failed\n");
+                return 1;
+            }
+
+            std::printf("[Transport]: intel_i210 (PMD) on server");
+
+            run_server(customPMD, customPMD, cfg, g_stop.get_token());
+        }
+        else {
+
+            Intel_I210<DriverMode::RxTx> customPMD;
+            if (!ensureHugepages(16)) {
+                std::fprintf(stderr, "Error: hugepage allocation failed\n");
+                return 1;
+            }
+            if (!customPMD.init("0000:07:00.0")) {
+                std::fprintf(stderr, "Error: I210 init failed\n");
+                return 1;
+            }
+
+            std::printf("[Transport]: intel_i210 (PMD) on client");
+
+            run_client(customPMD, customPMD, cfg, count, g_stop.get_token());
+        }
+
+      }
       else {
-          std::fprintf(stderr, "Error: unknown transport (AF_XDP not compiled in?)\n");
+          std::fprintf(stderr, "Error: unknown transport, application is dead.\n");
           return 1;
       }
 

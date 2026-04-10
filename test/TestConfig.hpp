@@ -8,8 +8,6 @@
 #include <string>
 #include <stdexcept>
 
-enum class Transport { PacketMmap, AfXdp };
-
 struct RoleConfig {
   std::string   interface;
   std::array<std::uint8_t, 6> mac;
@@ -19,7 +17,7 @@ struct RoleConfig {
 };
 
 struct TestConfig {
-  Transport     transport;
+  std::string   transport;
   std::uint16_t etherType;
   std::uint32_t frameSize;       // Ethernet frame size (both transports)
   int           watchdogSec;
@@ -67,13 +65,7 @@ inline TestConfig loadConfig(const char* path) {
   auto tbl = toml::parse_file(path);
   TestConfig cfg{};
 
-  // Transport selection
-  auto transport_str = tbl["general"]["transport"].value_or(std::string("packet_mmap"));
-  if (transport_str == "af_xdp")
-      cfg.transport = Transport::AfXdp;
-  else
-      cfg.transport = Transport::PacketMmap;
-
+  cfg.transport      = tbl["general"]["transport"].value_or(std::string("packet_mmap"));
   cfg.etherType      = static_cast<std::uint16_t>(tbl["general"]["ether_type"].value_or(0x88B5));
   cfg.frameSize      = static_cast<std::uint32_t>(tbl["general"]["frame_size"].value_or(64));
   cfg.watchdogSec    = tbl["general"]["watchdog_sec"].value_or(30);

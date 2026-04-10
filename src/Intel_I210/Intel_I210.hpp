@@ -5,7 +5,7 @@
 #ifndef ABTEDGE_INTEL_I210_H
 #define ABTEDGE_INTEL_I210_H
 
-#include "common/I210Registers.hpp"
+#include "I210Registers.hpp"
 #include "RxFrame.hpp"
 #include "DMARing.hpp"
 #include "HugepageBuffer.hpp"
@@ -100,10 +100,25 @@ public:
     if (!mmapBar0()) {
       return false;
     }
+    if (!enableBusMaster()) {
+      return false;
+    }
 
     reset();
     disableInterrupts();
     readMacAddress();
+
+    // Initialise PHY: reset, advertise all speeds, restart auto-negotiation
+    if (!initPhy()) {
+      return false;
+    }
+
+    // Set link up so MAC recognises PHY's LINK indication (Section 3.7.4.4.1)
+    // Also clear FRCSPD so MAC auto-detects speed from PHY (Section 3.7.4.4.2)
+    std::uint32_t ctrl = readReg(CTRL);
+    ctrl |= CTRL_SLU;
+    ctrl &= ~(CTRL_FRCSPD | CTRL_FRCDPLX);
+    writeReg(CTRL, ctrl);
 
     if constexpr (HAS_RX) {
       if (!initRx()) {
@@ -116,18 +131,15 @@ public:
       }
     }
 
-    // Set link up
-    writeReg(CTRL, readReg(CTRL) | CTRL_SLU);
-
-    // Wait for the link up to 3 seconds
-    for (int i{}; i<3; i++) {
+    // Wait for link — 1000BASE-T auto-negotiation takes 3-5s
+    for (int i{}; i < 5; i++) {
       if (isLinkUp()) {
         std::fprintf(stderr, "[I210] Link up at %u Mbps.\n", linkSpeedMbps());
         return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
-    std::fprintf(stderr, "[I210] Warning: link not up after 3s\n");
+    std::fprintf(stderr, "[I210] Warning: link not up after 5s\n");
     return true;
   }
 
@@ -154,6 +166,8 @@ public:
       ::close(m_barFd);
       m_barFd = -1;
     }
+
+    //rebindKernelDriver();
   }
 
   [[nodiscard]] bool isLinkUp() const {
@@ -170,9 +184,11 @@ public:
     return m_mac;
   }
 
-  void prefillRing(std::span<const std::uint8_t> frameTemplate) const noexcept {
-    // No op, function NOT NEEDED 
-    static_cast<void>(frameTemplate);
+  void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (HAS_TX) {
+    for (std::size_t i{}; i < NumTxDesc; i++) {
+      std::memcpy(m_txBuffer.ptrAt<std::uint8_t>(i * BuffSize),
+                  frameTemplate.data(), frameTemplate.size());
+    }
   }
   // Initialisation functions on the cold path. END
 
@@ -180,12 +196,12 @@ public:
   [[nodiscard, gnu::always_inline]]
   inline RxFrame tryReceive() noexcept requires (HAS_RX){
     const RxDescriptor& desc = m_rxRing[m_rxTail];
-    if (!(desc.status & RXD_STAT_DD))[[likely]] {
+    if (!(desc.wb.statusError & RXD_STAT_DD))[[likely]] {
       return {};
     }
 
     return {
-      .data   = {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), desc.length},
+      .data   = {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), desc.wb.length},
       .sec    = 0,
       .nsec   = 0,
       .status = 1   // non-zero = frame present
@@ -195,8 +211,9 @@ public:
   [[gnu::always_inline]]
   inline void release() noexcept requires (HAS_RX){
     RxDescriptor& desc = m_rxRing[m_rxTail];
-    desc.status = 0;
-    // buffer address stays the same - we reuse the same slot
+    // Reset to read format — restore buffer address for hardware reuse
+    desc.read.pktAddr = m_rxBuffer.physicalAddrAt(m_rxTail * BuffSize);
+    desc.read.hdrAddr = 0;
     std::size_t prev = m_rxTail;
     m_rxTail = (m_rxTail + 1) & RX_RING_MASK;
     writeReg(RDT0, static_cast<std::uint32_t>(prev));
@@ -214,13 +231,11 @@ public:
     }
 
     TxDescriptor& desc = m_txRing[m_txTail];
-    desc.bufferAddr = m_txBuffer.physicalAddrAt(m_txTail * BuffSize);
-    desc.length     = frameLen;
-    desc.cmd        = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
-    desc.cso        = 0;
-    desc.sta        = 0;
-    desc.css        = 0;
-    desc.vlanTag    = 0;
+    desc.read.bufferAddr   = m_txBuffer.physicalAddrAt(m_txTail * BuffSize);
+    desc.read.cmdTypeLen   = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS
+                           | TXD_CMD_DEXT | TXD_DTYP_DATA
+                           | frameLen;
+    desc.read.olinfoStatus = static_cast<std::uint32_t>(frameLen) << TXD_PAYLEN_SHIFT;
 
     return m_txBuffer.ptrAt<std::uint8_t>(m_txTail * BuffSize);
   }
@@ -298,12 +313,39 @@ private:
     }
     ssize_t written = ::write(fd, m_bdf.c_str(), m_bdf.size());
     ::close(fd);
-    if (written < 0) {
-      std::fprintf(stderr, "[I210] Failed to unbind igb driver.\n");
+
+    // Verify the driver is actually unbound by checking the sysfs symlink
+    std::string boundPath = "/sys/bus/pci/drivers/igb/" + m_bdf;
+    if (::access(boundPath.c_str(), F_OK) == 0) {
+      std::fprintf(stderr, "[I210] Failed to unbind igb driver from %s\n", m_bdf.c_str());
       return false;
     }
-    std::fprintf(stderr, "[I210] Unbound igb driver from %s\n", m_bdf.c_str());
+
+    if (written > 0) {
+      std::fprintf(stderr, "[I210] Unbound igb driver from %s\n", m_bdf.c_str());
+    } else {
+      std::fprintf(stderr, "[I210] igb driver already unbound from %s\n", m_bdf.c_str());
+    }
     return true;
+  }
+
+  void rebindKernelDriver() {
+    if (m_bdf.empty()) {
+      return;
+    }
+    std::string path = "/sys/bus/pci/drivers/igb/bind";
+    int fd = ::open(path.c_str(), O_WRONLY);
+    if (fd < 0) {
+      std::fprintf(stderr, "[I210] Cannot open igb bind (driver module not loaded?)\n");
+      return;
+    }
+    ssize_t written = ::write(fd, m_bdf.c_str(), m_bdf.size());
+    ::close(fd);
+    if (written > 0) {
+      std::fprintf(stderr, "[I210] Rebound igb driver to %s\n", m_bdf.c_str());
+    } else {
+      std::fprintf(stderr, "[I210] Failed to rebind igb driver to %s\n", m_bdf.c_str());
+    }
   }
 
   bool mmapBar0() {
@@ -342,6 +384,37 @@ private:
     return true;
   }
 
+  // Enable PCI bus mastering — required for DMA.
+  // The kernel clears this when the igb driver unbinds.
+  bool enableBusMaster() {
+    std::string path = "/sys/bus/pci/devices/" + m_bdf + "/config";
+    int fd = ::open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+      std::fprintf(stderr, "[I210] Cannot open PCI config: %s\n", path.c_str());
+      return false;
+    }
+
+    // PCI Command Register is at offset 0x04, 2 bytes
+    std::uint16_t cmd{};
+    if (::pread(fd, &cmd, sizeof(cmd), 0x04) != sizeof(cmd)) {
+      std::fprintf(stderr, "[I210] Failed to read PCI command register\n");
+      ::close(fd);
+      return false;
+    }
+
+    cmd |= (1U << 2);  // Bus Master Enable
+
+    if (::pwrite(fd, &cmd, sizeof(cmd), 0x04) != sizeof(cmd)) {
+      std::fprintf(stderr, "[I210] Failed to write PCI command register\n");
+      ::close(fd);
+      return false;
+    }
+
+    ::close(fd);
+    std::fprintf(stderr, "[I210] PCI bus mastering enabled\n");
+    return true;
+  }
+
   void reset() {
     // Issue device reset
     writeReg(CTRL, readReg(CTRL) | CTRL_DEV_RST);
@@ -366,6 +439,76 @@ private:
     (void)readReg(EICR);
   }
 
+  // PHY register access via MDIC (Section 8.2.4)
+  [[nodiscard]]
+  bool writePhy(std::uint32_t reg, std::uint16_t value) {
+    std::uint32_t cmd = static_cast<std::uint32_t>(value)
+                      | (reg << MDIC_REGADD_SHIFT)
+                      | MDIC_OP_WRITE;
+    writeReg(MDIC, cmd);
+
+    for (int i{}; i < 100; i++) {
+      std::uint32_t mdic = readReg(MDIC);
+      if (mdic & MDIC_READY) {
+        return (mdic & MDIC_ERROR) == 0;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    std::fprintf(stderr, "[I210] MDIC write timeout (reg %u)\n", reg);
+    return false;
+  }
+
+  [[nodiscard]]
+  std::uint16_t readPhy(std::uint32_t reg) {
+    std::uint32_t cmd = (reg << MDIC_REGADD_SHIFT)
+                      | MDIC_OP_READ;
+    writeReg(MDIC, cmd);
+
+    for (int i{}; i < 100; i++) {
+      std::uint32_t mdic = readReg(MDIC);
+      if (mdic & MDIC_READY) {
+        if (mdic & MDIC_ERROR) {
+          std::fprintf(stderr, "[I210] MDIC read error (reg %u)\n", reg);
+          return 0;
+        }
+        return static_cast<std::uint16_t>(mdic & MDIC_DATA_MASK);
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    std::fprintf(stderr, "[I210] MDIC read timeout (reg %u)\n", reg);
+    return 0;
+  }
+
+  // PHY initialisation: reset PHY, advertise all speeds, restart auto-negotiation
+  bool initPhy() {
+    // 1. Reset PHY (self-clearing bit)
+    if (!writePhy(PHY_BMCR, BMCR_RESET)) {
+      std::fprintf(stderr, "[I210] PHY reset write failed\n");
+      return false;
+    }
+
+    // 2. Wait for reset to self-clear (typically <1ms)
+    for (int i{}; i < 100; i++) {
+      if (!(readPhy(PHY_BMCR) & BMCR_RESET)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // 3. Advertise 10/100 Mbps modes
+    writePhy(PHY_ANAR, ANAR_SELECTOR | ANAR_10_HD | ANAR_10_FD
+                     | ANAR_100_HD | ANAR_100_FD);
+
+    // 4. Advertise 1000 Mbps full duplex
+    writePhy(PHY_GBCR, GBCR_1000_FD);
+
+    // 5. Enable auto-negotiation and restart it
+    writePhy(PHY_BMCR, BMCR_ANE | BMCR_RESTART_AN);
+
+    std::fprintf(stderr, "[I210] PHY initialised: auto-negotiation restarted\n");
+    return true;
+  }
+
   void readMacAddress() {
     std::uint32_t ral = readReg(RAL0);
     std::uint32_t rah = readReg(RAH0);
@@ -382,56 +525,76 @@ private:
   }
 
   bool initRx() requires (HAS_RX){
-    // 1. Allocate descriptor ring on hugepages
+    // 1. Allocate a region of memory for the receive descriptor list.
     if (!m_rxRing.allocate(NumRxDesc)) {
       std::fprintf(stderr, "[I210] Rx descriptor ring allocation failed.\n");
       return false;
     }
 
-    // 2. Allocate packet data buffers on hugepages
+    // 2. Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
     if (!m_rxBuffer.allocate(NumRxDesc * BuffSize)) {
       std::fprintf(stderr, "[I210] Rx data buffer allocation failed.\n");
       return false;
     }
 
-    // 3. Fill each descriptor with its buffer's physical address
+    // 3. Program the descriptor base address with the address of the region.
     for (std::size_t i{}; i<NumRxDesc; i++) {
-      m_rxRing[i].bufferAddr = m_rxBuffer.physicalAddrAt(i * BuffSize);
-      m_rxRing[i].status     = 0;
+      m_rxRing[i].read.pktAddr = m_rxBuffer.physicalAddrAt(i * BuffSize);
+      m_rxRing[i].read.hdrAddr = 0;  // single-buffer mode, no header split
     }
 
-    // 4. Program descriptor base address 64-bit split across two 32-bit regs
+    // 4. Program descriptor base address (base addr before length — matches igb driver order)
     std::uint64_t rxBase = m_rxRing.physicalBase();
     writeReg(RDBAL0, static_cast<std::uint32_t>(rxBase & 0xFFFFFFFF));
     writeReg(RDBAH0, static_cast<std::uint32_t>(rxBase >> 32));
 
-    // 5. Program ring length (bytes)
+    // 4. Set the length register to the size of the descriptor ring.
     writeReg(RDLEN0, static_cast<std::uint32_t>(m_rxRing.sizeBytes()));
 
-    // 6. Program SRRCTL: buffer size in KB, legacy descriptor type, drop enable
+    // 5. Program SRRCTL of the queue according to the size of the buffers, the required header handling and the drop policy.
     constexpr std::uint32_t bSizeKB = BuffSize/1024;
-    writeReg(SRRCTL0, (bSizeKB << SRRCTL_BSIZEPACKET_SHIFT)
-                            | SRRCTL_DESCTYPE_LEGACY
-                            | SRRCTL_DROP_EN);
+    writeReg(SRRCTL0, (bSizeKB << SRRCTL_BSIZEPACKET_SHIFT) | SRRCTL_DESCTYPE_ADV_ONE | SRRCTL_DROP_EN);
 
-    // 7. Enable receive queue, poll until enabled
-    writeReg(RXDCTL0, readReg(RXDCTL0) | RXDCTL_ENABLE);
-    for (int i{}; i<100; i++) {
+    // TODO: 6. If header split or header replication is required for this queue, program the PSRTYPE register according to the required headers ???
+
+    // 7. Enable global receiver first — igb driver sets RCTL.RXEN in igb_setup_rctl()
+    //    BEFORE enabling individual queues. RXDCTL.ENABLE won't stick without this.
+    writeReg(RCTL, RCTL_RXEN | RCTL_BAM | RCTL_SECRC | rctlBsize);
+
+    // 7. Enable the queue by setting RXDCTL.ENABLE. In the case of queue zero, the enable bit is set by default - so the ring parameters should be set before RCTL.RXEN is set.
+    //    igb driver sequence: disable queue, configure ring, then single write with ENABLE + thresholds
+    writeReg(RXDCTL0, 0);
+    writeReg(RDT0, 0);
+
+    std::uint32_t rxdctl = (8U << 0)              // PTHRESH = 8
+                         | (8U << 8)              // HTHRESH = 8
+                         | (4U << 16)             // WTHRESH = 4
+                         | RXDCTL_ENABLE;
+    writeReg(RXDCTL0, rxdctl);
+
+    // 8. Poll the RXDCTL register until the ENABLE bit is set. The tail should not be bumped before this bit was read as one.
+    bool rxEnabled = false;
+    for (int i{}; i < 100; i++) {
       if (readReg(RXDCTL0) & RXDCTL_ENABLE) {
+        rxEnabled = true;
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    if (!rxEnabled) {
+      std::fprintf(stderr, "[I210] RXDCTL0 enable timed out (RXDCTL0=0x%08x)\n",
+                   readReg(RXDCTL0));
+      return false;
+    }
 
-    // 8. Set tail to last descriptor - all descriptors available to hardware
-    m_rxTail =  0;
+    // 9. Program the direction of packets to this queue according to the mode selected in the MRQC register. Packets directed to a disabled queue are dropped.
+    // TODO:   
+
+    // TODO: Is this needed ?
+    m_rxTail = 0;
     writeReg(RDT0, static_cast<std::uint32_t>(NumRxDesc-1));
 
-    // 9. Enable receiver accept broadcast strip CRC, 2048 bytes buffer
-    writeReg(RCTL, RCTL_RXEN | RCTL_BAM | RCTL_SECRC | rctlBsize);
-
-    std::fprintf(stderr, "[I210] Rx queue 0 initialised: %zu descriptors, %zu bytes buffers\n",
-      NumRxDesc, BuffSize);
+    std::fprintf(stderr, "[I210] Rx queue 0 initialised: %zu descriptors, %zu bytes buffers\n", NumRxDesc, BuffSize);
     return true;
   }
 
@@ -459,11 +622,17 @@ private:
     // 5. Program TXDCTL : WTHRESH=1 for immediate write-back then enable
     writeReg(TXDCTL0, (1U << TXDCTL_WTHRESH_SHIFT));
     writeReg(TXDCTL0, readReg(TXDCTL0) | TXDCTL_ENABLE);
-    for (int i{}; i<100; i++) {
+    bool txEnabled = false;
+    for (int i{}; i < 100; i++) {
       if (readReg(TXDCTL0) & TXDCTL_ENABLE) {
+        txEnabled = true;
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!txEnabled) {
+      std::fprintf(stderr, "[I210] TXDCTL0 enable timed out\n");
+      return false;
     }
 
     // 6. Set the TIPG to default values for 1000BASE-T
@@ -485,11 +654,11 @@ private:
   inline void txReclaim() requires (HAS_TX){
     while (m_txInFlight > 0) {
       TxDescriptor& desc = m_txRing[m_txCleanHead];
-      if (!(desc.sta & TXD_STAT_DD)) {
+      if (!(desc.wb.status & TXD_STAT_DD)) {
         break;
       }
 
-      desc.sta = 0;
+      desc.wb.status = 0;
       m_txCleanHead = (m_txCleanHead + 1) & TX_RING_MASK;
       m_txInFlight--;
     }
