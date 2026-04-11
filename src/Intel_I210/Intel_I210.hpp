@@ -43,6 +43,8 @@ class Intel_I210 {
   static constexpr bool HAS_TX = (M == DriverMode::TxOnly || M == DriverMode::RxTx);
   static constexpr std::size_t RX_RING_MASK = NumRxDesc - 1;
   static constexpr std::size_t TX_RING_MASK = NumTxDesc - 1;
+  // Head write-back lives at end of TX buffer (within same 2MB hugepage)
+  static constexpr std::size_t TX_HEAD_WB_OFFSET = NumTxDesc * BuffSize;
 
 public:
   // Rule of 5
@@ -136,11 +138,13 @@ public:
     for (int i{}; i < 5; i++) {
       if (isLinkUp()) {
         std::fprintf(stderr, "[I210] Link up at %u Mbps.\n", linkSpeedMbps());
+        verifyLowLatencyConfig();
         return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     std::fprintf(stderr, "[I210] Warning: link not up after 5s\n");
+    verifyLowLatencyConfig();
     return true;
   }
 
@@ -197,6 +201,11 @@ public:
   // Receive functions on the hot path - START
   [[nodiscard, gnu::always_inline]]
   inline RxFrame tryReceive() noexcept requires (HAS_RX){
+    // Prefetch Rx packet buffer — warm the cache line before we need it.
+    // After a 1ms sleep the data cache is cold; this overlaps the cache
+    // fill with the volatile DD read below.
+    __builtin_prefetch(m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), 0, 0);
+
     // Volatile read — NIC writes statusError via DMA; without volatile the
     // compiler may cache this read and spin forever on a stale value.
     auto status = *reinterpret_cast<volatile const std::uint32_t*>(
@@ -243,6 +252,10 @@ public:
         return nullptr; // ring genuinely full
       }
     }
+
+    // Prefetch Tx packet buffer for write — cache line allocated in
+    // Modified state before memcpy, avoiding a cold write miss.
+    __builtin_prefetch(m_txBuffer.ptrAt<std::uint8_t>(m_txTail * BuffSize), 1, 3);
 
     TxDescriptor& desc = m_txRing[m_txTail];
     desc.read.bufferAddr   = m_txBuffer.physicalAddrAt(m_txTail * BuffSize);
@@ -427,9 +440,44 @@ private:
       return false;
     }
 
+    // Disable PCIe ASPM (Active State Power Management)
+    // Walk capabilities list to find PCIe capability, then clear ASPM bits
+    // in Link Control register.  L0s/L1 exit adds 1-50us latency per packet.
+    disableASPM(fd);
+
     ::close(fd);
     std::fprintf(stderr, "[I210] PCI bus mastering enabled\n");
     return true;
+  }
+
+  void disableASPM(int configFd) {
+    // Find PCIe capability by walking PCI capabilities list
+    std::uint8_t capPtr{};
+    if (::pread(configFd, &capPtr, 1, 0x34) != 1) return;  // Capabilities Pointer
+
+    while (capPtr != 0) {
+      std::uint8_t capId{};
+      if (::pread(configFd, &capId, 1, capPtr) != 1) return;
+
+      if (capId == 0x10) {  // PCIe Capability
+        // Link Control Register is at capability offset + 0x10
+        std::uint16_t linkCtl{};
+        off_t linkCtlOff = capPtr + 0x10;
+        if (::pread(configFd, &linkCtl, sizeof(linkCtl), linkCtlOff) != sizeof(linkCtl)) return;
+
+        std::uint16_t oldVal = linkCtl;
+        linkCtl &= ~0x0003U;  // Clear bits [1:0]: ASPM L0s and L1 disable
+
+        if (::pwrite(configFd, &linkCtl, sizeof(linkCtl), linkCtlOff) == sizeof(linkCtl)) {
+          std::fprintf(stderr, "[I210] PCIe ASPM disabled (LinkCtl: 0x%04x → 0x%04x)\n",
+                       oldVal, linkCtl);
+        }
+        return;
+      }
+
+      // Next capability: offset at capPtr + 1
+      if (::pread(configFd, &capPtr, 1, capPtr + 1) != 1) return;
+    }
   }
 
   void reset() {
@@ -448,6 +496,77 @@ private:
     std::fprintf(stderr, "[I210] Warning: reset did not complete within timeout.\n");
   }
 
+  // Verify all power-saving features are disabled for low-latency operation
+  void verifyLowLatencyConfig() {
+    constexpr std::uint32_t EEER_R        = 0x0E30;
+    constexpr std::uint32_t IPCNFG_R      = 0x0E38;
+    constexpr std::uint32_t DMACR_R       = 0x02508;
+    constexpr std::uint32_t PCIEMISC_R    = 0x05BB8;
+    constexpr std::uint32_t TQAVCTRL_R    = 0x03570;
+    constexpr std::uint32_t DCA_TXCTRL0_R = 0x0E014;
+
+    int warnings = 0;
+    auto check = [&](const char* name, std::uint32_t reg, std::uint32_t mask, bool expectClear) {
+      bool bitSet = (reg & mask) != 0;
+      if (bitSet == expectClear) {
+        std::fprintf(stderr, "[I210] WARN: %s=0x%08x (bit 0x%x should be %s)\n",
+            name, reg, mask, expectClear ? "0" : "1");
+        warnings++;
+      }
+    };
+
+    std::uint32_t eeer     = readReg(EEER_R);
+    std::uint32_t ipcnfg   = readReg(IPCNFG_R);
+    std::uint32_t dmacr    = readReg(DMACR_R);
+    std::uint32_t pciemisc = readReg(PCIEMISC_R);
+    std::uint32_t ctrlExt  = readReg(CTRL_EXT);
+    std::uint32_t tqavctrl = readReg(TQAVCTRL_R);
+    std::uint32_t dcaTx    = readReg(DCA_TXCTRL0_R);
+    std::uint32_t rxdctl   = readReg(RXDCTL0);
+    std::uint32_t txdctl   = readReg(TXDCTL0);
+    std::uint32_t tdwbal   = readReg(TDWBAL0);
+    std::uint32_t eitr     = readReg(EITR0);
+
+    // EEE: LPI must be off
+    check("EEER",    eeer,     0x00070000, true);   // TX_LPI | RX_LPI | LPI_FC
+    check("IPCNFG",  ipcnfg,   0x0000000C, true);   // EEE_1G | EEE_100M
+
+    // DMA coalescing: must be fully off
+    check("DMACR",   dmacr,    0x80000000, true);   // DMAC_EN
+
+    // PCIe Lx: NIC must not autonomously enter low-power
+    check("PCIEMISC", pciemisc, 0x00000080, true);   // LX_DECISION
+
+    // PHY power management: must be off
+    check("CTRL_EXT", ctrlExt,  0x00100000, true);   // PHYPDEN
+    check("CTRL_EXT", ctrlExt,  0x00200000, true);   // PHY_PWR_MGMT
+
+    // Qav/FQTSS: must be off (adds launch-time delays)
+    check("TQAVCTRL", tqavctrl, 0x00000001, true);   // XMIT_MODE
+
+    // Tx head write-back: must be enabled
+    check("TDWBAL0",  tdwbal,   0x00000001, false);  // Head_WB_En
+
+    // Tx relaxed ordering: must be off for head write-back
+    check("DCA_TXCTRL0", dcaTx, 0x00000800, true);   // TX_WB_RO_EN
+
+    // EITR: must be zero for immediate descriptor write-back
+    if (eitr != 0) {
+      std::fprintf(stderr, "[I210] WARN: EITR0=0x%08x (expected 0)\n", eitr);
+      warnings++;
+    }
+
+    // Queues: must be enabled
+    check("RXDCTL0", rxdctl, RXDCTL_ENABLE, false);
+    check("TXDCTL0", txdctl, TXDCTL_ENABLE, false);
+
+    if (warnings == 0) {
+      std::fprintf(stderr, "[I210] Low-latency config verified: all power-saving disabled\n");
+    } else {
+      std::fprintf(stderr, "[I210] Low-latency config: %d warning(s) — check register values above\n", warnings);
+    }
+  }
+
   void disableInterrupts() {
     writeReg(IMC, IRQ_DISABLE_ALL);
     writeReg(EIMC, IRQ_DISABLE_ALL);
@@ -455,9 +574,12 @@ private:
     (void)readReg(ICR);
     (void)readReg(EICR);
     // EITR=0 → no interrupt throttle timer, descriptors written back
-    // immediately (Section 7.1.4.4: "each receive descriptor are written
-    // to the host immediately")
-    writeReg(EITR0, 0);
+    // immediately (Section 7.1.4.4 / 7.2.2.6: EITR controls write-back
+    // timing for BOTH Rx and Tx even without interrupts enabled)
+    // EITR[n] = 0x1680 + 4*n, n = 0..4 — zero ALL of them
+    for (std::uint32_t i{}; i < 5; i++) {
+      writeReg(EITR0 + 4 * i, 0);
+    }
   }
 
   // Disable Energy Efficient Ethernet (EEE / 802.3az)
@@ -482,8 +604,30 @@ private:
     ipcnfg &= ~(IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN);
     writeReg(IPCNFG, ipcnfg);
 
-    std::fprintf(stderr, "[I210] EEE disabled (EEER=0x%08x IPCNFG=0x%08x)\n",
-                 readReg(EEER), readReg(IPCNFG));
+    // Disable DMA Coalescing — zero the entire register to clear
+    // DMAC_EN, DMAC_LX_MASK (Lx transitions), and watchdog timer.
+    constexpr std::uint32_t DMACR  = 0x02508;
+    constexpr std::uint32_t DMCTLX = 0x02514;  // DMA Coalescing Time to Lx
+    writeReg(DMACR, 0);
+    writeReg(DMCTLX, 0);
+
+    // Disable NIC-autonomous PCIe Lx transitions (PCIEMISC.LX_DECISION).
+    // This is SEPARATE from ASPM — the NIC can enter Lx on its own even
+    // with ASPM disabled at the link level. Set by igb_init_dmac().
+    constexpr std::uint32_t PCIEMISC              = 0x05BB8;
+    constexpr std::uint32_t PCIEMISC_LX_DECISION  = 0x00000080;
+    std::uint32_t pciemisc = readReg(PCIEMISC);
+    pciemisc &= ~PCIEMISC_LX_DECISION;
+    writeReg(PCIEMISC, pciemisc);
+
+    // Disable PHY power-down and power management in CTRL_EXT
+    constexpr std::uint32_t CTRL_EXT_PHYPDEN       = 0x00100000;  // PHY Power Down Enable
+    constexpr std::uint32_t CTRL_EXT_PHY_PWR_MGMT  = 0x00200000;  // PHY Power Management
+    std::uint32_t ctrlExt = readReg(CTRL_EXT);
+    ctrlExt &= ~(CTRL_EXT_PHYPDEN | CTRL_EXT_PHY_PWR_MGMT);
+    writeReg(CTRL_EXT, ctrlExt);
+
+    std::fprintf(stderr, "[I210] Power saving disabled (EEE + DMAC + PCIe Lx + PHY PM)\n");
   }
 
   // PHY register access via MDIC (Section 8.2.4)
@@ -655,8 +799,8 @@ private:
       return false;
     }
 
-    // 2. Allocate packet data buffers on hugepages
-    if (!m_txBuffer.allocate(NumTxDesc * BuffSize)) {
+    // 2. Allocate packet data buffers on hugepages (+ 64 bytes for head write-back)
+    if (!m_txBuffer.allocate(NumTxDesc * BuffSize + 64)) {
       std::fprintf(stderr, "[I210] Tx data buffer allocation failed.\n");
       return false;
     }
@@ -669,8 +813,29 @@ private:
     // 4. Program ring length bytes
     writeReg(TDLEN0, static_cast<std::uint32_t>(m_txRing.sizeBytes()));
 
-    // 5. Program TXDCTL : WTHRESH=1 for immediate write-back then enable
-    writeReg(TXDCTL0, (1U << TXDCTL_WTHRESH_SHIFT));
+    // 5. Program TXDCTL : WTHRESH=0, disable queue for configuration
+    writeReg(TXDCTL0, 0);
+
+    // 6. Enable TX Head Write-Back (Section 7.2.3) — MUST be programmed
+    //    while queue is disabled (TXDCTL.Enable = 0).
+    //    Instead of writing DD bits back to each descriptor (cache line thrash),
+    //    hardware writes the head pointer to a separate memory location.
+    *m_txBuffer.template ptrAt<std::uint32_t>(TX_HEAD_WB_OFFSET) = 0;
+    std::uint64_t headWbPhys = m_txBuffer.physicalAddrAt(TX_HEAD_WB_OFFSET);
+    // TDWBAL: bit 0 = Head_WB_En, bits [31:2] = address[31:2]
+    writeReg(TDWBAL0, static_cast<std::uint32_t>(headWbPhys & 0xFFFFFFFF) | 1U);
+    writeReg(TDWBAH0, static_cast<std::uint32_t>(headWbPhys >> 32));
+
+    // 6b. Disable PCIe Relaxed Ordering for head write-back (Section 8.13.2)
+    //     Required when Head Write-Back is enabled.
+    //     TXCTL queue 0 @ 0x0E014, bit 11 = TX_WB_RO_EN
+    constexpr std::uint32_t DCA_TXCTRL0    = 0x0E014;
+    constexpr std::uint32_t TX_WB_RO_EN    = (1U << 11);
+    std::uint32_t txctl = readReg(DCA_TXCTRL0);
+    txctl &= ~TX_WB_RO_EN;
+    writeReg(DCA_TXCTRL0, txctl);
+
+    // 7. Now enable the queue
     writeReg(TXDCTL0, readReg(TXDCTL0) | TXDCTL_ENABLE);
     bool txEnabled = false;
     for (int i{}; i < 100; i++) {
@@ -685,10 +850,10 @@ private:
       return false;
     }
 
-    // 6. Set the TIPG to default values for 1000BASE-T
+    // 7. Set the TIPG to default values for 1000BASE-T
     writeReg(TIPG, TIPG_DEFAULT);
 
-    // 7. Enable transmitter
+    // 8. Enable transmitter
     writeReg(TCTL, TCTL_EN | TCTL_PSP | TCTL_CT_IEEE | TCTL_BST_DEF);
 
     m_txTail = 0;
@@ -702,17 +867,22 @@ private:
 
   [[gnu::always_inline, gnu::hot]]
   inline void txReclaim() requires (HAS_TX){
-    while (m_txInFlight > 0) {
-      // Volatile read — NIC writes status via DMA after transmit completes
-      auto status = *reinterpret_cast<volatile const std::uint32_t*>(
-                        &m_txRing[m_txCleanHead].wb.status);
-      if (!(status & TXD_STAT_DD)) {
-        break;
-      }
+    // Read hardware head from write-back location (Section 7.2.3).
+    // This avoids polling DD bits in descriptor memory, eliminating
+    // cache line thrashing between CPU writes and NIC DMA.
+    std::size_t head = *reinterpret_cast<volatile const std::uint32_t*>(
+                           m_txBuffer.template ptrAt<std::uint8_t>(TX_HEAD_WB_OFFSET));
+    head &= TX_RING_MASK;
 
-      m_txRing[m_txCleanHead].wb.status = 0;
+    while (m_txInFlight > 0 && m_txCleanHead != head) {
       m_txCleanHead = (m_txCleanHead + 1) & TX_RING_MASK;
       m_txInFlight--;
+    }
+
+    // Wrap case: head == cleanHead but ring is full → head has lapped,
+    // all descriptors are complete (circular buffer ambiguity)
+    if (m_txInFlight == NumTxDesc && head == m_txCleanHead) {
+      m_txInFlight = 0;
     }
   }
 };

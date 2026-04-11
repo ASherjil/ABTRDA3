@@ -127,7 +127,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::printf("P99.9 RTT:  %.2f us\n", to_us(p999));
     std::printf("Max RTT:    %.2f us\n", to_us(latencies_ns.back()));
     std::printf("-----------------------------\n");
-    std::printf("Est. One-Way Latency: %.2f us\n", to_us(p50) / 2.0);
+    std::printf("Worst case latency(1-way): %.3f us\n", to_us(latencies_ns.back())/2.0);
 
     // Write latencies to file if configured
     const char* output_path = cfg.outputPath.empty() ? nullptr : cfg.outputPath.c_str();

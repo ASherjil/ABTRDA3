@@ -6,7 +6,7 @@ watchdog_sec     = 120           # safety timeout (seconds)
 ether_type       = 0x88B5         # IEEE local experimental
 frame_size       = 64             # Minimum ethernet frame
 nic_tuner        = "nfs_safe"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
-send_interval_us = 1000           # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
+send_interval_us = 0            # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
 output           = ""
 
 [server]
@@ -22,7 +22,7 @@ mac          = "d4:f5:27:2a:a9:59"
 cpu_core     = 4
 irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
 xdp_queue_id = 0
-count        = 60000           # number of packets to send (overridable with --count)
+count        = 900000           # number of packets to send (overridable with --count)
 
 [packet_mmap]
 block_size   = 4096               # must be >= PAGE_SIZE (4096 on x86_64)
