@@ -9,6 +9,8 @@
 #include "RxFrame.hpp"
 #include "DMARing.hpp"
 #include "HugepageBuffer.hpp"
+#include "InterfaceDiscovery.hpp"
+#include "PCIeBackend.hpp"
 
 #include <array>
 #include <chrono>
@@ -48,15 +50,14 @@ class Intel_I210 {
 
 public:
   // Rule of 5
-  Intel_I210() = default;
+  Intel_I210(std::string_view ifname, int bar = 0)
+    :m_pciBusHandler{ifname, bar} {}
+
   Intel_I210(const Intel_I210&) = delete;
   Intel_I210& operator=(const Intel_I210&) = delete;
 
   Intel_I210(Intel_I210&& other) noexcept
-     : m_regs{std::exchange(other.m_regs, nullptr)},
-       m_barFd{std::exchange(other.m_barFd, -1)},
-       m_barSize{std::exchange(other.m_barSize, 0)},
-       m_bdf{std::move(other.m_bdf)},
+     : m_pciBusHandler{std::move(other.m_pciBusHandler)},
        m_rxRing{std::move(other.m_rxRing)},
        m_rxBuffer{std::move(other.m_rxBuffer)},
        m_rxTail{std::exchange(other.m_rxTail, 0)},
@@ -65,25 +66,22 @@ public:
        m_txTail{std::exchange(other.m_txTail, 0)},
        m_txCleanHead{std::exchange(other.m_txCleanHead, 0)},
        m_txInFlight{std::exchange(other.m_txInFlight, 0)},
-       m_mac{std::move(other.m_mac)} {}
+       m_mac{other.m_mac} {}
 
 
   Intel_I210& operator=(Intel_I210&& other) noexcept {
     if (this != &other) {
       shutdown();
-      m_regs        = std::exchange(other.m_regs, nullptr);
-      m_barFd       = std::exchange(other.m_barFd, -1);
-      m_barSize     = std::exchange(other.m_barSize, 0);
-      m_bdf         = std::move(other.m_bdf);
-      m_rxRing      = std::move(other.m_rxRing);
-      m_rxBuffer    = std::move(other.m_rxBuffer);
-      m_rxTail      = std::exchange(other.m_rxTail, 0);
-      m_txRing      = std::move(other.m_txRing);
-      m_txBuffer    = std::move(other.m_txBuffer);
-      m_txTail      = std::exchange(other.m_txTail, 0);
-      m_txCleanHead = std::exchange(other.m_txCleanHead, 0);
-      m_txInFlight  = std::exchange(other.m_txInFlight, 0);
-      m_mac         = std::move(other.m_mac);
+      m_pciBusHandler = std::move(other.m_pciBusHandler);
+      m_rxRing        = std::move(other.m_rxRing);
+      m_rxBuffer      = std::move(other.m_rxBuffer);
+      m_rxTail        = std::exchange(other.m_rxTail, 0);
+      m_txRing        = std::move(other.m_txRing);
+      m_txBuffer      = std::move(other.m_txBuffer);
+      m_txTail        = std::exchange(other.m_txTail, 0);
+      m_txCleanHead   = std::exchange(other.m_txCleanHead, 0);
+      m_txInFlight    = std::exchange(other.m_txInFlight, 0);
+      m_mac           = std::exchange(other.m_mac, {});
     }
     return *this;
   }
@@ -93,19 +91,13 @@ public:
   }
 
   // Initialisation functions on the cold path. START
-  [[nodiscard]] bool init(std::string_view pciBdf) {
-    m_bdf = std::string(pciBdf);
+  [[nodiscard]] bool init() {
 
-    if (!unbindKernelDriver()) {
-      return false;
-    }
-    if (!mmapBar0()) {
-      return false;
-    }
-    if (!enableBusMaster()) {
+    if (!m_pciBusHandler.open()) {
       return false;
     }
 
+    disableASPM();
     reset();
     disableInterrupts();
     disableEEE();
@@ -149,10 +141,6 @@ public:
   }
 
   void shutdown() {
-    if (!m_regs) {
-      return;
-    }
-
     // Disable Rx/Tx
     if constexpr (HAS_RX) {
       writeReg(RCTL, readReg(RCTL) & ~RCTL_RXEN);
@@ -162,18 +150,6 @@ public:
     }
 
     disableInterrupts();
-
-    // Unmap BAR0
-    ::munmap(const_cast<std::uint32_t*>(m_regs), m_barSize);
-    m_regs = nullptr;
-
-    if (m_barFd >= 0) {
-      ::close(m_barFd);
-      m_barFd = -1;
-    }
-
-    // TODO: is this needed? It seems to bump the number everytime in ip link show
-    //rebindKernelDriver();
   }
 
   [[nodiscard]] bool isLinkUp() const {
@@ -289,10 +265,7 @@ public:
   }
   // Transmit functions on the hot path - END
 private:
-  volatile std::uint32_t* m_regs{nullptr};
-  int m_barFd{-1};
-  std::size_t m_barSize{};
-  std::string m_bdf{};
+  PCIeBackend<InterfaceDiscovery> m_pciBusHandler;
 
   // Rx
   DMARing<RxDescriptor>       m_rxRing;
@@ -323,161 +296,44 @@ private:
   // Register access - volatile MMIO
   [[gnu::always_inline]]
   inline void writeReg(std::uint32_t offset, std::uint32_t value) {
-    m_regs[offset/4] = value;
+    *m_pciBusHandler.template registerPtr<std::uint32_t>(offset) = value;
   }
 
   [[nodiscard, gnu::always_inline]]
   inline std::uint32_t readReg(std::uint32_t offset) const{
-    return m_regs[offset/4];
+    return *m_pciBusHandler.template registerPtr<std::uint32_t>(offset);
   }
 
-  // Initialisation Helper functions
-  bool unbindKernelDriver() {
-    // Write BDF to /sys/bus/pci/drivers/igb/unbind
-    std::string path = "/sys/bus/pci/drivers/igb/unbind";
-    int fd = ::open(path.c_str(), O_WRONLY);
-    if (fd < 0) {
-      // Driver may already be unbound
-      std::fprintf(stderr, "[I210] igb driver not bound(or permission denied).\n");
-      return true;
-    }
-    ssize_t written = ::write(fd, m_bdf.c_str(), m_bdf.size());
-    ::close(fd);
 
-    // Verify the driver is actually unbound by checking the sysfs symlink
-    std::string boundPath = "/sys/bus/pci/drivers/igb/" + m_bdf;
-    if (::access(boundPath.c_str(), F_OK) == 0) {
-      std::fprintf(stderr, "[I210] Failed to unbind igb driver from %s\n", m_bdf.c_str());
-      return false;
-    }
-
-    if (written > 0) {
-      std::fprintf(stderr, "[I210] Unbound igb driver from %s\n", m_bdf.c_str());
-    } else {
-      std::fprintf(stderr, "[I210] igb driver already unbound from %s\n", m_bdf.c_str());
-    }
-    return true;
-  }
-
-  void rebindKernelDriver() {
-    if (m_bdf.empty()) {
-      return;
-    }
-    std::string path = "/sys/bus/pci/drivers/igb/bind";
-    int fd = ::open(path.c_str(), O_WRONLY);
-    if (fd < 0) {
-      std::fprintf(stderr, "[I210] Cannot open igb bind (driver module not loaded?)\n");
-      return;
-    }
-    ssize_t written = ::write(fd, m_bdf.c_str(), m_bdf.size());
-    ::close(fd);
-    if (written > 0) {
-      std::fprintf(stderr, "[I210] Rebound igb driver to %s\n", m_bdf.c_str());
-    } else {
-      std::fprintf(stderr, "[I210] Failed to rebind igb driver to %s\n", m_bdf.c_str());
-    }
-  }
-
-  bool mmapBar0() {
-    // Open /sys/bus/pci/devices/{bdf}/resource0
-    std::string path = "/sys/bus/pci/devices/" + m_bdf + "/resource0";
-    m_barFd = ::open(path.c_str(), O_RDWR | O_SYNC);
-    if (m_barFd < 0) {
-      std::fprintf(stderr, "[I210] Cannot open %s\n", path.c_str());
-      return false;
-    }
-
-    // Determine BAR size from resource file
-    std::string resPath = "/sys/bus/pci/devices/" + m_bdf + "/resource";
-    FILE* f = std::fopen(resPath.c_str(), "r");
-    if (!f) {
-      std::fprintf(stderr, "[I210] Cannot open %s\n", resPath.c_str());
-      return false;
-    }
-
-    // First line: BAR0: start end flags
-    std::uint64_t start{}, end{}, flags{};
-    std::fscanf(f, "%" SCNx64 " %" SCNx64 " %" SCNx64, &start, &end, &flags);
-    std::fclose(f);
-    m_barSize = end - start + 1;
-
-    void* mapped = ::mmap(nullptr, m_barSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_barFd, 0);
-    if (mapped == MAP_FAILED) {
-      std::fprintf(stderr, "[I210] mmap BAR0 failed.\n");
-      ::close(m_barFd);
-      m_barFd = -1;
-      return false;
-    }
-
-    m_regs = static_cast<volatile std::uint32_t*>(mapped);
-    std::fprintf(stderr, "[I210] Mapped BAR0 at %p, size %zu\n", mapped, m_barSize);
-    return true;
-  }
-
-  // Enable PCI bus mastering — required for DMA.
-  // The kernel clears this when the igb driver unbinds.
-  bool enableBusMaster() {
-    std::string path = "/sys/bus/pci/devices/" + m_bdf + "/config";
+  // NIC-specific: disable PCIe ASPM via PCI config space.
+  // Uses BDF from the InterfaceDiscovery policy to open config.
+  void disableASPM() {
+    std::string path = "/sys/bus/pci/devices/"
+                     + std::string(m_pciBusHandler.policy().bdf()) + "/config";
     int fd = ::open(path.c_str(), O_RDWR);
-    if (fd < 0) {
-      std::fprintf(stderr, "[I210] Cannot open PCI config: %s\n", path.c_str());
-      return false;
-    }
+    if (fd < 0) return;
 
-    // PCI Command Register is at offset 0x04, 2 bytes
-    std::uint16_t cmd{};
-    if (::pread(fd, &cmd, sizeof(cmd), 0x04) != sizeof(cmd)) {
-      std::fprintf(stderr, "[I210] Failed to read PCI command register\n");
-      ::close(fd);
-      return false;
-    }
-
-    cmd |= (1U << 2);  // Bus Master Enable
-
-    if (::pwrite(fd, &cmd, sizeof(cmd), 0x04) != sizeof(cmd)) {
-      std::fprintf(stderr, "[I210] Failed to write PCI command register\n");
-      ::close(fd);
-      return false;
-    }
-
-    // Disable PCIe ASPM (Active State Power Management)
-    // Walk capabilities list to find PCIe capability, then clear ASPM bits
-    // in Link Control register.  L0s/L1 exit adds 1-50us latency per packet.
-    disableASPM(fd);
-
-    ::close(fd);
-    std::fprintf(stderr, "[I210] PCI bus mastering enabled\n");
-    return true;
-  }
-
-  void disableASPM(int configFd) {
-    // Find PCIe capability by walking PCI capabilities list
+    // Walk PCI capabilities list to find PCIe capability (ID=0x10)
     std::uint8_t capPtr{};
-    if (::pread(configFd, &capPtr, 1, 0x34) != 1) return;  // Capabilities Pointer
+    if (::pread(fd, &capPtr, 1, 0x34) != 1) { ::close(fd); return; }
 
     while (capPtr != 0) {
       std::uint8_t capId{};
-      if (::pread(configFd, &capId, 1, capPtr) != 1) return;
+      if (::pread(fd, &capId, 1, capPtr) != 1) break;
 
-      if (capId == 0x10) {  // PCIe Capability
-        // Link Control Register is at capability offset + 0x10
+      if (capId == 0x10) {
         std::uint16_t linkCtl{};
-        off_t linkCtlOff = capPtr + 0x10;
-        if (::pread(configFd, &linkCtl, sizeof(linkCtl), linkCtlOff) != sizeof(linkCtl)) return;
-
-        std::uint16_t oldVal = linkCtl;
-        linkCtl &= ~0x0003U;  // Clear bits [1:0]: ASPM L0s and L1 disable
-
-        if (::pwrite(configFd, &linkCtl, sizeof(linkCtl), linkCtlOff) == sizeof(linkCtl)) {
-          std::fprintf(stderr, "[I210] PCIe ASPM disabled (LinkCtl: 0x%04x → 0x%04x)\n",
-                       oldVal, linkCtl);
+        off_t off = capPtr + 0x10;
+        if (::pread(fd, &linkCtl, sizeof(linkCtl), off) == sizeof(linkCtl)) {
+          linkCtl &= static_cast<std::uint16_t>(~0x0003);
+          ::pwrite(fd, &linkCtl, sizeof(linkCtl), off);
+          std::fprintf(stderr, "[I210] PCIe ASPM disabled\n");
         }
-        return;
+        break;
       }
-
-      // Next capability: offset at capPtr + 1
-      if (::pread(configFd, &capPtr, 1, capPtr + 1) != 1) return;
+      if (::pread(fd, &capPtr, 1, capPtr + 1) != 1) break;
     }
+    ::close(fd);
   }
 
   void reset() {

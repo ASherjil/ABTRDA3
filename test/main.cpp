@@ -229,39 +229,25 @@ int main(int argc, char* argv[]) {
           }
       }
       else if (cfg.transport == "intel_i210") {
+          if (!ensureHugepages(16)) {
+              std::fprintf(stderr, "Error: hugepage allocation failed\n");
+              return 1;
+          }
 
-        if (is_server) {
-            Intel_I210<DriverMode::RxTx> customPMD;
-            if (!ensureHugepages(16)) {
-                std::fprintf(stderr, "Error: hugepage allocation failed\n");
-                return 1;
-            }
-            if (!customPMD.init("0000:0c:00.0")) {
-                std::fprintf(stderr, "Error: I210 init failed\n");
-                return 1;
-            }
+          Intel_I210<DriverMode::RxTx> nic(role.interface);
+          if (!nic.init()) {
+              std::fprintf(stderr, "Error: I210 init failed\n");
+              return 1;
+          }
 
-            std::printf("[Transport]: intel_i210 (PMD) on server");
+          std::printf("[%s] Transport: intel_i210 (PMD) on %s\n",
+                      is_server ? "Server" : "Client", role.interface.c_str());
 
-            run_server(customPMD, customPMD, cfg, g_stop.get_token());
-        }
-        else {
-
-            Intel_I210<DriverMode::RxTx> customPMD;
-            if (!ensureHugepages(16)) {
-                std::fprintf(stderr, "Error: hugepage allocation failed\n");
-                return 1;
-            }
-            if (!customPMD.init("0000:07:00.0")) {
-                std::fprintf(stderr, "Error: I210 init failed\n");
-                return 1;
-            }
-
-            std::printf("[Transport]: intel_i210 (PMD) on client");
-
-            run_client(customPMD, customPMD, cfg, count, g_stop.get_token());
-        }
-
+          if (is_server) {
+              run_server(nic, nic, cfg, g_stop.get_token());
+          } else {
+              run_client(nic, nic, cfg, count, g_stop.get_token());
+          }
       }
       else {
           std::fprintf(stderr, "Error: unknown transport, application is dead.\n");
