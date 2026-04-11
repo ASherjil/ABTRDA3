@@ -106,6 +106,7 @@ public:
 
     reset();
     disableInterrupts();
+    disableEEE();
     readMacAddress();
 
     // Initialise PHY: reset, advertise all speeds, restart auto-negotiation
@@ -167,6 +168,7 @@ public:
       m_barFd = -1;
     }
 
+    // TODO: is this needed? It seems to bump the number everytime in ip link show
     //rebindKernelDriver();
   }
 
@@ -195,13 +197,22 @@ public:
   // Receive functions on the hot path - START
   [[nodiscard, gnu::always_inline]]
   inline RxFrame tryReceive() noexcept requires (HAS_RX){
-    const RxDescriptor& desc = m_rxRing[m_rxTail];
-    if (!(desc.wb.statusError & RXD_STAT_DD))[[likely]] {
+    // Volatile read — NIC writes statusError via DMA; without volatile the
+    // compiler may cache this read and spin forever on a stale value.
+    auto status = *reinterpret_cast<volatile const std::uint32_t*>(
+                      &m_rxRing[m_rxTail].wb.statusError);
+    if (!(status & RXD_STAT_DD))[[likely]] {
       return {};
     }
 
+    // Read barrier — ensure subsequent reads (length, packet data) see the
+    // NIC's completed write, not stale prefetched values.  On x86 this is
+    // a compiler barrier only (strong memory model); matches igb's dma_rmb().
+    asm volatile("" ::: "memory");
+
     return {
-      .data   = {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), desc.wb.length},
+      .data   = {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize),
+                 m_rxRing[m_rxTail].wb.length},
       .sec    = 0,
       .nsec   = 0,
       .status = 1   // non-zero = frame present
@@ -216,6 +227,9 @@ public:
     desc.read.hdrAddr = 0;
     std::size_t prev = m_rxTail;
     m_rxTail = (m_rxTail + 1) & RX_RING_MASK;
+    // Write barrier — ensure descriptor writes are visible before the NIC
+    // sees the new tail.  Matches igb's dma_wmb().
+    asm volatile("" ::: "memory");
     writeReg(RDT0, static_cast<std::uint32_t>(prev));
   }
   // Receive functions on the hot path - END
@@ -245,6 +259,9 @@ public:
     // Increment the tail after filling the descriptor then write the new value to the TDT
     m_txTail = (m_txTail + 1) & TX_RING_MASK;
     m_txInFlight++;
+    // Write barrier — ensure descriptor + packet data writes are visible
+    // before the NIC sees the new tail.  Matches igb's dma_wmb().
+    asm volatile("" ::: "memory");
     writeReg(TDT0, static_cast<std::uint32_t>(m_txTail));
   }
 
@@ -434,9 +451,39 @@ private:
   void disableInterrupts() {
     writeReg(IMC, IRQ_DISABLE_ALL);
     writeReg(EIMC, IRQ_DISABLE_ALL);
-    // Clear any pending, TODO: what is this readReg?
+    // Clear any pending
     (void)readReg(ICR);
     (void)readReg(EICR);
+    // EITR=0 → no interrupt throttle timer, descriptors written back
+    // immediately (Section 7.1.4.4: "each receive descriptor are written
+    // to the host immediately")
+    writeReg(EITR0, 0);
+  }
+
+  // Disable Energy Efficient Ethernet (EEE / 802.3az)
+  // EEE puts the PHY into Low Power Idle (LPI) between packets.
+  // Wake-up from LPI adds ~30us latency — unacceptable for low-latency polling.
+  // Matches igb's igb_set_eee_i350() with eee_disable=true.
+  void disableEEE() {
+    constexpr std::uint32_t EEER    = 0x0E30;
+    constexpr std::uint32_t IPCNFG  = 0x0E38;
+
+    constexpr std::uint32_t EEER_TX_LPI_EN    = 0x00010000;
+    constexpr std::uint32_t EEER_RX_LPI_EN    = 0x00020000;
+    constexpr std::uint32_t EEER_LPI_FC       = 0x00040000;
+    constexpr std::uint32_t IPCNFG_EEE_1G_AN  = 0x00000008;
+    constexpr std::uint32_t IPCNFG_EEE_100M_AN = 0x00000004;
+
+    std::uint32_t eeer = readReg(EEER);
+    eeer &= ~(EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC);
+    writeReg(EEER, eeer);
+
+    std::uint32_t ipcnfg = readReg(IPCNFG);
+    ipcnfg &= ~(IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN);
+    writeReg(IPCNFG, ipcnfg);
+
+    std::fprintf(stderr, "[I210] EEE disabled (EEER=0x%08x IPCNFG=0x%08x)\n",
+                 readReg(EEER), readReg(IPCNFG));
   }
 
   // PHY register access via MDIC (Section 8.2.4)
@@ -566,9 +613,12 @@ private:
     writeReg(RXDCTL0, 0);
     writeReg(RDT0, 0);
 
+    // Thresholds tuned for minimum latency (Section 7.1.4.4):
+    // PTHRESH/HTHRESH > 0 for descriptor prefetching (NIC caches descriptors in advance)
+    // WTHRESH=0 + EITR=0 → each descriptor written back immediately, no batching
     std::uint32_t rxdctl = (8U << 0)              // PTHRESH = 8
-                         | (8U << 8)              // HTHRESH = 8
-                         | (4U << 16)             // WTHRESH = 4
+                         | (4U << 8)              // HTHRESH = 4
+                         | (0U << 16)             // WTHRESH = 0
                          | RXDCTL_ENABLE;
     writeReg(RXDCTL0, rxdctl);
 
@@ -653,12 +703,14 @@ private:
   [[gnu::always_inline, gnu::hot]]
   inline void txReclaim() requires (HAS_TX){
     while (m_txInFlight > 0) {
-      TxDescriptor& desc = m_txRing[m_txCleanHead];
-      if (!(desc.wb.status & TXD_STAT_DD)) {
+      // Volatile read — NIC writes status via DMA after transmit completes
+      auto status = *reinterpret_cast<volatile const std::uint32_t*>(
+                        &m_txRing[m_txCleanHead].wb.status);
+      if (!(status & TXD_STAT_DD)) {
         break;
       }
 
-      desc.wb.status = 0;
+      m_txRing[m_txCleanHead].wb.status = 0;
       m_txCleanHead = (m_txCleanHead + 1) & TX_RING_MASK;
       m_txInFlight--;
     }
