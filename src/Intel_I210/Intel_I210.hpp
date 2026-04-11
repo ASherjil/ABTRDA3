@@ -506,7 +506,7 @@ private:
     constexpr std::uint32_t DCA_TXCTRL0_R = 0x0E014;
 
     int warnings = 0;
-    auto check = [&](const char* name, std::uint32_t reg, std::uint32_t mask, bool expectClear) {
+    auto check = [&warnings](const char* name, std::uint32_t reg, std::uint32_t mask, bool expectClear) {
       bool bitSet = (reg & mask) != 0;
       if (bitSet == expectClear) {
         std::fprintf(stderr, "[I210] WARN: %s=0x%08x (bit 0x%x should be %s)\n",
@@ -527,9 +527,24 @@ private:
     std::uint32_t tdwbal   = readReg(TDWBAL0);
     std::uint32_t eitr     = readReg(EITR0);
 
-    // EEE: LPI must be off
+    // EEE MAC-side: LPI must be off
     check("EEER",    eeer,     0x00070000, true);   // TX_LPI | RX_LPI | LPI_FC
     check("IPCNFG",  ipcnfg,   0x0000000C, true);   // EEE_1G | EEE_100M
+
+    // EEE PHY-side: read EEE advertisement via MMD (device 7, register 60)
+    // PHY regs 13/14 are the MMD access control/data pair (IEEE 802.3 clause 45)
+    constexpr std::uint16_t MMD_EEE_DEV  = 7;
+    constexpr std::uint16_t MMD_EEE_ADDR = 60;   // EEE Advertisement register
+    constexpr std::uint16_t MMD_FUNC_DATA = 0x4000;
+    writePhy(13, MMD_EEE_DEV);                    // Select device 7
+    writePhy(14, MMD_EEE_ADDR);                   // Select register 60
+    writePhy(13, MMD_FUNC_DATA | MMD_EEE_DEV);    // Switch to data mode
+    std::uint16_t eeeAdv = readPhy(14);            // Read EEE advertisement
+    writePhy(13, 0);                               // Release MMD
+    if (eeeAdv & 0x0006) {  // bit 1 = 100M EEE, bit 2 = 1G EEE
+      std::fprintf(stderr, "[I210] WARN: PHY EEE advertisement=0x%04x (should be 0)\n", eeeAdv);
+      warnings++;
+    }
 
     // DMA coalescing: must be fully off
     check("DMACR",   dmacr,    0x80000000, true);   // DMAC_EN
