@@ -46,5 +46,7 @@ need_wakeup     = false           # mode auto-detected: native+zerocopy -> nativ
 
 # Server:  sudo ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
 # Client:  sudo ./abtrda3_test --client --config ../../../test/abtrda3_test.toml
+# Traffic generator: sudo ./abtrda3_test --txgen --config ../../../test/abtrda3_test.toml
+# Receiver: sudo ./abtrda3_test --rxsink --config ../../../test/abtrda3_test.toml
 
 # ./profile_hotpath.sh --no-perf
