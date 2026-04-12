@@ -273,6 +273,19 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
         std::fprintf(stderr, "[NicTuner] FAIL: ksoftirqd/%d not found\n", cpuCore);
     }
 
+    // ── Core isolation via tuna (more thorough than manual kthread migration) ──
+    // Moves ALL threads (kernel + user + timers) off the app core.
+    // Safe because SSH is already boosted to SCHED_RR:1 above.
+    {
+        char cmd[64];
+        std::snprintf(cmd, sizeof(cmd), "tuna --cpus=%d --isolate 2>/dev/null", cpuCore);
+        if (std::system(cmd) == 0)
+            std::fprintf(stderr, "[NicTuner] Core %d isolated via tuna\n", cpuCore);
+    }
+
+    // Disable kernel watchdog on the app core to prevent NMI jitter
+    writeInt("/proc/sys/kernel/watchdog", 0);
+
     // ── RSS steering ────────────────────────────────────────────────────
 
     if (m_ethtoolFd >= 0) {

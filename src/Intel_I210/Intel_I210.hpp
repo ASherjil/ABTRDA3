@@ -141,6 +141,8 @@ public:
   }
 
   void shutdown() {
+    if (!m_pciBusHandler.isOpen()) return;
+
     // Disable Rx/Tx
     if constexpr (HAS_RX) {
       writeReg(RCTL, readReg(RCTL) & ~RCTL_RXEN);

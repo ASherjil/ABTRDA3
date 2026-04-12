@@ -2,7 +2,7 @@
 
 [general]
 transport        = "intel_i210"  # "packet_mmap" or "af_xdp" or "intel_i210"
-watchdog_sec     = 120           # safety timeout (seconds)
+watchdog_sec     = 30           # safety timeout (seconds)
 ether_type       = 0x88B5         # IEEE local experimental
 frame_size       = 64             # Minimum ethernet frame
 nic_tuner        = "nfs_safe"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
@@ -22,7 +22,7 @@ mac          = "d4:f5:27:2a:a9:59"
 cpu_core     = 4
 irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
 xdp_queue_id = 0
-count        = 900000           # number of packets to send (overridable with --count)
+count        = 100          # number of packets to send (overridable with --count)
 
 [packet_mmap]
 block_size   = 4096               # must be >= PAGE_SIZE (4096 on x86_64)
@@ -46,3 +46,5 @@ need_wakeup     = false           # mode auto-detected: native+zerocopy -> nativ
 
 # Server:  sudo ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
 # Client:  sudo ./abtrda3_test --client --config ../../../test/abtrda3_test.toml
+
+# ./profile_hotpath.sh --no-perf
