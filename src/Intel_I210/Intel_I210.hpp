@@ -50,8 +50,8 @@ class Intel_I210 {
 
 public:
   // Rule of 5
-  Intel_I210(std::string_view ifname, int bar = 0)
-    :m_pciBusHandler{ifname, bar} {}
+  Intel_I210(std::string_view ifname, int bar = 0, std::string_view driverName = {})
+    :m_pciBusHandler{ifname, bar, driverName} {}
 
   Intel_I210(const Intel_I210&) = delete;
   Intel_I210& operator=(const Intel_I210&) = delete;

@@ -110,7 +110,7 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
             return 1;
         }
 
-        Intel_I210<DriverMode::RxTx> nic(role.interface);
+        Intel_I210<DriverMode::RxTx> nic(role.interface, 0, "igb");
         if (!nic.init()) {
             std::fprintf(stderr, "Error: I210 init failed\n");
             return 1;
