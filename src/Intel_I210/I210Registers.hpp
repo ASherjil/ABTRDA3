@@ -25,6 +25,7 @@ constexpr std::uint32_t CTRL       = 0x0000;   // Device Control (R/W)
 constexpr std::uint32_t STATUS     = 0x0008;   // Device Status (RO)
 constexpr std::uint32_t CTRL_EXT   = 0x0018;   // Extended Device Control (R/W)
 constexpr std::uint32_t MDIC       = 0x0020;   // MDI Control (R/W) — PHY register access
+constexpr std::uint32_t WUC        = 0x0030;   // Wake Up Control (R/W)
 constexpr std::uint32_t CONNSW     = 0x0034;   // Copper/Fiber Switch Control (R/W)
 constexpr std::uint32_t VET        = 0x0038;   // VLAN Ether Type (R/W)
 constexpr std::uint32_t LEDCTL     = 0x0E00;   // LED Control (R/W)
@@ -38,9 +39,11 @@ constexpr std::uint32_t CTRL_SLU        = (1U << 6);    // Set Link Up
 constexpr std::uint32_t CTRL_FRCSPD     = (1U << 11);   // Force Speed
 constexpr std::uint32_t CTRL_FRCDPLX    = (1U << 12);   // Force Duplex
 constexpr std::uint32_t CTRL_RST        = (1U << 26);   // Software Reset (self-clearing)
+constexpr std::uint32_t CTRL_RFCE       = (1U << 27);   // Receive Flow Control Enable
+constexpr std::uint32_t CTRL_TFCE       = (1U << 28);   // Transmit Flow Control Enable
+constexpr std::uint32_t CTRL_DEV_RST    = (1U << 29);   // Device Reset (self-clearing)
 constexpr std::uint32_t CTRL_VME        = (1U << 30);   // VLAN Mode Enable
 constexpr std::uint32_t CTRL_PHY_RST    = (1U << 31);   // PHY Reset
-constexpr std::uint32_t CTRL_DEV_RST    = (1U << 29);   // Device Reset (self-clearing)
 
 // ============================================================================
 // Section 8.2.2 — STATUS Register Bit Definitions

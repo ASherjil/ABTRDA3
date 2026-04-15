@@ -32,7 +32,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::vector<std::uint64_t> latencies_ns;
     latencies_ns.reserve(count);
 
-    constexpr std::uint64_t kTimeoutNs = 5'000'000; // 5ms
+    constexpr std::uint64_t kTimeoutNs = 2'000'000; // 2ms
 
     // Pacing: use CLOCK_MONOTONIC absolute sleeps for drift-free timing
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
@@ -74,20 +74,18 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
 
         while (true) {
           if (RxFrame rxf = rx.tryReceive(); !rxf.data.empty()) [[unlikely]]{
-                if (rxf.data.size() >= cfg.frameSize)[[likely]] { // Check 1: Bounds check ensure data is the correct size
-                    // Check 2: Check the dst mac address on the received frame. Is this packet for us ?
-                    if (std::memcmp(rxf.data.data(), cfg.client.mac.data(), 6) == 0)[[likely]]{
-                        std::uint32_t rx_seq;
-                        std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
+                // Check 1: dst MAC — is this packet for us?
+                if (std::memcmp(rxf.data.data(), cfg.client.mac.data(), 6) == 0)[[likely]]{
+                    std::uint32_t rx_seq;
+                    std::memcpy(&rx_seq, rxf.data.data() + 14, sizeof(rx_seq));
 
-                        // Check 3: Check the sequence number to prevent packets from previous timeouts being recorded as genuine echo
-                        if (rx_seq == seq_net)[[likely]] {
-                            rx.release();
-                            std::uint64_t t2 = now_ns();
-                            latencies_ns.push_back(t2 - t1);
-                            received = true;
-                            break;
-                        }
+                    // Check 2: sequence number — prevent stale echoes being recorded
+                    if (rx_seq == seq_net)[[likely]] {
+                        rx.release();
+                        std::uint64_t t2 = now_ns();
+                        latencies_ns.push_back(t2 - t1);
+                        received = true;
+                        break;
                     }
                 }
                 rx.release();
@@ -98,7 +96,8 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         }
 
         if (!received) {
-            std::printf("Packet %u timed out!\n", i);
+            std::fprintf(stderr, "Packet %u timed out (2ms) — stopping client\n", i);
+            break;
         }
     }
 

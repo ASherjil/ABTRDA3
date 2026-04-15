@@ -45,8 +45,8 @@ class Intel_I210 {
   static constexpr bool HAS_TX = (M == DriverMode::TxOnly || M == DriverMode::RxTx);
   static constexpr std::size_t RX_RING_MASK = NumRxDesc - 1;
   static constexpr std::size_t TX_RING_MASK = NumTxDesc - 1;
-  // Head write-back lives at end of TX buffer (within same 2MB hugepage)
-  static constexpr std::size_t TX_HEAD_WB_OFFSET = NumTxDesc * BuffSize;
+  // Batch RDT writes: flush after this many descriptors released (DPDK default: 32)
+  static constexpr std::uint32_t RX_FREE_THRESH = 32;
 
 public:
   // Rule of 5
@@ -61,6 +61,7 @@ public:
        m_rxRing{std::move(other.m_rxRing)},
        m_rxBuffer{std::move(other.m_rxBuffer)},
        m_rxTail{std::exchange(other.m_rxTail, 0)},
+       m_rxHeld{std::exchange(other.m_rxHeld, 0)},
        m_txRing{std::move(other.m_txRing)},
        m_txBuffer{std::move(other.m_txBuffer)},
        m_txTail{std::exchange(other.m_txTail, 0)},
@@ -76,6 +77,7 @@ public:
       m_rxRing        = std::move(other.m_rxRing);
       m_rxBuffer      = std::move(other.m_rxBuffer);
       m_rxTail        = std::exchange(other.m_rxTail, 0);
+      m_rxHeld        = std::exchange(other.m_rxHeld, 0);
       m_txRing        = std::move(other.m_txRing);
       m_txBuffer      = std::move(other.m_txBuffer);
       m_txTail        = std::exchange(other.m_txTail, 0);
@@ -101,6 +103,8 @@ public:
     reset();
     disableInterrupts();
     disableEEE();
+    clearPhyLinkDown();
+    zeroMulticastTable();
     readMacAddress();
 
     // Initialise PHY: reset, advertise all speeds, restart auto-negotiation
@@ -110,9 +114,11 @@ public:
 
     // Set link up so MAC recognises PHY's LINK indication (Section 3.7.4.4.1)
     // Also clear FRCSPD so MAC auto-detects speed from PHY (Section 3.7.4.4.2)
+    // Disable flow control — PAUSE frames from the link partner can stall
+    // our transmitter, adding unpredictable latency (DPDK sets fc=none).
     std::uint32_t ctrl = readReg(CTRL);
     ctrl |= CTRL_SLU;
-    ctrl &= ~(CTRL_FRCSPD | CTRL_FRCDPLX);
+    ctrl &= ~(CTRL_FRCSPD | CTRL_FRCDPLX | CTRL_RFCE | CTRL_TFCE);
     writeReg(CTRL, ctrl);
 
     if constexpr (HAS_RX) {
@@ -177,12 +183,15 @@ public:
   // Initialisation functions on the cold path. END
 
   // Receive functions on the hot path - START
-  [[nodiscard, gnu::always_inline]]
+  [[nodiscard, gnu::always_inline, gnu::hot]]
   inline RxFrame tryReceive() noexcept requires (HAS_RX){
-    // Prefetch Rx packet buffer — warm the cache line before we need it.
-    // After a 1ms sleep the data cache is cold; this overlaps the cache
-    // fill with the volatile DD read below.
-    __builtin_prefetch(m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), 0, 0);
+    // DPDK-style multi-level prefetch (igb_rxtx.c:886-921):
+    //  - Prefetch next descriptor every 4 iterations (cache-line aligned)
+    //  - Prefetch packet data into L2 for current descriptor
+    if ((m_rxTail & 0x3) == 0) {
+      __builtin_prefetch(&m_rxRing[(m_rxTail + 4) & RX_RING_MASK], 0, 3);
+    }
+    __builtin_prefetch(m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), 0, 1);
 
     // Volatile read — NIC writes statusError via DMA; without volatile the
     // compiler may cache this read and spin forever on a stale value.
@@ -206,18 +215,23 @@ public:
     };
   }
 
-  [[gnu::always_inline]]
+  [[gnu::always_inline, gnu::hot]]
   inline void release() noexcept requires (HAS_RX){
     RxDescriptor& desc = m_rxRing[m_rxTail];
     // Reset to read format — restore buffer address for hardware reuse
     desc.read.pktAddr = m_rxBuffer.physicalAddrAt(m_rxTail * BuffSize);
     desc.read.hdrAddr = 0;
-    std::size_t prev = m_rxTail;
     m_rxTail = (m_rxTail + 1) & RX_RING_MASK;
-    // Write barrier — ensure descriptor writes are visible before the NIC
-    // sees the new tail.  Matches igb's dma_wmb().
-    asm volatile("" ::: "memory");
-    writeReg(RDT0, static_cast<std::uint32_t>(prev));
+
+    // Batch RDT writes (DPDK igb_rxtx.c:965-976): instead of an MMIO write
+    // per packet, defer until rx_free_thresh descriptors have been released.
+    // Each MMIO write costs ~100-200ns on PCIe; batching amortises this.
+    m_rxHeld++;
+    if (m_rxHeld >= RX_FREE_THRESH) [[unlikely]] {
+      asm volatile("" ::: "memory");
+      writeReg(RDT0, static_cast<std::uint32_t>((m_rxTail - 1) & RX_RING_MASK));
+      m_rxHeld = 0;
+    }
   }
   // Receive functions on the hot path - END
 
@@ -273,6 +287,7 @@ private:
   DMARing<RxDescriptor>       m_rxRing;
   HugepageBuffer              m_rxBuffer;
   std::size_t                 m_rxTail{};
+  std::uint32_t               m_rxHeld{};  // count of released-but-not-flushed descriptors
 
   // Tx
   DMARing<TxDescriptor>       m_txRing;
@@ -361,7 +376,6 @@ private:
     constexpr std::uint32_t DMACR_R       = 0x02508;
     constexpr std::uint32_t PCIEMISC_R    = 0x05BB8;
     constexpr std::uint32_t TQAVCTRL_R    = 0x03570;
-    constexpr std::uint32_t DCA_TXCTRL0_R = 0x0E014;
 
     int warnings = 0;
     auto check = [&warnings](const char* name, std::uint32_t reg, std::uint32_t mask, bool expectClear) {
@@ -379,10 +393,8 @@ private:
     std::uint32_t pciemisc = readReg(PCIEMISC_R);
     std::uint32_t ctrlExt  = readReg(CTRL_EXT);
     std::uint32_t tqavctrl = readReg(TQAVCTRL_R);
-    std::uint32_t dcaTx    = readReg(DCA_TXCTRL0_R);
     std::uint32_t rxdctl   = readReg(RXDCTL0);
     std::uint32_t txdctl   = readReg(TXDCTL0);
-    std::uint32_t tdwbal   = readReg(TDWBAL0);
     std::uint32_t eitr     = readReg(EITR0);
 
     // EEE MAC-side: LPI must be off
@@ -417,17 +429,22 @@ private:
     // Qav/FQTSS: must be off (adds launch-time delays)
     check("TQAVCTRL", tqavctrl, 0x00000001, true);   // XMIT_MODE
 
-    // Tx head write-back: must be enabled
-    check("TDWBAL0",  tdwbal,   0x00000001, false);  // Head_WB_En
+    // Flow control: must be off (PAUSE frames add unpredictable latency)
+    std::uint32_t ctrl = readReg(CTRL);
+    check("CTRL", ctrl, CTRL_RFCE, true);   // Rx Flow Control
+    check("CTRL", ctrl, CTRL_TFCE, true);   // Tx Flow Control
 
-    // Tx relaxed ordering: must be off for head write-back
-    check("DCA_TXCTRL0", dcaTx, 0x00000800, true);   // TX_WB_RO_EN
-
-    // EITR: must be zero for immediate descriptor write-back
-    if (eitr != 0) {
-      std::fprintf(stderr, "[I210] WARN: EITR0=0x%08x (expected 0)\n", eitr);
+    // EITR: must be max value to disable interrupt-driven write-back (DPDK default)
+    // Hardware masks bits [1:0] so 0xFFFF reads back as 0xFFFC — both are correct.
+    if (eitr != 0xFFFF && eitr != 0xFFFC) {
+      std::fprintf(stderr, "[I210] WARN: EITR0=0x%08x (expected 0xFFFC)\n", eitr);
       warnings++;
     }
+
+    // DVMOLR: per-queue CRC stripping must be enabled (I210-specific)
+    constexpr std::uint32_t DVMOLR0_R = 0x0C038;
+    std::uint32_t dvmolr = readReg(DVMOLR0_R);
+    check("DVMOLR0", dvmolr, 0x80000000, false);  // STRCRC must be set
 
     // Queues: must be enabled
     check("RXDCTL0", rxdctl, RXDCTL_ENABLE, false);
@@ -449,10 +466,15 @@ private:
     // EITR=0 → no interrupt throttle timer, descriptors written back
     // immediately (Section 7.1.4.4 / 7.2.2.6: EITR controls write-back
     // timing for BOTH Rx and Tx even without interrupts enabled)
-    // EITR[n] = 0x1680 + 4*n, n = 0..4 — zero ALL of them
+    // EITR[n] = 0x1680 + 4*n, n = 0..4
+    // DPDK sets 0xFFFF (max delay) to disable interrupt-driven write-back
+    // entirely — write-back then only happens via WTHRESH/RS bit.
     for (std::uint32_t i{}; i < 5; i++) {
-      writeReg(EITR0 + 4 * i, 0);
+      writeReg(EITR0 + 4 * i, 0xFFFF);
     }
+
+    // Disable all wake-up sources (DPDK: E1000_WRITE_REG(hw, E1000_WUC, 0))
+    writeReg(WUC, 0);
   }
 
   // Disable Energy Efficient Ethernet (EEE / 802.3az)
@@ -501,6 +523,26 @@ private:
     writeReg(CTRL_EXT, ctrlExt);
 
     std::fprintf(stderr, "[I210] Power saving disabled (EEE + DMAC + PCIe Lx + PHY PM)\n");
+  }
+
+  // Clear "Go Link Down" in PHY power management (DPDK: e1000_82575.c:1588)
+  // If set, the PHY can autonomously take the link down.
+  void clearPhyLinkDown() {
+    constexpr std::uint32_t PHY_POWER_MGMT   = 0xE854;  // E1000_82580_PHY_POWER_MGMT
+    constexpr std::uint32_t PM_GO_LINKD       = 0x00000001;
+    std::uint32_t phpm = readReg(PHY_POWER_MGMT);
+    phpm &= ~PM_GO_LINKD;
+    writeReg(PHY_POWER_MGMT, phpm);
+  }
+
+  // Zero the Multicast Table Array (128 × 32-bit entries at 0x5200)
+  // Stale entries from the igb driver can cause the NIC to accept
+  // unwanted multicast packets, wasting DMA bandwidth and cache.
+  void zeroMulticastTable() {
+    constexpr std::uint32_t MTA_BASE = 0x5200;
+    for (int i = 0; i < 128; i++) {
+      writeReg(MTA_BASE + static_cast<std::uint32_t>(i) * 4, 0);
+    }
   }
 
   // PHY register access via MDIC (Section 8.2.4)
@@ -657,9 +699,16 @@ private:
     // 9. Program the direction of packets to this queue according to the mode selected in the MRQC register. Packets directed to a disabled queue are dropped.
     // TODO:   
 
-    // TODO: Is this needed ?
     m_rxTail = 0;
     writeReg(RDT0, static_cast<std::uint32_t>(NumRxDesc-1));
+
+    // 10. DVMOLR per-queue CRC stripping (I210-specific, DPDK igb_rxtx.c:2559)
+    //     Required in addition to RCTL_SECRC for I210/I350.
+    constexpr std::uint32_t DVMOLR0      = 0x0C038;   // DMA VM Offload queue 0
+    constexpr std::uint32_t DVMOLR_STRCRC = 0x80000000;
+    std::uint32_t dvmolr = readReg(DVMOLR0);
+    dvmolr |= DVMOLR_STRCRC;
+    writeReg(DVMOLR0, dvmolr);
 
     std::fprintf(stderr, "[I210] Rx queue 0 initialised: %zu descriptors, %zu bytes buffers\n", NumRxDesc, BuffSize);
     return true;
@@ -672,8 +721,8 @@ private:
       return false;
     }
 
-    // 2. Allocate packet data buffers on hugepages (+ 64 bytes for head write-back)
-    if (!m_txBuffer.allocate(NumTxDesc * BuffSize + 64)) {
+    // 2. Allocate packet data buffers on hugepages
+    if (!m_txBuffer.allocate(NumTxDesc * BuffSize)) {
       std::fprintf(stderr, "[I210] Tx data buffer allocation failed.\n");
       return false;
     }
@@ -689,26 +738,8 @@ private:
     // 5. Program TXDCTL : WTHRESH=0, disable queue for configuration
     writeReg(TXDCTL0, 0);
 
-    // 6. Enable TX Head Write-Back (Section 7.2.3) — MUST be programmed
-    //    while queue is disabled (TXDCTL.Enable = 0).
-    //    Instead of writing DD bits back to each descriptor (cache line thrash),
-    //    hardware writes the head pointer to a separate memory location.
-    *m_txBuffer.template ptrAt<std::uint32_t>(TX_HEAD_WB_OFFSET) = 0;
-    std::uint64_t headWbPhys = m_txBuffer.physicalAddrAt(TX_HEAD_WB_OFFSET);
-    // TDWBAL: bit 0 = Head_WB_En, bits [31:2] = address[31:2]
-    writeReg(TDWBAL0, static_cast<std::uint32_t>(headWbPhys & 0xFFFFFFFF) | 1U);
-    writeReg(TDWBAH0, static_cast<std::uint32_t>(headWbPhys >> 32));
-
-    // 6b. Disable PCIe Relaxed Ordering for head write-back (Section 8.13.2)
-    //     Required when Head Write-Back is enabled.
-    //     TXCTL queue 0 @ 0x0E014, bit 11 = TX_WB_RO_EN
-    constexpr std::uint32_t DCA_TXCTRL0    = 0x0E014;
-    constexpr std::uint32_t TX_WB_RO_EN    = (1U << 11);
-    std::uint32_t txctl = readReg(DCA_TXCTRL0);
-    txctl &= ~TX_WB_RO_EN;
-    writeReg(DCA_TXCTRL0, txctl);
-
-    // 7. Now enable the queue
+    // 6. Enable the queue (DD polling for Tx completion, matching DPDK)
+    //    No Head Write-Back — simpler and avoids wrap ambiguity.
     writeReg(TXDCTL0, readReg(TXDCTL0) | TXDCTL_ENABLE);
     bool txEnabled = false;
     for (int i{}; i < 100; i++) {
@@ -726,8 +757,8 @@ private:
     // 7. Set the TIPG to default values for 1000BASE-T
     writeReg(TIPG, TIPG_DEFAULT);
 
-    // 8. Enable transmitter
-    writeReg(TCTL, TCTL_EN | TCTL_PSP | TCTL_CT_IEEE | TCTL_BST_DEF);
+    // 8. Enable transmitter (DPDK also sets TCTL_RTLC for late collision retry)
+    writeReg(TCTL, TCTL_EN | TCTL_PSP | TCTL_CT_IEEE | TCTL_BST_DEF | TCTL_RTLC);
 
     m_txTail = 0;
     m_txCleanHead = 0;
@@ -740,22 +771,18 @@ private:
 
   [[gnu::always_inline, gnu::hot]]
   inline void txReclaim() requires (HAS_TX){
-    // Read hardware head from write-back location (Section 7.2.3).
-    // This avoids polling DD bits in descriptor memory, eliminating
-    // cache line thrashing between CPU writes and NIC DMA.
-    std::size_t head = *reinterpret_cast<volatile const std::uint32_t*>(
-                           m_txBuffer.template ptrAt<std::uint8_t>(TX_HEAD_WB_OFFSET));
-    head &= TX_RING_MASK;
-
-    while (m_txInFlight > 0 && m_txCleanHead != head) {
+    // DD polling (matches DPDK igb_rxtx.c:493) — poll the DD bit in each
+    // completed descriptor. Simpler than Head Write-Back and avoids the
+    // circular buffer wrap ambiguity.
+    while (m_txInFlight > 0) {
+      auto status = *reinterpret_cast<volatile const std::uint32_t*>(
+                        &m_txRing[m_txCleanHead].wb.status);
+      if (!(status & TXD_STAT_DD)) {
+        break;
+      }
+      m_txRing[m_txCleanHead].wb.status = 0;
       m_txCleanHead = (m_txCleanHead + 1) & TX_RING_MASK;
       m_txInFlight--;
-    }
-
-    // Wrap case: head == cleanHead but ring is full → head has lapped,
-    // all descriptors are complete (circular buffer ambiguity)
-    if (m_txInFlight == NumTxDesc && head == m_txCleanHead) {
-      m_txInFlight = 0;
     }
   }
 };
