@@ -19,12 +19,29 @@ for arg in "$@"; do
 done
 
 SERVER=${HOSTS[0]:-cfc-865-mkdev16}
-CLIENT=${HOSTS[1]:-cfc-865-mkdev30}
-BUILD_DIR=/user/asherjil/ABTTiming/ABTRDA3/build/x86_64-release/test
+CLIENT=${HOSTS[1]:-cfd-865-mkdev50}
+BUILD_BASE=/user/asherjil/ABTTiming/ABTRDA3/build
 CONFIG=../../../test/abtrda3_test.toml
 
-echo "=== Intel I210 PMD — latency test ==="
-echo "Server: $SERVER | Client: $CLIENT | perf: $($NO_PERF && echo off || echo on)"
+# Detect architecture per host and set build directory
+get_build_dir() {
+    local host=$1
+    local arch
+    arch=$(ssh "$host" "uname -m")
+    case "$arch" in
+        x86_64)  echo "$BUILD_BASE/x86_64-release/test" ;;
+        aarch64) echo "$BUILD_BASE/arm64-release/test" ;;
+        *)       echo "Error: unknown arch '$arch' on $host" >&2; exit 1 ;;
+    esac
+}
+
+SERVER_BUILD=$(get_build_dir "$SERVER")
+CLIENT_BUILD=$(get_build_dir "$CLIENT")
+
+echo "=== ABTRDA3 — latency test ==="
+echo "Server: $SERVER ($(basename $(dirname $SERVER_BUILD)))"
+echo "Client: $CLIENT ($(basename $(dirname $CLIENT_BUILD)))"
+echo "perf: $($NO_PERF && echo off || echo on)"
 echo ""
 
 if [ "$NO_PERF" = true ]; then
@@ -56,14 +73,14 @@ done
 
 # Start server
 echo "Starting server on $SERVER..."
-ssh $SERVER "cd $BUILD_DIR && sudo $WRAP ./abtrda3_test --server --config $CONFIG" &
+ssh $SERVER "cd $SERVER_BUILD && sudo $WRAP ./abtrda3_test --server --config $CONFIG" &
 SERVER_PID=$!
 
 sleep 10
 
 # Start client (blocks until done)
 echo "Starting client on $CLIENT..."
-ssh $CLIENT "cd $BUILD_DIR && sudo $WRAP ./abtrda3_test --client --config $CONFIG"
+ssh $CLIENT "cd $CLIENT_BUILD && sudo $WRAP ./abtrda3_test --client --config $CONFIG"
 
 echo ""
 echo "Client done. Killing server..."

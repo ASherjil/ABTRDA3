@@ -32,7 +32,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
     std::vector<std::uint64_t> latencies_ns;
     latencies_ns.reserve(count);
 
-    constexpr std::uint64_t kTimeoutNs = 2'000'000; // 2ms
+    constexpr std::uint64_t kTimeoutNs = 5'000'000; // 5ms
 
     // Pacing: use CLOCK_MONOTONIC absolute sleeps for drift-free timing
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;

@@ -13,6 +13,7 @@
 #include "AFXDPRx.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
+#include "TapBridge.hpp"
 
 #include <cstdio>
 #include <stop_token>
