@@ -302,9 +302,183 @@ The driver DOES support programming screening registers via `ethtool -N`
 is not installed on cfd-865-mkdev50. Even if it were, steering packets to
 queue 1's DMA ring doesn't help because the socket layer merges them anyway.
 
+## Linux Kernel Source Analysis — What to Port
+
+Source path: `/nfs/cs-ccr-nfshome/user/asherjil/ABTTiming/linux-xlnx/drivers/net/ethernet/cadence/`
+
+### File breakdown
+
+| File | Lines | Purpose | What to port |
+|------|-------|---------|-------------|
+| `macb.h` | 1486 | Register defs, bit fields, descriptor structs | **~950 lines near-verbatim** → `GEMRegisters.hpp` |
+| `macb_main.c` | 6040 | Driver logic | **~12% copy, ~8% rewrite, ~80% skip** |
+| `macb_ptp.c` | 466 | Hardware timestamping (TSU) | **~70 lines** for future PTP support |
+| `macb_pci.c` | 133 | PCIe wrapper for Cadence eval boards | **Skip entirely** (we're a platform device) |
+
+### macb.h — near-verbatim copy to GEMRegisters.hpp
+
+**Keep (lines 17-970)**: All register offsets, bit field defines (`MACB_RE_OFFSET` etc.),
+bit-manipulation macros (`MACB_BIT`, `MACB_BF`, `MACB_BFEXT`, `MACB_BFINS` + GEM_ variants),
+descriptor structs (`macb_dma_desc`, `macb_dma_desc_64`, `macb_dma_desc_ptp`), constants.
+These are pure hardware definitions — portable C.
+
+**Delete**:
+- Lines 10-16: Linux kernel `#include`s (clk.h, phylink.h, ptp_clock_kernel.h, net_tstamp.h,
+  interrupt.h, phy/phy.h, workqueue.h)
+- Lines ~820-852: register access macros that reference `struct macb` (`macb_readl`,
+  `gem_readl`, `queue_readl`, etc.) — we use our own `AXIBackend::readReg/writeReg`
+- Lines 972-1486: All kernel driver structs (`macb_tx_skb`, `macb_queue`, `macb`) —
+  they use `sk_buff`, `napi_struct`, `spinlock_t`, `phylink`, `clk`, `ptp_clock` etc.
+
+**Add at top**:
+```cpp
+#include <cstdint>
+using u8  = std::uint8_t;
+using u16 = std::uint16_t;
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
+```
+
+### macb_main.c — Tier 1: Copy verbatim (~700 lines)
+
+Just substitute `m_bus.writeReg()` for `gem_writel()` / `macb_writel()` / `queue_writel()`:
+
+| Function | Lines | Purpose |
+|----------|-------|---------|
+| `hw_readl`, `hw_writel`, native variants | 223-241 | Register primitives (uses `relaxed` — zero barrier overhead) |
+| `macb_set_addr` / `macb_get_addr` | 1107-1142 | 64-bit descriptor address + `dma_wmb()` (preserve barrier!) |
+| `macb_tx_dma`, `macb_rx_ring_wrap`, `macb_rx_desc`, `macb_rx_buffer` | 194-220 | Ring index arithmetic |
+| `macb_reset_hw` | 2746-2776 | Full reset: disable RX/TX, clear stats, disable IRQs per queue |
+| `macb_init_hw` | 2897-2930 | Orchestrates NCFGR/PBUFRXCUT/DMA config |
+| `macb_configure_dma` | 2851-2895 | DMA engine (burst, RX buffer size, 64b, PTP) |
+| `macb_init_buffers` | 489-512 | Program RBQPH/TBQPH and per-queue ring bases |
+| `macb_set_hwaddr` / `macb_get_hwaddr` | 272-324 | MAC address via SA1B/SA1T |
+| `macb_mdc_clk_div` / `gem_mdc_clk_div` / `macb_dbw` | 2778-2842 | Capability probing |
+| `gem_init_rings` / `macb_init_rings` / `macb_init_rx_ring` | 1631-2744 | Descriptor ring init |
+| `macb_tx_complete_pending`, `macb_rx_pending` | 1728-1822 | Polling checks (drop spin_lock) |
+| `macb_halt_tx`, `macb_tx_restart` | 1076-1805 | Stall recovery |
+| **`gem_enable_flow_filters`, `gem_prog_cmp_regs`** | 3712-3844 | **Screener programming for our Q0/Q1 steering** |
+| `hash_get_index`, `hash_bit_value`, `macb_sethashtable` | 2965-3008 | Multicast hash |
+| `macb_mdio_wait_for_idle`, `macb_mdio_read_c22`, `macb_mdio_write_c22` | 325-441 | MDIO (strip `pm_runtime_*`) |
+
+### macb_main.c — Tier 2: Algorithmic gold, rewrite around kernel types (~235 lines)
+
+The descriptor-handling algorithm is what we want. Replace kernel types with our own:
+
+| Function | Lines | What to preserve | What to replace |
+|----------|-------|------------------|-----------------|
+| `gem_rx` | 1458-1628 | Descriptor polling, USED-bit check, `rmb()`/`dma_rmb()` placement (~35 lines) | `sk_buff` alloc → our buffer pool |
+| `gem_rx_refill` | 1374-1435 | Descriptor filling, barrier order (~20 lines) | `netdev_alloc_skb` → `HugepageBuffer` |
+| `macb_tx_map` | 2103-2275 | TX descriptor build in reverse, `wmb()/dma_wmb()` (~80 lines, **load-bearing on ARM64**) | skb fragment walking |
+| `macb_start_xmit` | 2381-2484 | TSTART write (line 2474), ring slot check (~30 lines) | netif queueing |
+| `macb_tx_complete` | 1296-1372 | TX_USED polling, tx_tail advance (~40 lines) | sk_buff stats/release; drop spin_lock |
+| `macb_alloc_consistent` | 2626-2686 | Ring assignment arithmetic (~30 lines) | `dma_alloc_coherent` → `HugepageBuffer` |
+
+### macb_main.c — Tier 3: Skip entirely (~4800 lines, 80%)
+
+- All interrupt handlers (`macb_interrupt`, `gem_wol_interrupt`, `macb_wol_interrupt`,
+  `macb_poll_controller`) — 195 lines
+- NAPI poll (`macb_rx_poll`, `macb_tx_poll`) — ~50 lines
+- Stats collection, ethtool strings — ~300 lines
+- ethtool ops (regs dump, ring settings, channel count, WoL, coalescing) — ~500 lines
+- Suspend/resume/runtime_pm — ~200 lines
+- Phylink state machine integration — ~400 lines
+- `macb_open`/`macb_close` (networking-stack lifecycle) — ~100 lines
+- `macb_tx_error_task` (kernel workqueue error recovery) — 120 lines
+- VLAN, `macb_pad_and_fcs`, `macb_clear_csum` — ~100 lines
+- XDP/AF_XDP hooks, SRIOV/VF, netpoll
+- `macb_configure_caps` device-tree probing (we hard-code for Zynq UltraScale+)
+
+### Critical memory barriers — NEVER remove on ARM64
+
+ARM64 is NOT DMA-coherent. These barriers in the kernel source are load-bearing:
+
+```c
+// Before hardware reads descriptors we wrote:
+dma_wmb()   // macb_set_addr:1119, gem_rx_refill:1417, macb_tx_map:2257
+
+// Before we read descriptors hardware wrote:
+dma_rmb()   // gem_rx:1477, macb_tx_complete:1317
+
+// Between writing address and ctrl (LAST step before HW sees the frame):
+wmb()       // macb_tx_map:2243
+```
+
+C++ equivalents:
+- `dma_wmb` ≈ `std::atomic_thread_fence(std::memory_order_release)` or `asm volatile("dmb oshst")`
+- `dma_rmb` ≈ `std::atomic_thread_fence(std::memory_order_acquire)` or `asm volatile("dmb oshld")`
+- `wmb` ≈ `asm volatile("dsb sy")` for strict ordering
+
+### macb_ptp.c — TSU/PTP copy (~70 lines, future work)
+
+Not needed for initial bring-up. Useful when we want hardware timestamps:
+
+| Function | Lines | Action |
+|----------|-------|--------|
+| `gem_hw_timestamp` | 246-272 | Copy — extract 64-bit TS from descriptor PTP extension |
+| `gem_tsu_set_time` | 77-100 | Copy — TN → TSL → TSH register order is critical |
+| `gem_tsu_get_time` | 41-75 | Copy — rollover detection logic |
+| `gem_tsu_incr_set` | 102-120 | Copy — clock rate programming |
+| `gem_ptp_init_timer` | 205-218 | Copy — increment arithmetic from rate |
+| `macb_ptp_desc` | 28-39 | Copy — PTP extension pointer math |
+| `gem_ptp_set_ts_mode` | 367-375 | Copy — enable HW timestamping in TXBDCTRL/RXBDCTRL |
+
+Skip all `ptp_clock_info` callbacks (Linux PTP subsystem integration).
+
+### Top 10 functions to port first (by value)
+
+1. `macb_reset_hw` (2746-2776, 30 lines) — clean reset, 100% copy
+2. `macb_init_hw` (2897-2930, 33 lines) — full init, 100% copy
+3. `macb_configure_dma` (2851-2895, 44 lines) — DMA config, 100% copy
+4. `macb_set_addr` + `macb_get_addr` (1107-1142, 33 lines) — descriptor addr, **dma_wmb() critical**
+5. `macb_tx_complete` (1296-1372, 76 lines) — TX polling, drop spin_lock, ~50 lines preserved
+6. `gem_rx` (1458-1628, 170 lines) — RX polling, ~35 lines preserved descriptor logic
+7. `macb_tx_map` (2103-2275, 172 lines) — TX descriptor fill, **barriers critical**, ~80 lines preserved
+8. `macb_init_rings` + `gem_init_rings` (2701-2744, 41 lines) — ring init, mostly copy
+9. `macb_init_buffers` (489-512, 23 lines) — ring base programming, 100% copy
+10. `gem_prog_cmp_regs` + `gem_enable_flow_filters` (3758-3844 + 3712-3756, 130 lines) — **screener setup, core to our routing**
+
+### Recommended porting order (7-day estimate)
+
+| Day | Phase | Functions |
+|-----|-------|-----------|
+| 1 | Cold path | `macb_reset_hw`, `macb_init_hw`, `macb_configure_dma`, `macb_init_buffers` |
+| 2 | Descriptors | `macb_set_addr`/`get_addr`, ring init, `HugepageBuffer` allocation |
+| 3 | PHY/MDIO | `macb_mdio_read_c22`/`write_c22` (strip PM), LAN8841 init |
+| 4-5 | TX hot path | `macb_tx_map` rewrite, `macb_start_xmit`, `macb_tx_complete` |
+| 6-7 | RX hot path | `gem_rx` rewrite, `gem_rx_refill` with our buffer pool |
+| 8 | Screeners & multi-queue | `gem_prog_cmp_regs`, `gem_enable_flow_filters`, Q1 hot path, Q0 TAP |
+| 9-10 | Test + tune | Latency benchmark, barrier audit |
+
+### Summary numbers
+
+| File | Total lines | Copy verbatim | Rewrite preserving logic | Skip |
+|------|-------------|---------------|--------------------------|------|
+| macb_pci.c | 133 | 0 | 0 | 133 |
+| macb_ptp.c | 466 | ~70 | 0 | ~400 |
+| macb_main.c | 6040 | ~700 | ~235 | ~5100 |
+| **Total** | **6639** | **~770** | **~235** | **~5633** |
+
+~15% of the Linux code transfers by line count. Algorithmic value is higher: ~60-70% of
+critical-path logic (descriptor handling, init sequence, memory barrier placement) is
+preserved. The other 85% of lines is kernel plumbing we replace with our C++ infrastructure
+(AXIBackend, HugepageBuffer, TapBridge, direct polling).
+
+Expected final PMD size: 1500-2000 lines (1000-1200 ported from macb + 500-800 new C++).
+
 ## Reference Documentation
 
 - Xilinx UG1085: Zynq UltraScale+ TRM, Chapter 16 (GEM)
 - Cadence GEM Technical Reference Manual
-- Linux kernel: `drivers/net/ethernet/cadence/macb_main.c`, `macb.h`
-- DPDK has NO macb driver — Linux kernel source is the primary reference
+- Linux kernel (cloned locally): `/nfs/cs-ccr-nfshome/user/asherjil/ABTTiming/linux-xlnx/drivers/net/ethernet/cadence/`
+  - `macb.h` — register definitions (source of `GEMRegisters.hpp`)
+  - `macb_main.c` — driver logic reference
+  - `macb_ptp.c` — TSU/PTP hardware timestamping
+  - `macb_pci.c` — PCIe wrapper (not applicable to us)
+- DPDK has NO official macb driver. The Phytium patch v1 (Oct 2024, rejected due to build
+  errors and style issues) contained register-level work that may be useful for cross-reference
+- Existing infrastructure in `/user/asherjil/ABTTiming/ABTEdge/src/backends/`:
+  - `AXIBackend.hpp` — AXI register access (mmap at 0xff0b0000)
+  - `InterfaceDiscovery.hpp` — driver unbind/rebind via sysfs
+  - `HugepageBuffer.hpp` — replaces `dma_alloc_coherent`
+  - `DMARing.hpp` — ring management helpers
