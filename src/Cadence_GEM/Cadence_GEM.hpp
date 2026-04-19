@@ -200,12 +200,16 @@ public:
     class SlowPath {
     public:
         SlowPath() = default;
-        explicit SlowPath(Cadence_GEM* parent) noexcept : m_parent{parent} {}
+        explicit SlowPath(Cadence_GEM* parent) noexcept
+            : m_parent{parent} {}
 
-        [[nodiscard]] std::uint8_t* acquire(std::uint32_t len) noexcept {
+        [[nodiscard]] std::uint8_t* acquire(std::uint32_t len) const noexcept {
             return m_parent->template txAcquire<Q_SLOW>(len);
         }
-        void commit() noexcept { m_parent->template txCommit<Q_SLOW>(); }
+        void commit() noexcept {
+            m_parent->template txCommit<Q_SLOW>();
+        }
+
         [[nodiscard]] bool send(std::span<const std::uint8_t> frame) noexcept {
             auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
             if (!dst) return false;
@@ -213,11 +217,16 @@ public:
             commit();
             return true;
         }
-        void prefillRing(std::span<const std::uint8_t>) noexcept {}
-        [[nodiscard]] RxFrame tryReceive() noexcept {
+
+        void prefillRing(std::span<const std::uint8_t>) noexcept {
+            // No op. Exists to satify the ring concept. 
+        }
+
+        [[nodiscard]] RxFrame tryReceive() const noexcept {
             return m_parent->template rxTryReceive<Q_SLOW>();
         }
-        void release() noexcept {
+
+        void release() const noexcept {
             m_parent->template rxRelease<Q_SLOW>();
         }
 
@@ -481,7 +490,7 @@ private:
     void configureNcfgr() noexcept {
         std::uint32_t cfg = 0;
         cfg |= GEM_BF(CLK, GEM_CLK_DIV128);
-        cfg |= GEM_BF(RBOF, 2);
+        cfg |= MACB_BF(RBOF, 2);                      // RBOF is a MACB-common field
         cfg |= MACB_BIT(DRFCS);
         cfg |= MACB_BIT(BIG);
         cfg |= MACB_BIT(FD);
@@ -524,28 +533,31 @@ private:
             }
         }
 
+        // Cold-path init — runtime queue iteration. The hot-path descriptor
+        // accessors (rxDesc<Q>/txDesc<Q>) are compile-time-only; here we walk
+        // the rings directly through the hugepage buffers.
         for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
             if constexpr (HAS_TX) {
+                auto* tx = static_cast<GEMDescriptor64*>(m_txRings[q].getHugepageBuffer());
                 for (std::size_t i = 0; i < NumTxDesc; ++i) {
-                    auto& d = txDesc(q, i);
-                    d.base.addr  = 0;
-                    d.high.addrh = 0;
-                    d.high.resvd = 0;
+                    tx[i].base.addr  = 0;
+                    tx[i].high.addrh = 0;
+                    tx[i].high.resvd = 0;
                     std::uint32_t ctrl = MACB_BIT(TX_USED);
                     if (i == NumTxDesc - 1) ctrl |= MACB_BIT(TX_WRAP);
-                    d.base.ctrl = ctrl;
+                    tx[i].base.ctrl = ctrl;
                 }
             }
             if constexpr (HAS_RX) {
+                auto* rx = static_cast<GEMDescriptor64*>(m_rxRings[q].getHugepageBuffer());
                 for (std::size_t i = 0; i < NumRxDesc; ++i) {
-                    auto& d = rxDesc(q, i);
                     const std::uint64_t buf = m_rxBuffers[q].physicalAddrAt(i * BuffSize);
                     std::uint32_t addrLo = static_cast<std::uint32_t>(buf & ~0x3ULL);
                     if (i == NumRxDesc - 1) addrLo |= MACB_BIT(RX_WRAP);
-                    d.base.addr  = addrLo;
-                    d.base.ctrl  = 0;
-                    d.high.addrh = static_cast<std::uint32_t>(buf >> 32);
-                    d.high.resvd = 0;
+                    rx[i].base.addr  = addrLo;
+                    rx[i].base.ctrl  = 0;
+                    rx[i].high.addrh = static_cast<std::uint32_t>(buf >> 32);
+                    rx[i].high.resvd = 0;
                 }
             }
         }
@@ -574,12 +586,15 @@ private:
     // Screener — steer our EtherType to Q_HOT, everything else to Q_SLOW
     // =====================================================================
     void configureScreeners() noexcept {
-        writeReg(GEM_ETHT(0), GEM_LOCAL_EXPERIMENTAL_ETHERTYPE);
-        const std::uint32_t rule =
-              GEM_BF(QUEUE,    Q_HOT)
-            | GEM_BF(ETHT2IDX, 0)
-            | GEM_BIT(ETHTEN);
-        writeReg(GEM_SCRT2(0), rule);
+        // GEM_ETHT and GEM_SCRT2 are base addresses; each entry is 4 bytes.
+        constexpr std::uint32_t ETHT_IDX  = 0;
+        constexpr std::uint32_t SCR2_SLOT = 0;
+
+        writeReg(GEM_ETHT  + (ETHT_IDX  << 2), GEM_LOCAL_EXPERIMENTAL_ETHERTYPE);
+        writeReg(GEM_SCRT2 + (SCR2_SLOT << 2),
+                   GEM_BF(QUEUE,    Q_HOT)
+                 | GEM_BF(ETHT2IDX, ETHT_IDX)
+                 | GEM_BIT(ETHTEN));
     }
 
     // =====================================================================

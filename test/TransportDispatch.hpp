@@ -13,10 +13,18 @@
 #include "AFXDPRx.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
+#include "Cadence_GEM.hpp"
+#include "TapBridge.hpp"
 
-#include <cstdio>
+#include <fmt/core.h>
+
+#include <pthread.h>
+#include <sched.h>
+
 #include <stop_token>
 #include <string>
+#include <string_view>
+#include <thread>
 
 // =============================================================================
 // Transport dispatch — creates the transport and runs the selected mode
@@ -40,19 +48,32 @@ template<TxRing Tx, RxRing Rx>
 void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
                   std::uint32_t count, std::stop_token stop) {
     switch (mode) {
-        case RunMode::Server:
-            run_server(tx, rx, cfg, stop);
-            break;
-        case RunMode::Client:
-            run_client(tx, rx, cfg, count, stop);
-            break;
-        case RunMode::TxGen:
-            run_txgen(tx, cfg, count, stop);
-            break;
-        case RunMode::RxSink:
-            run_rxsink(rx, cfg, stop);
-            break;
+        case RunMode::Server: run_server(tx, rx, cfg, stop);           break;
+        case RunMode::Client: run_client(tx, rx, cfg, count, stop);    break;
+        case RunMode::TxGen:  run_txgen(tx, cfg, count, stop);         break;
+        case RunMode::RxSink: run_rxsink(rx, cfg, stop);               break;
     }
+}
+
+// ── Spawn a low-priority thread that runs a TapBridge ──────────────────────
+//
+// The bridge itself MUST outlive the returned jthread, so the caller owns it.
+// This helper just handles the thread attributes (demote from SCHED_FIFO,
+// clear inherited CPU affinity) and spawns the jthread.
+template<TxRing Tx, RxRing Rx>
+[[nodiscard]]
+std::jthread spawnTapDeviceThread(TapBridge<Tx, Rx>& tap) {
+    return std::jthread([&tap](std::stop_token st) {
+        sched_param sp{};
+        pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
+        pthread_setaffinity_np(pthread_self(), sizeof(all), &all);
+
+        tap(st);
+    });
 }
 
 // ── Transport creation + dispatch ───────────────────────────────────────────
@@ -62,8 +83,9 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
                         RunMode mode, std::uint32_t count, std::stop_token stop) {
 
     const char* roleName = runModeName(mode);
+    const std::string& transport = role.transport;
 
-    if (cfg.transport == "packet_mmap") {
+    if (transport == "packet_mmap") {
         RingConfig tx_cfg{};
         tx_cfg.interface     = role.interface.c_str();
         tx_cfg.direction     = RingDirection::TX;
@@ -84,10 +106,12 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         PacketMmapTx tx(tx_cfg);
         PacketMmapRx rx(rx_cfg);
 
-        std::printf("[%s] Transport: packet_mmap on %s\n", roleName, role.interface.c_str());
+        fmt::println("[{}] Transport: packet_mmap on {}", roleName, role.interface);
         dispatchMode(tx, rx, mode, cfg, count, stop);
+        return 0;
     }
-    else if (cfg.transport == "af_xdp") {
+
+    if (transport == "af_xdp") {
         XdpConfig xdp_cfg{};
         xdp_cfg.interface  = role.interface.c_str();
         xdp_cfg.queueId    = role.xdpQueueId;
@@ -100,30 +124,64 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         AFXDPTx tx(sock);
         AFXDPRx rx(sock);
 
-        std::printf("[%s] Transport: af_xdp on %s (queue %u)\n",
-                    roleName, role.interface.c_str(), role.xdpQueueId);
+        fmt::println("[{}] Transport: af_xdp on {} (queue {})",
+                     roleName, role.interface, role.xdpQueueId);
         dispatchMode(tx, rx, mode, cfg, count, stop);
+        return 0;
     }
-    else if (cfg.transport == "intel_i210") {
+
+    if (transport == "intel_i210") {
         if (!ensureHugepages(16)) {
-            std::fprintf(stderr, "Error: hugepage allocation failed\n");
+            fmt::println(stderr, "Error: hugepage allocation failed");
             return 1;
         }
 
-        Intel_I210<DriverMode::RxTx> nic(role.interface, 0, "igb");
+        const std::string_view drv = role.driver.empty() ? std::string_view{"igb"} : std::string_view{role.driver};
+
+        Intel_I210<DriverMode::RxTx> nic(role.interface, 0, drv);
         if (!nic.init()) {
-            std::fprintf(stderr, "Error: I210 init failed\n");
+            fmt::println(stderr, "Error: Intel I210 init failed");
+            return 1;
+        }
+        fmt::println("[{}] Transport: intel_i210 (PMD) on {} (driver={})",
+                     roleName, role.interface, drv);
+        dispatchMode(nic, nic, mode, cfg, count, stop);
+        return 0;
+    }
+
+    if (transport == "cadence_gem") {
+        if (!ensureHugepages(16)) {
+            fmt::println(stderr, "Error: hugepage allocation failed");
             return 1;
         }
 
-        std::printf("[%s] Transport: intel_i210 (PMD) on %s\n",
-                    roleName, role.interface.c_str());
+        const std::string_view drv = role.driver.empty() ? std::string_view{"macb"} : std::string_view{role.driver};
+
+        Cadence_GEM<GEMDriverMode::RxTx> nic(role.interface, drv);
+        if (!nic.init()) {
+            fmt::println(stderr, "Error: Cadence GEM init failed");
+            return 1;
+        }
+
+        // Kernel traffic (NFS, SSH, ARP) must keep flowing while the PMD owns
+        // the hardware — bridge Q_SLOW (Q0) to a TAP device. Q_HOT (Q1)
+        // carries our latency-critical traffic and never touches the kernel.
+        auto& slow = nic.slowPath();
+        const std::string tapName = "tap_" + role.interface;
+        TapBridge tap(slow, slow, tapName);
+        std::jthread tapThread = spawnTapDeviceThread(tap);
+
+        fmt::println("[{}] Transport: cadence_gem (PMD) on {} (driver={}, tap={})",
+                     roleName, role.interface, drv, tapName);
         dispatchMode(nic, nic, mode, cfg, count, stop);
-    }
-    else {
-        std::fprintf(stderr, "Error: unknown transport '%s'\n", cfg.transport.c_str());
-        return 1;
+
+        // Scope destruction order is what we need:
+        //   ~tapThread  → request_stop() + join()   (bridge loop exits)
+        //   ~tap        → closes /dev/net/tun fd
+        //   ~nic        → disables RX/TX, rebinds macb, end0 reappears
+        return 0;
     }
 
-    return 0;
+    fmt::println(stderr, "Error: unknown transport '{}'", transport);
+    return 1;
 }

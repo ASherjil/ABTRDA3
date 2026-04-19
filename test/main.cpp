@@ -1,4 +1,4 @@
-// ABTRDA3 - Ultra-Low Latency Network Test
+// ABTRDA3 — Ultra-Low Latency Network Test
 //
 // Modes:
 //   --server   Reflect incoming packets (ping-pong server)
@@ -6,93 +6,109 @@
 //   --txgen    TX-only traffic generator
 //   --rxsink   RX-only packet counter
 //
+// Each role selects its own transport in the TOML config so an x86 box
+// (intel_i210) can pair with an ARM64 SoC (cadence_gem).
+//
 // Usage:
-//   sudo ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
-//   sudo ./abtrda3_test --client --count 1000 --config ../../../test/abtrda3_test.toml
-//   sudo ./abtrda3_test --txgen  --count 1000 --config ../../../test/abtrda3_test.toml
-//   sudo ./abtrda3_test --rxsink --config ../../../test/abtrda3_test.toml
+//   sudo ./abtrda3_test --server [--config <file>]
+//   sudo ./abtrda3_test --client [--count N] [--config <file>]
+//   sudo ./abtrda3_test --txgen  [--count N] [--config <file>]
+//   sudo ./abtrda3_test --rxsink [--config <file>]
 
 #include "NicTuner.hpp"
 #include "TestConfig.hpp"
 #include "RuntimeSetup.hpp"
 #include "TransportDispatch.hpp"
 
-#include <cstdio>
+#include <fmt/core.h>
+
+#include <cstdint>
 #include <cstring>
 #include <optional>
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::printf("Usage:\n"
-                    "  %s --server  [--config <file>]\n"
-                    "  %s --client  [--count <N>] [--config <file>]\n"
-                    "  %s --txgen   [--count <N>] [--config <file>]\n"
-                    "  %s --rxsink  [--config <file>]\n",
-                    argv[0], argv[0], argv[0], argv[0]);
-        return 1;
-    }
+namespace {
 
-    // ── Parse CLI ────────────────────────────────────────────────────────
-    const char* config_path = "abtrda3_test.toml";
-    const char* mode = nullptr;
-    std::int64_t count_override = -1;
+struct CliArgs {
+    const char*   configPath = "abtrda3_test.toml";
+    RunMode       runMode{};
+    bool          useServerRole{};
+    std::int64_t  countOverride = -1;
+    bool          valid         = false;
+};
+
+[[nodiscard]] CliArgs parseCli(int argc, char* argv[]) {
+    CliArgs a{};
+    bool haveMode = false;
 
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc)
-            config_path = argv[++i];
-        else if (std::strcmp(argv[i], "--server") == 0)
-            mode = "server";
-        else if (std::strcmp(argv[i], "--client") == 0)
-            mode = "client";
-        else if (std::strcmp(argv[i], "--txgen") == 0)
-            mode = "txgen";
-        else if (std::strcmp(argv[i], "--rxsink") == 0)
-            mode = "rxsink";
-        else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc)
-            count_override = std::atol(argv[++i]);
+        const std::string_view arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            a.configPath = argv[++i];
+        }
+        else if (arg == "--server")  { a.runMode = RunMode::Server; a.useServerRole = true;  haveMode = true; }
+        else if (arg == "--client")  { a.runMode = RunMode::Client; a.useServerRole = false; haveMode = true; }
+        else if (arg == "--txgen")   { a.runMode = RunMode::TxGen;  a.useServerRole = false; haveMode = true; }
+        else if (arg == "--rxsink")  { a.runMode = RunMode::RxSink; a.useServerRole = true;  haveMode = true; }
+        else if (arg == "--count" && i + 1 < argc) {
+            a.countOverride = std::atoll(argv[++i]);
+        }
     }
 
-    if (!mode) {
-        std::fprintf(stderr, "Error: specify --server, --client, --txgen, or --rxsink\n");
+    a.valid = haveMode;
+    return a;
+}
+
+void printUsage(const char* argv0) {
+    fmt::println("Usage:\n"
+                 "  {0} --server  [--config <file>]\n"
+                 "  {0} --client  [--count <N>] [--config <file>]\n"
+                 "  {0} --txgen   [--count <N>] [--config <file>]\n"
+                 "  {0} --rxsink  [--config <file>]",
+                 argv0);
+}
+
+} // anonymous namespace
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printUsage(argv[0]);
         return 1;
     }
 
-    // ── Load config ──────────────────────────────────────────────────────
+    const CliArgs args = parseCli(argc, argv);
+    if (!args.valid) {
+        fmt::println(stderr, "Error: specify --server, --client, --txgen, or --rxsink");
+        return 1;
+    }
+
     TestConfig cfg;
     try {
-        cfg = loadConfig(config_path);
+        cfg = loadConfig(args.configPath);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "Config error: %s\n", e.what());
+        fmt::println(stderr, "Config error: {}", e.what());
         return 1;
     }
 
+    const RoleConfig& role = args.useServerRole ? cfg.server : cfg.client;
+
     std::uint32_t count = cfg.clientCount;
-    if (count_override >= 0)
-        count = static_cast<std::uint32_t>(count_override);
+    if (args.countOverride >= 0)
+        count = static_cast<std::uint32_t>(args.countOverride);
 
-    std::printf("[Config] Loaded from %s\n", config_path);
+    fmt::println("[Config] Loaded from {} — role={} transport={} iface={}",
+                 args.configPath, runModeName(args.runMode),
+                 role.transport, role.interface);
 
-    // Map CLI mode string to RunMode enum and select the correct role config
-    RunMode runMode{};
-    bool useServerRole{};
-
-    if (std::strcmp(mode, "server") == 0)      { runMode = RunMode::Server; useServerRole = true;  }
-    else if (std::strcmp(mode, "client") == 0)  { runMode = RunMode::Client; useServerRole = false; }
-    else if (std::strcmp(mode, "txgen") == 0)   { runMode = RunMode::TxGen;  useServerRole = false; }
-    else if (std::strcmp(mode, "rxsink") == 0)  { runMode = RunMode::RxSink; useServerRole = true;  }
-
-    const RoleConfig& role = useServerRole ? cfg.server : cfg.client;
-
-    // ── System tuning ────────────────────────────────────────────────────
+    // System tuning (optional per config)
     std::optional<NicTuner> tuner;
-    if (cfg.nicTunerMode != NicTunerMode::Off)
+    if (cfg.nicTunerMode != NicTunerMode::Off) {
         tuner.emplace(role.interface.c_str(), role.cpuCore, cfg.nicTunerMode);
-    else
-        std::fprintf(stderr, "[NicTuner] Off\n");
+    } else {
+        fmt::println(stderr, "[NicTuner] Off");
+    }
 
-    // ── RT setup (watchdog, CPU pin, SCHED_FIFO) ─────────────────────────
-    RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(runMode));
+    // RT setup (watchdog, CPU pin, SCHED_FIFO, mlockall, signal handler)
+    RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(args.runMode));
 
-    // ── Run ──────────────────────────────────────────────────────────────
-    return runTransport(cfg, role, runMode, count, rt.stopToken());
+    return runTransport(cfg, role, args.runMode, count, rt.stopToken());
 }

@@ -2,14 +2,15 @@
 
 #include "RingConcepts.hpp"
 #include "TestConfig.hpp"
+#include "fmt/ostream.h"
 
+#include <algorithm>
+#include <arpa/inet.h>
 #include <cstdio>
 #include <cstring>
-#include <vector>
-#include <algorithm>
-#include <stop_token>
 #include <ctime>
-#include <arpa/inet.h>
+#include <stop_token>
+#include <vector>
 
 [[gnu::always_inline]]
 inline std::uint64_t now_ns() noexcept {
@@ -96,7 +97,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         }
 
         if (!received) {
-            std::fprintf(stderr, "Packet %u timed out (2ms) — stopping client\n", i);
+            fmt::println(stderr,"Packet {} timed out ({}ms) - stopping client.", i, (kTimeoutNs - intervalNs)/1'000'000);
             break;
         }
     }

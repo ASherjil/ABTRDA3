@@ -1,52 +1,53 @@
 # ABTRDA3 Ping-Pong Test Configuration
+#
+# Server and client each pick their own transport so a fast x86 box
+# (intel_i210) can drive an ARM64 SoC (cadence_gem) and vice-versa.
+#
+# Valid transports: "packet_mmap" | "af_xdp" | "intel_i210" | "cadence_gem"
 
 [general]
-transport        = "packet_mmap"  # "packet_mmap" or "af_xdp" or "intel_i210"
-watchdog_sec     = 50000           # safety timeout (seconds)
-ether_type       = 0x88B5         # IEEE local experimental
-frame_size       = 64             # Minimum ethernet frame
-nic_tuner        = "nfs_safe"      # "off", "nfs_safe" (NFS boot), or "full" (dedicated LAN)
-send_interval_us = 0           # µs between sends (0 = back-to-back, 1000 = 1ms like WR timing)
+watchdog_sec     = 50000
+ether_type       = 0x88B5
+frame_size       = 64
+nic_tuner        = "nfs_safe"        # "off" | "nfs_safe" (NFS boot) | "full" (dedicated LAN)
+send_interval_us = 0                 # 0 = back-to-back, 1000 = 1ms (WR-like)
 output           = "/nfs/cs-ccr-nfshome/user/asherjil/ABTTiming/ABTRDA3/results/mkdev50_360M.txt"
 
 [server]
+transport    = "intel_i210"          # runs on cfc-865-mkdev16 (x86_64)
 interface    = "eno3"
+driver       = "igb"                 # kernel driver to unbind for the PMD
 mac          = "20:87:56:b6:33:68"
 cpu_core     = 4
-irq_core     = 4               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
 xdp_queue_id = 0
 
 [client]
+transport    = "cadence_gem"         # runs on cfd-865-mkdev50 (aarch64 Zynq UltraScale+)
 interface    = "end0"
+driver       = "macb"
 mac          = "fc:0f:e7:1b:8b:55"
 cpu_core     = 1
-irq_core     = 1               # nfs_safe: dedicated core for NIC IRQs (-1 = auto)
 xdp_queue_id = 0
-count        = 360000000          # number of packets to send (overridable with --count)
+count        = 360000000             # overridable with --count
 
 [packet_mmap]
-block_size   = 4096               # must be >= PAGE_SIZE (4096 on x86_64)
-block_number = 512                # ring depth (number of frames)
+block_size   = 4096
+block_number = 512
 
 [af_xdp]
-umem_frame_size = 2048            # UMEM frame size, must be 2048/4096
-frame_count     = 512             # total UMEM frames (split half TX/RX)
-need_wakeup     = false           # mode auto-detected: native+zerocopy -> native+copy -> generic+copy
+umem_frame_size = 2048
+frame_count     = 512
+need_wakeup     = false
 
 
-# ip link show enoX
-# mkdev16 -> mac address
-# eno1 = 20:87:56:b6:6a:27, eno2 = 20:87:56:b6:33:67, eno3 = 20:87:56:b6:33:68
-
-# mkdev30 -> mac address
-# eno1 = d4:f5:27:2a:69:f1, eno2 = d4:f5:27:2a:a9:59, eno3 = d4:f5:27:2a:a9:58
-
-# mkdev50 -> mac address
-# end0 = fc:0f:e7:1b:8b:55
-
-# Server:  sudo ./abtrda3_test --server --config ../../../test/abtrda3_test.toml
-# Client:  sudo ./abtrda3_test --client --config ../../../test/abtrda3_test.toml
-# Traffic generator: sudo ./abtrda3_test --txgen --config ../../../test/abtrda3_test.toml
-# Receiver: sudo ./abtrda3_test --rxsink --config ../../../test/abtrda3_test.toml
-
+# ── MAC reference ─────────────────────────────────────────────────────────
+# mkdev16: eno1=20:87:56:b6:6a:27  eno2=20:87:56:b6:33:67  eno3=20:87:56:b6:33:68
+# mkdev30: eno1=d4:f5:27:2a:69:f1  eno2=d4:f5:27:2a:a9:59  eno3=d4:f5:27:2a:a9:58
+# mkdev50: end0=fc:0f:e7:1b:8b:55
+#
+# ── Running ────────────────────────────────────────────────────────────────
+# sudo ./abtrda3_test --server [--config ...]
+# sudo ./abtrda3_test --client [--count N] [--config ...]
+# sudo ./abtrda3_test --txgen  [--count N] [--config ...]
+# sudo ./abtrda3_test --rxsink [--config ...]
 # ./profile_hotpath.sh --no-perf

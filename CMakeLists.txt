@@ -89,6 +89,16 @@ FetchContent_Declare(abtedge
 )
 FetchContent_MakeAvailable(abtedge)
 
+# {fmt} — modern formatting library (fmt::print, fmt::format) until C++23 std::print lands
+FetchContent_Declare(fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG        12.1.0
+)
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(FMT_TEST    OFF CACHE BOOL "" FORCE)
+set(FMT_DOC     OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(fmt)
+
 # =============================================================================
 # Library
 # =============================================================================

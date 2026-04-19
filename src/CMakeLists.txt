@@ -32,6 +32,7 @@ target_compile_features(abtrda3 PUBLIC cxx_std_20)
 target_link_libraries(abtrda3
     PRIVATE abtrda3_flags
     PUBLIC  abtedge_backend
+    PUBLIC  fmt::fmt
 )
 
 # =============================================================================
