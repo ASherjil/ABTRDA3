@@ -18,8 +18,8 @@ for arg in "$@"; do
     fi
 done
 
-SERVER=${HOSTS[0]:-cfc-865-mkdev16}
-CLIENT=${HOSTS[1]:-cfd-865-mkdev50}
+SERVER=${HOSTS[0]:-cfd-865-mkdev50}
+CLIENT=${HOSTS[1]:-cfc-865-mkdev16}
 BUILD_BASE=/user/asherjil/ABTTiming/ABTRDA3/build
 CONFIG=../../../test/abtrda3_test.toml
 

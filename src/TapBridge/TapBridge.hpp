@@ -14,8 +14,15 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
+#include <net/if.h>           // POSIX — IFNAMSIZ, struct ifreq, IFF_UP/RUNNING.
+                              // Use this instead of <linux/if.h> so the kernel
+                              // UAPI header doesn't clash with glibc's: when
+                              // both reach the same TU via different paths,
+                              // they define overlapping anonymous unions with
+                              // incompatible layouts (ODR-violation warning at
+                              // link time on the CERN FECOS sysroot).
+#include <linux/if_tun.h>     // TUN/TAP macros (TUNSETIFF, IFF_TAP, IFF_NO_PI)
+                              // — standalone, does not pull in <linux/if.h>.
 #include <stdexcept>
 #include <stop_token>
 #include <string>

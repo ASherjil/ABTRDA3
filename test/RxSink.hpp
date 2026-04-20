@@ -34,8 +34,8 @@ inline void run_rxsink(Rx& rx, const TestConfig& cfg, std::stop_token stop) {
                 continue;
             }
 
-            if (rxf.data.size() >= cfg.frameSize &&
-                std::memcmp(rxf.data.data(), ourMac.data(), 6) == 0) {
+            // Perform a simple check, is this packet meant for us ? Check its dst mac address
+            if (std::memcmp(rxf.data.data(), ourMac.data(), 6) == 0) {
                 accepted++;
             } else {
                 rejected++;

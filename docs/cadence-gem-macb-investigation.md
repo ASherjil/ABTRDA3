@@ -14,7 +14,8 @@ Investigation date: 2026-04-16
 | Interface | `end0` (renamed from eth0) |
 | MAC | fc:0f:e7:1b:8b:55 |
 | Speed | 1 Gbps, Full duplex |
-| PHY | Microchip LAN8841, RGMII-ID mode (internal delay TX+RX) |
+| PHY | Microchip LAN8841, RGMII-ID mode (internal delay TX+RX), MDIO addr **31** (0x1f) |
+| PHY ID | 0x00221652 |
 | Driver | macb (built-in, CONFIG_MACB=y) |
 | GEM revision | 0x50070106 |
 
@@ -465,6 +466,178 @@ preserved. The other 85% of lines is kernel plumbing we replace with our C++ inf
 (AXIBackend, HugepageBuffer, TapBridge, direct polling).
 
 Expected final PMD size: 1500-2000 lines (1000-1200 ported from macb + 500-800 new C++).
+
+## PHY MDIO Address — 31 (0x1f), NOT 0
+
+Investigation date: 2026-04-20
+
+The device tree declares the PHY at MDIO address 31:
+
+```
+/sys/firmware/devicetree/base/axi/ethernet@ff0b0000/mdio/phy@1f/reg = 0x0000001f
+```
+
+Kernel dmesg confirms:
+```
+macb ff0b0000.ethernet end0: PHY [ff0b0000.ethernet-ffffffff:1f] driver [Microchip LAN8841 Gigabit PHY] (irq=POLL)
+```
+
+The only device on the MDIO bus:
+```
+/sys/bus/mdio_bus/devices/ff0b0000.ethernet-ffffffff:1f
+```
+
+Our PMD's MDIO scan (addresses 0→31) finds a valid PHY ID (0x00221652) at address 0
+**and** at address 31. The PHY may respond on address 0 as a broadcast/alias, but the
+canonical address is 31. Writes to address 0 may silently fail (reads work because the
+PHY echoes its registers, but the write target may not latch).
+
+**Impact:** If `initPhy()` picks address 0, BMCR writes (power-down clear, isolate clear)
+and `isLinkUp()` status reads may be hitting the wrong address. The fix is to scan in
+reverse (31→0) or hardcode 31 for this platform.
+
+## CRL_APB Clock Gating After macb Unbind
+
+Investigation date: 2026-04-20
+
+When macb is unbound, `macb_remove()` → `clk_disable_unprepare()` drops the clock refcount
+to zero. The Linux clock framework then gates the GEM reference clocks via CRL_APB:
+
+| Register | Address | Before unbind | After unbind | Bits cleared |
+|----------|---------|---------------|--------------|--------------|
+| GEM0_REF_CTRL | 0xFF5E0050 | 0x06010C00 | 0x00010C00 | 25 (CLKACT0), 26 (CLKACT1) |
+| GEM_TSU_REF | 0xFF5E0100 | 0x01010600 | 0x00010600 | 24 (CLKACT) |
+
+**Symptoms:** MAC APB registers still read/write (APB bus always on), MDIO works (separate
+clock), TXGO latches at 1 but TXCNT stays at 0 forever. No error flags. No traffic on wire.
+
+**Fix:** After unbind, mmap CRL_APB at 0xFF5E0000 and OR-set the CLKACT bits back on.
+Implemented in `Cadence_GEM::restoreGemClocks()`.
+
+This also fixes the rebind hang — `macb_probe()` → phylink init was stalling because the
+PHY/MAC had no reference clock.
+
+## Network and NFS Recovery After Rebind
+
+Investigation date: 2026-04-20
+
+### Boot-time service order (from SSH investigation of healthy mkdev50)
+
+1. **macb_probe** creates `eth0`, renamed to `end0` by udev (~7.7s into boot)
+2. **systemd-networkd** starts (PID 736), applies `/etc/systemd/network/fec.network`:
+   - `Match: Name=en*`, `Type=ether`
+   - `DHCP=ipv4`, `ConfigureWithoutCarrier=yes`
+3. **PHY link-up** at ~14s (Microchip LAN8841, 1Gbps/Full)
+4. **DHCP** assigns 10.11.33.71 (via 137.138.17.9)
+5. **fec-setup-filesystem.service** runs `/usr/sbin/fec-filesystem-mangling`:
+   - Mounts `/usr/local` via NFSv3: `mount -overs=3,noatime,nodev,ro cs-ccr-felab:/data/dsc/lab/debian/12/aarch64 /usr/local`
+   - Creates overlay at `/usr/local/lib/modules/$(uname -r)` with upperdir in `/run/fec/overlayfs/`
+   - Appends autofs entries to `/etc/fstab` (these are NOT static — generated at boot)
+   - Runs `systemctl daemon-reload && systemctl restart remote-fs.target`
+6. **Autofs NFS mounts** come up: `/nfs/cs-ccr-nfshome`, `/nfs/cs-ccr-felab`, etc.
+
+### What breaks after unbind/rebind
+
+| What | Why it breaks | How to fix |
+|------|---------------|------------|
+| `end0` disappears | macb_remove destroys netdev | macb_probe recreates it on rebind |
+| DHCP/IPv4 gone | No interface, no address | **Manual IP assignment** (see below) — networkd is dead |
+| `/usr/local` hangs | Hard NFS mount retries forever (timeo=600 = 60s) | Auto-recovers within 1–60s once IP path is restored |
+| `/usr/local` "device busy" on unmount | Overlay at `/usr/local/lib/modules/$(uname -r)` holds it | Stop overlay first: `systemctl stop usr-local-lib-modules-*.mount` |
+| Autofs mounts dead | NFS client state stale | `systemctl restart remote-fs.target` after IP is back |
+| `systemctl` commands hang | If run under SCHED_FIFO (from PMD via fork), starves systemd/D-Bus | Drop to SCHED_OTHER before forking |
+| `systemd-networkd` | Threads stuck on NFS after losing the interface — reload/reconfigure/restart all fail | **Do NOT rely on networkd.** Stop it before unbind, use manual `ip` commands after rebind |
+| `ip link show` hangs | Netlink needs RTNL mutex, held by kernel during deferred NFS teardown | Use sysfs (`[ -d /sys/class/net/end0 ]`) between unbind and rebind |
+| collectd | Tries to stat NFS paths | Stop BEFORE unbind while NFS is still healthy |
+| Dynamic linker hang | `ld.so.cache` entries under `/usr/local/lib` cause library loads to block | Set `LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/lib:/usr/lib/aarch64-linux-gnu:/usr/lib` |
+
+### Recovery approaches tried and failed
+
+1. **`networkctl reconfigure end0`** — returns OK but `Network File: n/a` (networkd doesn't
+   re-match fec.network to the new ifindex after rebind)
+2. **`networkctl reload` + `reconfigure`** — both fail silently when networkd is hung
+3. **`systemctl restart systemd-networkd`** — hangs (daemon has threads stuck on dead NFS)
+4. **`ip link show`** — blocks on RTNL mutex during NFS teardown (caused full device hang
+   on first attempt before switching to sysfs checks)
+
+### Working recovery sequence (verified 2026-04-20)
+
+**Key insight: bypass networkd, use manual IP assignment.** Total recovery time: ~20 seconds.
+
+**Before unbind** (while everything works):
+```bash
+# 1. Capture network config
+SAVED_ADDR=$(ip -4 -o addr show end0 | grep -oP 'inet \K[\d./]+')  # e.g. 10.11.33.71/24
+SAVED_GW=$(ip -4 route show default dev end0 | grep -oP 'via \K[\d.]+')  # e.g. 10.11.33.1
+
+# 2. Stop services that will hang on dead NFS
+systemctl stop collectd
+systemctl stop systemd-networkd   # CRITICAL: stop while it can still cleanly shutdown
+
+# 3. Pre-warm binaries (loads shared libs into page cache)
+ip link show end0 > /dev/null 2>&1 || true
+# ... etc for all binaries needed after unbind
+```
+
+**After rebind:**
+```bash
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/lib:/usr/lib/aarch64-linux-gnu:/usr/lib
+
+# 4. Wait for interface via sysfs (NOT netlink)
+# [ -d /sys/class/net/end0 ]   — pure VFS stat, no RTNL mutex
+
+# 5. Manual network config (bypass networkd entirely)
+ip link set end0 up
+ip addr add $SAVED_ADDR dev end0
+ip route add default via $SAVED_GW dev end0
+
+# 6. Wait for PHY link-up (~5s for LAN8841 autoneg)
+# cat /sys/class/net/end0/carrier  — poll until "1"
+
+# 7. Verify: ping $SAVED_GW
+
+# 8. NFS auto-recovers (hard mount retries on its own)
+# /usr/local recovered after just 1s in testing
+
+# 9. Restart autofs NFS mounts
+systemctl restart remote-fs.target
+
+# 10. Restart networkd last (for long-term DHCP renewal)
+systemctl restart systemd-networkd   # may timeout — non-critical, IP works
+```
+
+### Timing from successful test run
+
+| Step | Time | Duration |
+|------|------|----------|
+| Unbind | 20:57:46.928 | instant |
+| Rebind | 20:57:51.095 | instant (3s pause between) |
+| end0 appears | 20:57:52 | 1s after rebind |
+| IP assigned | 20:57:51.238 | instant (manual) |
+| PHY link-up | 20:57:56 | 5s (autoneg) |
+| Gateway ping | 20:57:56.578 | instant |
+| /usr/local NFS | 20:57:56.578 | 1s (auto-recover) |
+| remote-fs.target | 20:57:57 | ~1s |
+| All NFS OK | 20:58:07 | ~20s total |
+
+### Key insight: NFS hard mount auto-recovers fast
+
+The `/usr/local` mount is `hard,proto=tcp,timeo=600,retrans=2`. In practice, once the IP
+path is restored, NFS reconnects within 1–2 seconds (not 60s). The 60s `timeo` is the
+*maximum* retry interval — the kernel NFS client retries much sooner when the TCP SYN
+succeeds immediately. Previous failures were caused by never reaching this point because
+networkd was hung and no IP was assigned.
+
+### For the C++ PMD destructor
+
+The `restoreNetworkAndNfs()` method should follow the same pattern:
+1. Save IP/gateway in `init()` (before unbind) using `getifaddrs()` (no fork needed)
+2. Stop networkd before unbind (while it's healthy): `system("systemctl stop systemd-networkd")`
+3. After rebind: use raw syscalls via netlink `AF_NETLINK/NETLINK_ROUTE` to set IP and route
+   (avoids forking `ip` which may hang on RTNL), or fork `ip` with `timeout`
+4. Poll carrier via `/sys/class/net/end0/carrier` (no fork)
+5. NFS auto-recovers; `system("systemctl restart remote-fs.target")` for autofs mounts
 
 ## Reference Documentation
 

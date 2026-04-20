@@ -8,17 +8,26 @@
 #include "DMARing.hpp"
 #include "HugepageBuffer.hpp"
 
+#include <fmt/core.h>
+
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <span>
 #include <string>
 #include <string_view>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -83,7 +92,9 @@ public:
           m_txTail{other.m_txTail},
           m_txInFlight{other.m_txInFlight},
           m_mac{other.m_mac},
-          m_unboundDriver{std::exchange(other.m_unboundDriver, false)} {}
+          m_unboundDriver{std::exchange(other.m_unboundDriver, false)},
+          m_savedAddr{std::move(other.m_savedAddr)},
+          m_savedGateway{std::move(other.m_savedGateway)} {}
 
     Cadence_GEM& operator=(Cadence_GEM&& other) noexcept {
         if (this != &other) {
@@ -102,6 +113,8 @@ public:
             m_txInFlight    = other.m_txInFlight;
             m_mac           = other.m_mac;
             m_unboundDriver = std::exchange(other.m_unboundDriver, false);
+            m_savedAddr     = std::move(other.m_savedAddr);
+            m_savedGateway  = std::move(other.m_savedGateway);
         }
         return *this;
     }
@@ -109,54 +122,145 @@ public:
     ~Cadence_GEM() {
         shutdown();
         if (m_unboundDriver) {
-            rebindKernelDriver();
+            // Rebind + full network/NFS recovery. The earlier phylink hang was
+            // caused by macb_remove gating the GEM reference clocks — fixed by
+            // restoreGemClocks() in init(). Rebind now completes in <1s.
+            if (std::getenv("ABTRDA3_REBIND")) {
+                rebindKernelDriver();
+                // rebindKernelDriver() sets m_unboundDriver = false on success.
+                // Only run the network/NFS recovery if rebind actually worked —
+                // otherwise end0 isn't back and there's nothing to reconfigure.
+                if (!m_unboundDriver) {
+                    restoreNetworkAndNfs();
+                } else {
+                    fmt::println(stderr,
+                        "[GEM] destructor: rebind failed — skipping network/NFS restore");
+                }
+            } else {
+                fmt::println(stderr,
+                    "[GEM] destructor: skipping rebind (ABTRDA3_REBIND not set) — "
+                    "device stays unbound, reboot to restore macb");
+            }
         }
     }
 
     [[nodiscard]] bool init() {
+        fmt::println(stderr, "[GEM] init: resolveDeviceName…");
         if (!resolveDeviceName()) return false;
+        fmt::println(stderr, "[GEM] init: parseMmioBase ({}) ", m_deviceName);
         if (!parseMmioBase())     return false;
-        if (!unbindKernelDriver()) return false;
-
+        // Open MMIO BEFORE unbinding macb so we can snapshot macb's register
+        // baseline. /dev/mem mappings aren't exclusive — both macb's ioremap
+        // and our /dev/mem view of the same physical window can coexist for
+        // read-only diagnostics here.
+        fmt::println(stderr, "[GEM] init: mmap /dev/mem @ 0x{:x} (before unbind, for baseline snapshot)…", m_mmioBase);
         if (!m_bus.open("/dev/mem", m_mmioBase, GEM_MMIO_SIZE)) {
-            std::fprintf(stderr, "[GEM] mmap of 0x%lx failed\n", m_mmioBase);
+            fmt::println(stderr, "[GEM] mmap of 0x{:x} failed", m_mmioBase);
             return false;
         }
-        std::fprintf(stderr, "[GEM] %s mapped at 0x%lx (%zu bytes)\n",
-                     m_deviceName.c_str(), m_mmioBase, GEM_MMIO_SIZE);
+        fmt::println(stderr, "[GEM] {} mapped at 0x{:x} ({} bytes)",
+                     m_deviceName, m_mmioBase, GEM_MMIO_SIZE);
 
-        resetHw();
-        disableInterrupts();
-        readMacAddress();
-        setMacAddress();
+        dumpRegisterSnapshot("BEFORE unbind (macb baseline)");
 
-        configureNcfgr();
-        configureDma();
-        configureUsrio();
+        fmt::println(stderr, "[GEM] init: saveNetworkConfig (capture IP/gateway while interface is up)…");
+        saveNetworkConfig();
 
-        if (!initRings()) {
-            return false;
-        }
-        initBuffers();
-        configureScreeners();
+        fmt::println(stderr, "[GEM] init: stopMonitoringDaemons (prevents collectd ethtool oops during unbind window)…");
+        stopMonitoringDaemons();
+        stopNetworkd();
+        fmt::println(stderr, "[GEM] init: unbindKernelDriver (driver={}) — sysfs write is synchronous", m_driverName);
+        if (!unbindKernelDriver()) return false;
+        fmt::println(stderr, "[GEM] init: unbind OK — MMIO still valid");
 
-        if (!initPhy()) {
-            return false;
-        }
-        enableRxTx();
+        // macb_remove() just gated our GEM reference clock off via the Linux
+        // clock framework (CLKACT bits on GEM0_REF_CTRL and GEM_TSU_REF both
+        // cleared). Without this restore, the MAC registers accept writes but
+        // the TX/RX state machines have no clock to run — TXGO latches and
+        // TXCNT stays at 0 forever.
+        fmt::println(stderr, "[GEM] init: restoreGemClocks (macb_remove gated the ref clock off)…");
+        restoreGemClocks();
 
-        std::fprintf(stderr, "[GEM] Initialised. MAC=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n",
+        fmt::println(stderr, "[GEM] init: resetHw…");           resetHw();
+        fmt::println(stderr, "[GEM] init: disableInterrupts…"); disableInterrupts();
+        fmt::println(stderr, "[GEM] init: readMacAddress…");    readMacAddress();
+        fmt::println(stderr, "[GEM] init: setMacAddress…");     setMacAddress();
+        fmt::println(stderr, "[GEM] init: configureNcfgr…");    configureNcfgr();
+        fmt::println(stderr, "[GEM] init: configureDma…");      configureDma();
+        fmt::println(stderr, "[GEM] init: configureUsrio…");    configureUsrio();
+
+        fmt::println(stderr, "[GEM] init: initRings (alloc hugepage-backed descriptor rings)…");
+        if (!initRings()) return false;
+        fmt::println(stderr, "[GEM] init: initBuffers (program RBQP/TBQP)…");      initBuffers();
+        fmt::println(stderr, "[GEM] init: configureScreeners…");                   configureScreeners();
+
+        fmt::println(stderr, "[GEM] init: initPhy (MDIO read — may wait for link)…");
+        if (!initPhy()) return false;
+        fmt::println(stderr, "[GEM] init: enableRxTx…"); enableRxTx();
+
+        fmt::println(stderr, "[GEM] Initialised. MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                      m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5],
                      isLinkUp() ? "up" : "down");
+
+        dumpRegisterSnapshot("AFTER init (our config)");
+
         return true;
     }
 
     void shutdown() noexcept {
         if (!m_bus.isOpen()) return;
+        dumpHwCounters();
         std::uint32_t ncr = readReg(MACB_NCR);
         ncr &= ~(MACB_BIT(RE) | MACB_BIT(TE));
         writeReg(MACB_NCR, ncr);
         disableInterrupts();
+    }
+
+    // Print live silicon counters and per-queue state, alongside our own
+    // SW view. Run this BEFORE macb rebind — macb_reset_hw() wipes stats.
+    void dumpHwCounters() const noexcept {
+        if (!m_bus.isOpen()) return;
+
+        const std::uint32_t txFrames = readReg(GEM_TXCNT);
+        const std::uint32_t txOctets = readReg(GEM_OCTTXL);
+        const std::uint32_t rxFrames = readReg(GEM_RXCNT);
+        const std::uint32_t rxOctets = readReg(GEM_OCTRXL);
+
+        const std::uint32_t rxBcast   = readReg(GEM_RXBROADCNT);
+        const std::uint32_t rxMcast   = readReg(GEM_RXMULTICNT);
+        const std::uint32_t rxPause   = readReg(GEM_RXPAUSECNT);
+        const std::uint32_t rxJab     = readReg(GEM_RXJABCNT);
+        const std::uint32_t rxFcs     = readReg(GEM_RXFCSCNT);
+        const std::uint32_t rxAlign   = readReg(GEM_RXALIGNCNT);
+        const std::uint32_t rxResErr  = readReg(GEM_RXRESERRCNT);
+        const std::uint32_t rxOver    = readReg(GEM_RXORCNT);
+
+        const std::uint32_t ncr      = readReg(MACB_NCR);
+        const std::uint32_t tsr      = readReg(MACB_TSR);
+        const std::uint32_t rsr      = readReg(MACB_RSR);
+        const std::uint32_t dmacfg   = readReg(GEM_DMACFG);
+
+        const std::uint32_t tbqpQ0   = readReg(qTBQP(0));
+        const std::uint32_t tbqpQ1   = readReg(qTBQP(1));
+        const std::uint32_t rbqpQ0   = readReg(qRBQP(0));
+        const std::uint32_t rbqpQ1   = readReg(qRBQP(1));
+
+        fmt::println(stderr,
+            "[GEM] HW counters (live silicon, before teardown):\n"
+            "  Frames    TX={:<8} RX={:<8}   Octets TX={:<10} RX={}\n"
+            "  RX errs   bcast={} mcast={} pause={} jab={} fcs={} align={} resErr={} over={}\n"
+            "  Control   NCR=0x{:08x}  TSR=0x{:08x}  RSR=0x{:08x}  DMACFG=0x{:08x}\n"
+            "  Q0 regs   TBQP=0x{:08x}  RBQP=0x{:08x}\n"
+            "  Q1 regs   TBQP=0x{:08x}  RBQP=0x{:08x}\n"
+            "  SW  Q0    tx_tail={:<4} tx_inflight={:<4} rx_tail={}\n"
+            "  SW  Q1    tx_tail={:<4} tx_inflight={:<4} rx_tail={}",
+            txFrames, rxFrames, txOctets, rxOctets,
+            rxBcast, rxMcast, rxPause, rxJab, rxFcs, rxAlign, rxResErr, rxOver,
+            ncr, tsr, rsr, dmacfg,
+            tbqpQ0, rbqpQ0,
+            tbqpQ1, rbqpQ1,
+            m_txTail[Q_SLOW], m_txInFlight[Q_SLOW], m_rxTail[Q_SLOW],
+            m_txTail[Q_HOT],  m_txInFlight[Q_HOT],  m_rxTail[Q_HOT]);
     }
 
     // ---------------------------------------------------------------------
@@ -242,10 +346,8 @@ public:
     [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept { return m_mac; }
 
     [[nodiscard]] bool isLinkUp() noexcept {
-        constexpr std::uint8_t  PHY_ADDR       = 0;
-        constexpr std::uint8_t  PHY_REG_STATUS = 0x01;
-        constexpr std::uint16_t LINK_UP_MASK   = 0x0004;
-        return (mdioRead(PHY_ADDR, PHY_REG_STATUS) & LINK_UP_MASK) != 0;
+        if (m_phyAddr < 0) return false;
+        return (mdioRead(static_cast<std::uint8_t>(m_phyAddr), 0x01) & 0x0004) != 0;
     }
 
 private:
@@ -260,9 +362,25 @@ private:
     inline std::uint32_t readReg(std::uint32_t offset) const noexcept {
         return *m_bus.template registerPtr<std::uint32_t>(offset);
     }
-    [[gnu::always_inline]]
-    inline void writeQueueReg(std::uint32_t base, std::size_t q, std::uint32_t v) noexcept {
-        writeReg(base + static_cast<std::uint32_t>(q << 2), v);
+    // GEM/MACB has a historical quirk: hw_q 0 uses the ORIGINAL single-queue
+    // registers (MACB_TBQP/RBQP/ISR/IDR at low offsets), and hw_q >= 1 uses
+    // the per-queue array added later (GEM_TBQP(hw_q - 1) at 0x440+, etc.).
+    // Ref: kernel drivers/net/ethernet/cadence/macb_main.c:4612-4628.
+    [[nodiscard, gnu::always_inline]]
+    static constexpr std::uint32_t qTBQP(std::size_t q) noexcept {
+        return q == 0 ? MACB_TBQP : (GEM_TBQP(0) + static_cast<std::uint32_t>((q - 1) << 2));
+    }
+    [[nodiscard, gnu::always_inline]]
+    static constexpr std::uint32_t qRBQP(std::size_t q) noexcept {
+        return q == 0 ? MACB_RBQP : (GEM_RBQP(0) + static_cast<std::uint32_t>((q - 1) << 2));
+    }
+    [[nodiscard, gnu::always_inline]]
+    static constexpr std::uint32_t qISR(std::size_t q) noexcept {
+        return q == 0 ? MACB_ISR : (GEM_ISR(0) + static_cast<std::uint32_t>((q - 1) << 2));
+    }
+    [[nodiscard, gnu::always_inline]]
+    static constexpr std::uint32_t qIDR(std::size_t q) noexcept {
+        return q == 0 ? MACB_IDR : (GEM_IDR(0) + static_cast<std::uint32_t>((q - 1) << 2));
     }
 
     // ARM64 DMA barriers — macb is in the Outer Shareable domain
@@ -395,6 +513,353 @@ private:
         return ::lstat(link.c_str(), &st) == 0;
     }
 
+    // CERN FECOS ships collectd which periodically polls end0 via SIOCETHTOOL.
+    // While macb is unbound (or mid-probe), phylink state is NULL → collectd's
+    // ioctl hits phylink_ethtool_ksettings_get with a NULL pointer and oopses
+    // the kernel (trace seen: python3 PID in macb_get_link_ksettings). The oops
+    // is soft (kills the ioctl context, kernel survives) but it taints the
+    // kernel and may interfere with macb_probe running concurrently.
+    //
+    // Best-effort: ignore failures (service may be absent, not running, or we
+    // may lack perms). Opt out with ABTRDA3_KEEP_COLLECTD=1 for debugging.
+    // Diagnostic: dump a snapshot of key GEM registers plus the CRL_APB
+    // GEM-clock controls. Called at two points in init() (before unbind —
+    // macb's baseline — and after our own configuration) so a diff of the
+    // log tells us (a) what macb configures that we do not, and (b) whether
+    // macb_remove gated the GEM reference clock off, which would explain
+    // TXGO-latched-but-TXCNT=0. Read-only: safe to call anytime the GEM MMIO
+    // is mapped.
+    void dumpRegisterSnapshot(const char* label) noexcept {
+        if (m_bus.isOpen()) {
+            fmt::println(stderr,
+                "[GEM snapshot {}] GEM regs @0x{:x}:\n"
+                "  NCR     =0x{:08x}  NCFGR   =0x{:08x}  NSR     =0x{:08x}  DMACFG  =0x{:08x}\n"
+                "  TSR     =0x{:08x}  RSR     =0x{:08x}  ISR     =0x{:08x}  IMR     =0x{:08x}\n"
+                "  MAN     =0x{:08x}  USRIO   =0x{:08x}  JML     =0x{:08x}  PBUFRX  =0x{:08x}\n"
+                "  SA1B    =0x{:08x}  SA1T    =0x{:08x}  HRB     =0x{:08x}  HRT     =0x{:08x}\n"
+                "  TBQP(0) =0x{:08x}  RBQP(0) =0x{:08x}  TBQP(1) =0x{:08x}  RBQP(1) =0x{:08x}\n"
+                "  TBQPH   =0x{:08x}  RBQPH   =0x{:08x}  RBQS(1) =0x{:08x}\n"
+                "  ETHT(0) =0x{:08x}  SCRT2(0)=0x{:08x}\n"
+                "  DCFG1   =0x{:08x}  DCFG2   =0x{:08x}  DCFG5   =0x{:08x}  DCFG6   =0x{:08x}",
+                label, m_mmioBase,
+                readReg(MACB_NCR),    readReg(GEM_NCFGR),   readReg(MACB_NSR),    readReg(GEM_DMACFG),
+                readReg(MACB_TSR),    readReg(MACB_RSR),    readReg(MACB_ISR),    readReg(MACB_IMR),
+                readReg(MACB_MAN),    readReg(GEM_USRIO),   readReg(GEM_JML),     readReg(GEM_PBUFRXCUT),
+                readReg(GEM_SA1B),    readReg(GEM_SA1T),    readReg(MACB_HRB),    readReg(MACB_HRT),
+                readReg(qTBQP(0)),    readReg(qRBQP(0)),    readReg(qTBQP(1)),    readReg(qRBQP(1)),
+                readReg(MACB_TBQPH),  readReg(MACB_RBQPH),  readReg(GEM_RBQS(0)),
+                readReg(GEM_ETHT),    readReg(GEM_SCRT2),
+                readReg(GEM_DCFG1),   readReg(GEM_DCFG2),   readReg(GEM_DCFG5),   readReg(GEM_DCFG6));
+        } else {
+            fmt::println(stderr, "[GEM snapshot {}] GEM MMIO not mapped — skipping GEM regs", label);
+        }
+
+        // CRL_APB clock controls — mmap a separate 4 KiB window at 0xff5e0000
+        // just for this read. All four PS GEMs' reference clocks plus the
+        // shared TSU clock live here. Comparing the baseline (macb bound)
+        // against the post-init snapshot tells us whether macb_remove gated
+        // our GEM's reference clock off.
+        constexpr std::uint64_t CRL_APB_BASE = 0xff5e0000;
+        constexpr std::size_t   CRL_APB_SIZE = 0x1000;
+        const int fd = ::open("/dev/mem", O_RDONLY | O_SYNC);
+        if (fd < 0) {
+            fmt::println(stderr, "[GEM snapshot {}] CRL_APB /dev/mem open failed: {}",
+                         label, std::strerror(errno));
+            return;
+        }
+        void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ, MAP_SHARED, fd,
+                         static_cast<off_t>(CRL_APB_BASE));
+        ::close(fd);
+        if (p == MAP_FAILED) {
+            fmt::println(stderr, "[GEM snapshot {}] CRL_APB mmap failed: {}",
+                         label, std::strerror(errno));
+            return;
+        }
+        auto* crl = static_cast<volatile const std::uint32_t*>(p);
+        const std::uint32_t g0  = crl[0x050 / 4];
+        const std::uint32_t g1  = crl[0x054 / 4];
+        const std::uint32_t g2  = crl[0x058 / 4];
+        const std::uint32_t g3  = crl[0x05c / 4];
+        const std::uint32_t tsu = crl[0x100 / 4];
+        ::munmap(p, CRL_APB_SIZE);
+        fmt::println(stderr,
+            "[GEM snapshot {}] CRL_APB @0x{:x}:\n"
+            "  [0x050] GEM0_REF_CTRL = 0x{:08x}   <-- our device (0xff0b0000 = GEM0)\n"
+            "  [0x054] GEM1_REF_CTRL = 0x{:08x}\n"
+            "  [0x058] GEM2_REF_CTRL = 0x{:08x}\n"
+            "  [0x05c] GEM3_REF_CTRL = 0x{:08x}\n"
+            "  [0x100] GEM_TSU_REF   = 0x{:08x}",
+            label, CRL_APB_BASE, g0, g1, g2, g3, tsu);
+    }
+
+    // Zynq UltraScale+ CRL_APB (0xff5e0000) holds the reference-clock enables
+    // for all four PS GEMs. macb_remove() calls clk_disable_unprepare() which
+    // drops the refcount to zero and gates GEM0's CLKACT bits off. Without
+    // the reference clock the MAC's TX/RX state machines cannot shift bits
+    // to the PHY — TXGO latches at 1 waiting for carrier sense but TXCNT
+    // stays at 0 forever. We cannot talk to the Linux clock framework from
+    // userspace, so we force the CLKACT bits back on via direct MMIO.
+    //
+    // Bits (observed on mkdev50, kernel 6.6.40-xlnxLTS20242-fecos03):
+    //   GEM0_REF_CTRL @0xff5e0050 — bits 25+26 are the two CLKACT outputs
+    //   GEM_TSU_REF   @0xff5e0100 — bit 24 is CLKACT for the TSU clock
+    void restoreGemClocks() noexcept {
+        constexpr std::uint64_t CRL_APB_BASE     = 0xff5e0000;
+        constexpr std::size_t   CRL_APB_SIZE     = 0x1000;
+        constexpr std::uint32_t GEM_CLKACT_MASK  = (1u << 25) | (1u << 26);
+        constexpr std::uint32_t TSU_CLKACT_MASK  = (1u << 24);
+
+        const int fd = ::open("/dev/mem", O_RDWR | O_SYNC);
+        if (fd < 0) {
+            fmt::println(stderr, "[GEM] restoreGemClocks: /dev/mem open failed: {}",
+                         std::strerror(errno));
+            return;
+        }
+        void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         fd, static_cast<off_t>(CRL_APB_BASE));
+        ::close(fd);
+        if (p == MAP_FAILED) {
+            fmt::println(stderr, "[GEM] restoreGemClocks: mmap CRL_APB failed: {}",
+                         std::strerror(errno));
+            return;
+        }
+        auto* crl = static_cast<volatile std::uint32_t*>(p);
+        const std::uint32_t oldRef = crl[0x050 / 4];
+        const std::uint32_t oldTsu = crl[0x100 / 4];
+        const std::uint32_t newRef = oldRef | GEM_CLKACT_MASK;
+        const std::uint32_t newTsu = oldTsu | TSU_CLKACT_MASK;
+        if (newRef != oldRef) {
+            crl[0x050 / 4] = newRef;
+            fmt::println(stderr,
+                "[GEM] restoreGemClocks: GEM0_REF_CTRL 0x{:08x} -> 0x{:08x} (CLKACT 25+26 forced on)",
+                oldRef, newRef);
+        } else {
+            fmt::println(stderr,
+                "[GEM] restoreGemClocks: GEM0_REF_CTRL 0x{:08x} — CLKACT already on", oldRef);
+        }
+        if (newTsu != oldTsu) {
+            crl[0x100 / 4] = newTsu;
+            fmt::println(stderr,
+                "[GEM] restoreGemClocks: GEM_TSU_REF   0x{:08x} -> 0x{:08x} (CLKACT 24 forced on)",
+                oldTsu, newTsu);
+        } else {
+            fmt::println(stderr,
+                "[GEM] restoreGemClocks: GEM_TSU_REF   0x{:08x} — CLKACT already on", oldTsu);
+        }
+        ::munmap(p, CRL_APB_SIZE);
+    }
+
+    // After a successful macb rebind, end0 is reborn as a fresh netdev but
+    // nothing is auto-wired back up:
+    //   - systemd-networkd sees the new interface via udev but hasn't re-
+    //     applied fec.network yet, so there's no IP, no DHCP lease, no
+    //     default route
+    //   - the NFS client is stuck in "server unreachable" state from the
+    //     unbind window; the hard-mounted /usr/local (NFSv3 RO) does not
+    //     recover on its own once the link is back, which is why any later
+    //     shell command that touches /usr/local/bin hangs
+    //   - SSH/serial itself keeps working, but new shells fork-exec into
+    //     /usr/local paths and then block
+    //
+    // This helper runs a minimal recovery sequence synchronously (from the
+    // destructor, after rebind). All commands pin PATH to local-only
+    // directories so /bin/sh never searches NFS-backed components, and are
+    // Captures the interface's IPv4 address+prefix and default gateway before
+    // unbind. Uses getifaddrs() + /proc/net/route — no subprocess, no NFS.
+    void saveNetworkConfig() noexcept {
+        struct ifaddrs* list = nullptr;
+        if (::getifaddrs(&list) == 0) {
+            for (struct ifaddrs* ifa = list; ifa; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_name || std::strcmp(ifa->ifa_name, m_ifname.c_str()) != 0) continue;
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                auto* sin = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+                char ipbuf[INET_ADDRSTRLEN]{};
+                ::inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+                int prefix = 0;
+                if (ifa->ifa_netmask) {
+                    auto* mask = reinterpret_cast<sockaddr_in*>(ifa->ifa_netmask);
+                    std::uint32_t m = ntohl(mask->sin_addr.s_addr);
+                    while (m & 0x80000000u) { ++prefix; m <<= 1; }
+                }
+                m_savedAddr = fmt::format("{}/{}", ipbuf, prefix);
+                break;
+            }
+            ::freeifaddrs(list);
+        }
+
+        FILE* f = std::fopen("/proc/net/route", "r");
+        if (f) {
+            char line[256];
+            std::fgets(line, sizeof(line), f); // skip header
+            while (std::fgets(line, sizeof(line), f)) {
+                char iface[32]{};
+                unsigned long dest = 1, gw = 0;
+                if (std::sscanf(line, "%31s %lx %lx", iface, &dest, &gw) == 3 &&
+                    std::strcmp(iface, m_ifname.c_str()) == 0 && dest == 0) {
+                    struct in_addr gwaddr{};
+                    gwaddr.s_addr = static_cast<std::uint32_t>(gw);
+                    char gwbuf[INET_ADDRSTRLEN]{};
+                    ::inet_ntop(AF_INET, &gwaddr, gwbuf, sizeof(gwbuf));
+                    m_savedGateway = gwbuf;
+                    break;
+                }
+            }
+            std::fclose(f);
+        }
+
+        if (!m_savedAddr.empty() && !m_savedGateway.empty())
+            fmt::println(stderr, "[GEM] saved network config: addr={} gw={}", m_savedAddr, m_savedGateway);
+        else
+            fmt::println(stderr, "[GEM] WARNING: could not capture network config (addr='{}' gw='{}')",
+                         m_savedAddr, m_savedGateway);
+    }
+
+    void stopNetworkd() noexcept {
+        if (!driverIsBound()) {
+            fmt::println(stderr, "[GEM] macb already unbound — skipping networkd stop");
+            return;
+        }
+        fmt::println(stderr, "[GEM] stopping systemd-networkd (while healthy, before unbind)…");
+        const int rc = std::system("timeout 5 systemctl stop systemd-networkd >/dev/null 2>&1");
+        fmt::println(stderr, "[GEM] systemd-networkd stop: rc={}", WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+    }
+
+    // Restores networking and NFS after macb rebind.
+    //
+    // systemd-networkd is dead (stopped before unbind to prevent it from hanging
+    // with threads stuck on NFS). We bypass it entirely and assign the saved
+    // IP/gateway manually with ip(8). NFS hard mounts auto-recover within ~1s
+    // once the TCP path is restored.
+    void restoreNetworkAndNfs() noexcept {
+        if (std::getenv("ABTRDA3_SKIP_NET_RESTORE")) {
+            fmt::println(stderr, "[GEM] ABTRDA3_SKIP_NET_RESTORE set — skipping");
+            return;
+        }
+
+        // Drop SCHED_FIFO so forked children don't starve systemd/D-Bus.
+        sched_param sp{};
+        sp.sched_priority = 0;
+        if (sched_setscheduler(0, SCHED_OTHER, &sp) == 0) {
+            fmt::println(stderr, "[GEM] dropped to SCHED_OTHER for recovery");
+        }
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        const long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
+        for (long c = 0; c < (ncpu > 0 ? ncpu : CPU_SETSIZE); ++c) CPU_SET(c, &mask);
+        ::sched_setaffinity(0, sizeof(mask), &mask);
+
+        constexpr const char* ENV =
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin "
+            "LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/lib:/usr/lib/aarch64-linux-gnu:/usr/lib";
+        const auto run = [&](const char* label, const char* cmd, int sec) {
+            fmt::println(stderr, "[GEM] {}…", label);
+            const std::string full = fmt::format("{} timeout {} {} >/dev/null 2>&1", ENV, sec, cmd);
+            const int rc = std::system(full.c_str());
+            const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+            fmt::println(stderr, "[GEM] {} → rc={}", label, code);
+            return code;
+        };
+
+        // 1. Wait for end0 via sysfs (NOT netlink — ip blocks on RTNL mutex
+        //    during deferred NFS teardown after interface removal).
+        fmt::println(stderr, "[GEM] waiting for /sys/class/net/{} …", m_ifname);
+        bool ifaceBack = false;
+        for (int i = 0; i < 150; ++i) {
+            struct stat st{};
+            if (::stat(("/sys/class/net/" + m_ifname).c_str(), &st) == 0) {
+                fmt::println(stderr, "[GEM] {} appeared after ~{} ms", m_ifname, i * 100);
+                ifaceBack = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!ifaceBack) {
+            fmt::println(stderr, "[GEM] WARNING: {} never appeared — aborting recovery", m_ifname);
+            return;
+        }
+
+        // 2. Manual IP assignment (bypass dead networkd).
+        if (m_savedAddr.empty() || m_savedGateway.empty()) {
+            fmt::println(stderr, "[GEM] no saved network config — cannot restore IP");
+            return;
+        }
+        run("ip link set up",
+            fmt::format("ip link set {} up", m_ifname).c_str(), 5);
+        run("ip addr add",
+            fmt::format("ip addr add {} dev {}", m_savedAddr, m_ifname).c_str(), 5);
+        run("ip route add default",
+            fmt::format("ip route add default via {} dev {}", m_savedGateway, m_ifname).c_str(), 5);
+
+        // 3. Wait for PHY link-up via sysfs carrier (no netlink).
+        fmt::println(stderr, "[GEM] waiting for PHY link-up (carrier)…");
+        const std::string carrierPath = "/sys/class/net/" + m_ifname + "/carrier";
+        for (int i = 0; i < 200; ++i) {
+            char buf[4]{};
+            int fd = ::open(carrierPath.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+                ::close(fd);
+                if (n > 0 && buf[0] == '1') {
+                    fmt::println(stderr, "[GEM] link up after ~{} ms", i * 100);
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // 4. Wait for NFS auto-recovery (hard mount retries on its own).
+        fmt::println(stderr, "[GEM] waiting for /usr/local NFS auto-recovery (up to 90s)…");
+        bool nfsOk = false;
+        for (int i = 0; i < 90; ++i) {
+            struct stat st{};
+            if (::stat("/usr/local/bin", &st) == 0) {
+                fmt::println(stderr, "[GEM] /usr/local recovered after ~{}s", i);
+                nfsOk = true;
+                break;
+            }
+            if (i > 0 && (i % 15) == 0)
+                fmt::println(stderr, "[GEM] … still waiting ({}s)", i);
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!nfsOk)
+            fmt::println(stderr, "[GEM] WARNING: /usr/local did not auto-recover after 90s");
+
+        // 5. Restart autofs NFS mounts.
+        run("systemctl restart remote-fs.target",
+            "systemctl restart remote-fs.target", 20);
+
+        // 6. Restart networkd last (for long-term DHCP lease renewal).
+        //    May timeout — non-critical since our static IP is already working.
+        run("systemctl restart systemd-networkd",
+            "systemctl restart systemd-networkd", 10);
+
+        fmt::println(stderr, "[GEM] network/NFS recovery complete");
+    }
+
+    void stopMonitoringDaemons() noexcept {
+        if (std::getenv("ABTRDA3_KEEP_COLLECTD")) {
+            fmt::println(stderr, "[GEM] ABTRDA3_KEEP_COLLECTD set — leaving collectd running");
+            return;
+        }
+        // Crash-recovery guard: if macb was left unbound by a previous run,
+        // end0 is dead — NFS/DNS unreachable. systemctl hangs in that state
+        // (D-Bus → journald → nss → network). Also: no macb means no phylink
+        // for collectd to oops on, so there's nothing to prevent.
+        if (!driverIsBound()) {
+            fmt::println(stderr,
+                "[GEM] macb already unbound — skipping collectd stop "
+                "(systemctl would hang on dead network, nothing to oops anyway)");
+            return;
+        }
+        // `timeout 5` caps the call even if systemctl stalls on some other
+        // systemd-internal delay (journald flush, mount unit settle, etc.).
+        const int rc = std::system("timeout 5 systemctl stop collectd >/dev/null 2>&1");
+        if (rc == 0)
+            fmt::println(stderr, "[GEM] collectd stopped (systemctl stop returned 0)");
+        else
+            fmt::println(stderr, "[GEM] collectd stop returned {} (absent, not running, or timed out — continuing)", rc);
+    }
+
     [[nodiscard]] bool unbindKernelDriver() {
         if (m_driverName.empty()) return true;
 
@@ -408,29 +873,50 @@ private:
         const std::string unbind = "/sys/bus/platform/drivers/" + m_driverName + "/unbind";
         const int fd = ::open(unbind.c_str(), O_WRONLY);
         if (fd < 0) {
-            std::fprintf(stderr, "[GEM] open(%s) failed\n", unbind.c_str());
+            fmt::println(stderr, "[GEM] open({}) failed", unbind);
             return false;
         }
+
+        // The sysfs write synchronously runs macb_remove() in the kernel.
+        // If it oopses (phylink teardown NULL deref has been seen), we never
+        // come back from this call. Log before AND after so we can tell.
+        fmt::println(stderr, "[GEM] writing '{}' to {}  (kernel runs macb_remove synchronously…)",
+                     m_deviceName, unbind);
         const ssize_t w = ::write(fd, m_deviceName.data(), m_deviceName.size());
+        fmt::println(stderr, "[GEM] write returned {} (errno={})",
+                     w, w < 0 ? errno : 0);
         ::close(fd);
         if (w != static_cast<ssize_t>(m_deviceName.size())) return false;
 
         m_unboundDriver = true;
-        std::fprintf(stderr, "[GEM] Unbound %s from %s\n",
-                     m_deviceName.c_str(), m_driverName.c_str());
+        fmt::println(stderr, "[GEM] Unbound {} from {}", m_deviceName, m_driverName);
         return true;
     }
 
     void rebindKernelDriver() noexcept {
         if (m_driverName.empty() || m_deviceName.empty()) return;
         const std::string bind = "/sys/bus/platform/drivers/" + m_driverName + "/bind";
+        fmt::println(stderr, "[GEM] rebind: opening {}…", bind);
         const int fd = ::open(bind.c_str(), O_WRONLY);
-        if (fd < 0) return;
-        (void)::write(fd, m_deviceName.data(), m_deviceName.size());
+        if (fd < 0) {
+            fmt::println(stderr, "[GEM] rebind: open failed: {}", std::strerror(errno));
+            return;
+        }
+        // The sysfs write runs macb_probe() synchronously. On FECOS kernel
+        // 6.6.40-xlnxLTS20242-fecos03 this has been seen to hang in phylink
+        // init — if we never see the "write returned" line below, that's it.
+        fmt::println(stderr, "[GEM] rebind: writing '{}' (macb_probe runs synchronously — may hang on FECOS kernel)…",
+                     m_deviceName);
+        const ssize_t w = ::write(fd, m_deviceName.data(), m_deviceName.size());
+        fmt::println(stderr, "[GEM] rebind: write returned {} (errno={})",
+                     w, w < 0 ? errno : 0);
         ::close(fd);
+        if (w != static_cast<ssize_t>(m_deviceName.size())) {
+            fmt::println(stderr, "[GEM] rebind: short write — rebind failed");
+            return;
+        }
         m_unboundDriver = false;
-        std::fprintf(stderr, "[GEM] Rebound %s to %s\n",
-                     m_deviceName.c_str(), m_driverName.c_str());
+        fmt::println(stderr, "[GEM] Rebound {} to {}", m_deviceName, m_driverName);
     }
 
     // =====================================================================
@@ -449,8 +935,8 @@ private:
 
     void disableInterrupts() noexcept {
         for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
-            writeQueueReg(GEM_IDR(0), q, 0xFFFFFFFFU);
-            writeQueueReg(GEM_ISR(0), q, 0xFFFFFFFFU);
+            writeReg(qIDR(q), 0xFFFFFFFFU);
+            writeReg(qISR(q), 0xFFFFFFFFU);
         }
     }
 
@@ -509,8 +995,11 @@ private:
         cfg |= GEM_BIT(ADDR64);
         writeReg(GEM_DMACFG, cfg);
 
-        for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
-            writeQueueReg(GEM_RBQS(0), q, BuffSize / 64);
+        // Per-queue RX buffer size exists only for hw_q >= 1. Q0 uses the
+        // global DMACFG.RXBS (already set above).
+        for (std::size_t q = 1; q < GEM_NUM_QUEUES_HW; ++q) {
+            writeReg(GEM_RBQS(0) + static_cast<std::uint32_t>((q - 1) << 2),
+                     BuffSize / 64);
         }
     }
 
@@ -570,14 +1059,14 @@ private:
             writeReg(MACB_RBQPH, static_cast<std::uint32_t>(m_rxRings[0].physicalBase() >> 32));
             for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
                 const std::uint64_t b = m_rxRings[q].physicalBase();
-                writeQueueReg(GEM_RBQP(0), q, static_cast<std::uint32_t>(b & 0xFFFFFFFFU));
+                writeReg(qRBQP(q), static_cast<std::uint32_t>(b & 0xFFFFFFFFU));
             }
         }
         if constexpr (HAS_TX) {
             writeReg(MACB_TBQPH, static_cast<std::uint32_t>(m_txRings[0].physicalBase() >> 32));
             for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
                 const std::uint64_t b = m_txRings[q].physicalBase();
-                writeQueueReg(GEM_TBQP(0), q, static_cast<std::uint32_t>(b & 0xFFFFFFFFU));
+                writeReg(qTBQP(q), static_cast<std::uint32_t>(b & 0xFFFFFFFFU));
             }
         }
     }
@@ -634,18 +1123,86 @@ private:
     }
 
     [[nodiscard]] bool initPhy() noexcept {
+        // MPE must be set before any MDIO transaction.
         std::uint32_t ncr = readReg(MACB_NCR);
         ncr |= MACB_BIT(MPE);
         writeReg(MACB_NCR, ncr);
 
+        // Scan MDIO 31→0 (reverse). The LAN8841 on mkdev50 is at addr 31
+        // per the device tree, but also responds at addr 0 (broadcast alias).
+        // Scanning high-to-low finds the real address before the alias.
+        m_phyAddr = -1;
+        for (int a = 31; a >= 0; --a) {
+            const auto addr = static_cast<std::uint8_t>(a);
+            const std::uint16_t id2 = mdioRead(addr, 2);
+            const std::uint16_t id3 = mdioRead(addr, 3);
+            if (id2 != 0xFFFF && id2 != 0x0000) {
+                fmt::println(stderr, "[GEM] PHY at MDIO addr {:<2}: ID = 0x{:04x}{:04x}",
+                             a, id2, id3);
+                if (m_phyAddr < 0) m_phyAddr = static_cast<std::int8_t>(a);
+            }
+        }
+        if (m_phyAddr < 0) {
+            fmt::println(stderr, "[GEM] No PHY responded on MDIO scan — TX/RX cannot work");
+            return false;
+        }
+
+        // Verify writes actually stick at the chosen address. Broadcast
+        // aliases may accept reads but silently discard writes — which
+        // would make our BMCR power-down clear a no-op.
+        const auto ph = static_cast<std::uint8_t>(m_phyAddr);
+        {
+            const std::uint16_t anar = mdioRead(ph, 4);   // ANAR (reg 4)
+            const std::uint16_t toggled = anar ^ 0x0020u;  // flip 10BASE-T advert bit
+            mdioWrite(ph, 4, toggled);
+            const std::uint16_t readback = mdioRead(ph, 4);
+            mdioWrite(ph, 4, anar);                        // restore
+            if (readback != toggled) {
+                fmt::println(stderr,
+                    "[GEM] WARNING: MDIO write-readback FAILED at addr {} "
+                    "(wrote 0x{:04x}, read 0x{:04x}) — may be a broadcast alias",
+                    m_phyAddr, toggled, readback);
+            } else {
+                fmt::println(stderr, "[GEM] MDIO write-readback OK at addr {}", m_phyAddr);
+            }
+        }
+
+        // macb_remove (from our unbind) runs phylink_disconnect → phy_stop,
+        // which sets BMCR.POWER_DOWN (bit 11). Our PMD then sees no carrier
+        // from the PHY → the MAC's TX state machine latches TXGO=1 waiting
+        // for carrier sense and TXCNT stays at 0. Wake the PHY here.
+        std::uint16_t bmcr = mdioRead(ph, 0);
+        fmt::println(stderr,
+            "[GEM] PHY BMCR=0x{:04x} (power_down={}, isolate={}, auto_neg_en={})",
+            bmcr,
+            (bmcr & 0x0800) ? 1 : 0,
+            (bmcr & 0x0400) ? 1 : 0,
+            (bmcr & 0x1000) ? 1 : 0);
+        if (bmcr & 0x0C00) {
+            fmt::println(stderr, "[GEM] Clearing POWER_DOWN / ISOLATE and restarting auto-neg");
+            bmcr &= ~0x0C00;          // clear POWER_DOWN (bit 11) + ISOLATE (bit 10)
+            bmcr |=  0x1200;          // set AUTO_NEG_EN (bit 12) + RESTART_AN (bit 9)
+            if (!mdioWrite(ph, 0, bmcr)) {
+                fmt::println(stderr,
+                    "[GEM] Warning: mdioWrite to BMCR stalled — PHY may still be in POWER_DOWN/ISOLATE");
+            }
+        }
+
+        // Poll the real PHY for link-up, not addr 0.
         for (int i = 0; i < 500; ++i) {
-            if (isLinkUp()) {
-                std::fprintf(stderr, "[GEM] Link up\n");
+            const std::uint16_t bmsr = mdioRead(ph, 1);
+            if (bmsr & 0x0004) {
+                const std::uint16_t anlpar = mdioRead(ph, 5);
+                const std::uint16_t gbstat = mdioRead(ph, 10);
+                fmt::println(stderr,
+                    "[GEM] Link up on PHY addr {}: BMSR=0x{:04x} ANLPAR=0x{:04x} GBStatus=0x{:04x}",
+                    m_phyAddr, bmsr, anlpar, gbstat);
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::fprintf(stderr, "[GEM] Warning: link not up after 5s (continuing)\n");
+        fmt::println(stderr, "[GEM] Warning: no link up on PHY addr {} after 5s — continuing",
+                     m_phyAddr);
         return true;
     }
 
@@ -806,7 +1363,10 @@ private:
     std::array<std::uint32_t,            GEM_NUM_QUEUES_HW> m_txPendingLen{};
 
     std::array<std::uint8_t, 6> m_mac{};
+    std::int8_t                 m_phyAddr{-1};          // set by initPhy scan; -1 = not found
     bool                        m_unboundDriver{false};
+    std::string m_savedAddr;        // e.g. "10.11.33.71/24" — captured before unbind
+    std::string m_savedGateway;     // e.g. "10.11.33.1" — captured before unbind
 
     SlowPath m_slowPath{this};
 };
