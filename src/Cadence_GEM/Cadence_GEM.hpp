@@ -122,10 +122,26 @@ public:
     ~Cadence_GEM() {
         shutdown();
         if (m_unboundDriver) {
-            // Rebind + full network/NFS recovery. The earlier phylink hang was
-            // caused by macb_remove gating the GEM reference clocks — fixed by
-            // restoreGemClocks() in init(). Rebind now completes in <1s.
             if (std::getenv("ABTRDA3_REBIND")) {
+                resetForRebind();
+                // Drop SCHED_FIFO + CPU pin BEFORE rebind.  macb_probe
+                // runs in our process context; it triggers uevent helpers,
+                // PHY driver probes, and workqueue items that are
+                // SCHED_NORMAL — they cannot preempt SCHED_FIFO, causing
+                // a priority-inversion deadlock inside the kernel.
+                {
+                    sched_param sp{};
+                    sp.sched_priority = 0;
+                    sched_setscheduler(0, SCHED_OTHER, &sp);
+                    cpu_set_t mask;
+                    CPU_ZERO(&mask);
+                    const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+                    for (long c = 0; c < (n > 0 ? n : CPU_SETSIZE); ++c) CPU_SET(c, &mask);
+                    ::sched_setaffinity(0, sizeof(mask), &mask);
+                }
+                // Close our /dev/mem mapping so macb_probe's
+                // devm_ioremap_resource doesn't see a conflicting mapping.
+                m_bus.close();
                 rebindKernelDriver();
                 // rebindKernelDriver() sets m_unboundDriver = false on success.
                 // Only run the network/NFS recovery if rebind actually worked —
@@ -736,18 +752,6 @@ private:
             return;
         }
 
-        // Drop SCHED_FIFO so forked children don't starve systemd/D-Bus.
-        sched_param sp{};
-        sp.sched_priority = 0;
-        if (sched_setscheduler(0, SCHED_OTHER, &sp) == 0) {
-            fmt::println(stderr, "[GEM] dropped to SCHED_OTHER for recovery");
-        }
-        cpu_set_t mask;
-        CPU_ZERO(&mask);
-        const long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
-        for (long c = 0; c < (ncpu > 0 ? ncpu : CPU_SETSIZE); ++c) CPU_SET(c, &mask);
-        ::sched_setaffinity(0, sizeof(mask), &mask);
-
         constexpr const char* ENV =
             "PATH=/usr/sbin:/usr/bin:/sbin:/bin "
             "LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/lib:/usr/lib/aarch64-linux-gnu:/usr/lib";
@@ -837,27 +841,27 @@ private:
     }
 
     void stopMonitoringDaemons() noexcept {
-        if (std::getenv("ABTRDA3_KEEP_COLLECTD")) {
-            fmt::println(stderr, "[GEM] ABTRDA3_KEEP_COLLECTD set — leaving collectd running");
-            return;
-        }
-        // Crash-recovery guard: if macb was left unbound by a previous run,
-        // end0 is dead — NFS/DNS unreachable. systemctl hangs in that state
-        // (D-Bus → journald → nss → network). Also: no macb means no phylink
-        // for collectd to oops on, so there's nothing to prevent.
         if (!driverIsBound()) {
             fmt::println(stderr,
-                "[GEM] macb already unbound — skipping collectd stop "
-                "(systemctl would hang on dead network, nothing to oops anyway)");
+                "[GEM] macb already unbound — skipping daemon stops "
+                "(systemctl would hang on dead network)");
             return;
         }
-        // `timeout 5` caps the call even if systemctl stalls on some other
-        // systemd-internal delay (journald flush, mount unit settle, etc.).
-        const int rc = std::system("timeout 5 systemctl stop collectd >/dev/null 2>&1");
-        if (rc == 0)
-            fmt::println(stderr, "[GEM] collectd stopped (systemctl stop returned 0)");
-        else
-            fmt::println(stderr, "[GEM] collectd stop returned {} (absent, not running, or timed out — continuing)", rc);
+        // fec-check-ethernet-speed polls psutil.net_if_stats() every 5 min,
+        // which does SIOCETHTOOL on every interface. If it races with
+        // macb_probe during rebind, phylink_ethtool_ksettings_get
+        // dereferences a NULL phydev → kernel oops.
+        static constexpr const char* services[] = {
+            "collectd",
+            "fec-check-ethernet-speed",
+        };
+        for (const char* svc : services) {
+            const std::string cmd = fmt::format(
+                "timeout 5 systemctl stop {} >/dev/null 2>&1", svc);
+            const int rc = std::system(cmd.c_str());
+            const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+            fmt::println(stderr, "[GEM] stop {}: rc={}", svc, code);
+        }
     }
 
     [[nodiscard]] bool unbindKernelDriver() {
@@ -937,6 +941,61 @@ private:
         for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
             writeReg(qIDR(q), 0xFFFFFFFFU);
             writeReg(qISR(q), 0xFFFFFFFFU);
+        }
+    }
+
+    // Restore the GEM to the state macb_remove leaves it in so that
+    // macb_probe can re-init cleanly. shutdown() only clears RE/TE —
+    // this goes further: zeroes DMA pointers, clears DMACFG/NCFGR,
+    // and gates the clocks back off so the kernel CCF ref-count matches
+    // reality (0 = disabled). Without this, macb_probe hangs.
+    void resetForRebind() noexcept {
+        if (!m_bus.isOpen()) return;
+
+        // 1. Full register reset — matches kernel macb_reset_hw().
+        writeReg(MACB_NCR, 0);
+        writeReg(MACB_TSR, 0xFFFFFFFFU);
+        writeReg(MACB_RSR, 0xFFFFFFFFU);
+        disableInterrupts();
+
+        // 2. Zero DMA ring pointers — our hugepages are about to be freed.
+        writeReg(MACB_TBQPH, 0);
+        writeReg(MACB_RBQPH, 0);
+        for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
+            writeReg(qTBQP(q), 0);
+            writeReg(qRBQP(q), 0);
+        }
+
+        // 3. Clear DMA config and network config.
+        writeReg(GEM_DMACFG, 0);
+        writeReg(GEM_NCFGR, 0);
+        writeReg(GEM_USRIO, 0);
+        writeReg(GEM_PBUFRXCUT, 0);
+        for (std::size_t q = 1; q < GEM_NUM_QUEUES_HW; ++q)
+            writeReg(GEM_RBQS(0) + static_cast<std::uint32_t>((q - 1) << 2), 0);
+
+        fmt::println(stderr, "[GEM] resetForRebind: registers cleared");
+
+        // 4. Gate GEM clocks off — undo our restoreGemClocks() so the
+        //    kernel CCF (ref-count = 0 after macb_remove) matches HW.
+        //    macb_probe will call clk_prepare_enable() to turn them on.
+        constexpr std::uint64_t CRL_APB_BASE    = 0xff5e0000;
+        constexpr std::size_t   CRL_APB_SIZE    = 0x1000;
+        constexpr std::uint32_t GEM_CLKACT_MASK = (1u << 25) | (1u << 26);
+        constexpr std::uint32_t TSU_CLKACT_MASK = (1u << 24);
+
+        const int fd = ::open("/dev/mem", O_RDWR | O_SYNC);
+        if (fd >= 0) {
+            void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, fd, static_cast<off_t>(CRL_APB_BASE));
+            ::close(fd);
+            if (p != MAP_FAILED) {
+                auto* crl = static_cast<volatile std::uint32_t*>(p);
+                crl[0x050 / 4] &= ~GEM_CLKACT_MASK;
+                crl[0x100 / 4] &= ~TSU_CLKACT_MASK;
+                ::munmap(p, CRL_APB_SIZE);
+                fmt::println(stderr, "[GEM] resetForRebind: CRL_APB clocks gated off");
+            }
         }
     }
 

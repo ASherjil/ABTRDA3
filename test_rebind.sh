@@ -64,9 +64,14 @@ timeout 3 ls /usr/local/bin/ > /dev/null 2>&1 && echo "  /usr/local: OK" || echo
 timeout 3 ls /nfs/cs-ccr-nfshome/user/ > /dev/null 2>&1 && echo "  NFS home:   OK" || echo "  NFS home:   FAILED"
 echo
 
-# ── Stop collectd (while NFS still works) ────────────────────────────
-echo ">>> $(ts) Stopping collectd..."
-timeout 5 systemctl stop collectd 2>&1 && echo "    stopped" || echo "    skip/timeout"
+# ── Stop monitoring daemons (while NFS still works) ──────────────────
+# fec-check-ethernet-speed does ethtool on every interface every 5 min.
+# If it races with macb_probe during rebind → kernel NULL deref in
+# phylink_ethtool_ksettings_get (phydev not yet attached).
+echo ">>> $(ts) Stopping monitoring daemons..."
+for svc in collectd fec-check-ethernet-speed; do
+    timeout 5 systemctl stop "$svc" 2>&1 && echo "    $svc stopped" || echo "    $svc skip/timeout"
+done
 
 # ── Stop networkd cleanly BEFORE unbind (while it can still respond) ─
 echo ">>> $(ts) Stopping systemd-networkd (while healthy)..."
@@ -194,8 +199,10 @@ echo "  [3/3] Restarting systemd-networkd (for long-term DHCP)..."
 timeout 10 systemctl restart systemd-networkd 2>&1 \
     && echo "    OK" || echo "    timeout (IP is static, DHCP renewal will fail eventually)"
 
-echo "  Restarting collectd..."
-timeout 5 systemctl start collectd 2>&1 && echo "    OK" || echo "    skip"
+echo "  Restarting monitoring daemons..."
+for svc in collectd fec-check-ethernet-speed; do
+    timeout 5 systemctl start "$svc" 2>&1 && echo "    $svc OK" || echo "    $svc skip"
+done
 
 # ── Final verification ───────────────────────────────────────────────
 echo
