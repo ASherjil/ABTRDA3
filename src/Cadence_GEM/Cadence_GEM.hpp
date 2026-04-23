@@ -399,20 +399,60 @@ private:
         return q == 0 ? MACB_IDR : (GEM_IDR(0) + static_cast<std::uint32_t>((q - 1) << 2));
     }
 
-    // ARM64 DMA barriers — macb is in the Outer Shareable domain
-    [[gnu::always_inline]] static inline void dmaStoreBarrier() noexcept {
+    // ── ARM64 cache maintenance for non-coherent DMA (Zynq GEM) ────────
+    // Zynq UltraScale+ GEM DMA traverses the LPD interconnect without
+    // snooping CCI-400, so CPU cache is invisible to the MAC.
+    // We use DC CVAC (clean to Point of Coherency = DRAM) to push CPU
+    // writes out, and DC CIVAC (clean+invalidate) to drop stale lines
+    // before reading DMA-written data.  DSB ensures completion before
+    // the next step (ARM ARM K11.5.4: "A DMB is not sufficient").
+    // Cortex-A53 cache line = 64 bytes.
+
+    static constexpr std::size_t CACHE_LINE = 64;
+
+    // Clean one cache line to DRAM (DC CVAC)
+    [[gnu::always_inline]] static inline void dcClean(const void* addr) noexcept {
 #if defined(__aarch64__)
-        asm volatile("dmb oshst" ::: "memory");
+        asm volatile("dc cvac, %0" :: "r"(addr) : "memory");
+#else
+        (void)addr;
+#endif
+    }
+
+    // Clean + invalidate one cache line (DC CIVAC)
+    [[gnu::always_inline]] static inline void dcCleanInvalidate(const void* addr) noexcept {
+#if defined(__aarch64__)
+        asm volatile("dc civac, %0" :: "r"(addr) : "memory");
+#else
+        (void)addr;
+#endif
+    }
+
+    // DSB SY — completion barrier; all prior cache ops globally visible
+    [[gnu::always_inline]] static inline void dsbSy() noexcept {
+#if defined(__aarch64__)
+        asm volatile("dsb sy" ::: "memory");
 #else
         asm volatile("" ::: "memory");
 #endif
     }
-    [[gnu::always_inline]] static inline void dmaLoadBarrier() noexcept {
-#if defined(__aarch64__)
-        asm volatile("dmb oshld" ::: "memory");
-#else
-        asm volatile("" ::: "memory");
-#endif
+
+    // Clean a range to DRAM
+    [[gnu::always_inline]]
+    static inline void dcCleanRange(const void* addr, std::size_t bytes) noexcept {
+        auto p   = reinterpret_cast<std::uintptr_t>(addr) & ~(CACHE_LINE - 1);
+        auto end = reinterpret_cast<std::uintptr_t>(addr) + bytes;
+        for (; p < end; p += CACHE_LINE)
+            dcClean(reinterpret_cast<const void*>(p));
+    }
+
+    // Clean + invalidate a range
+    [[gnu::always_inline]]
+    static inline void dcCleanInvalidateRange(const void* addr, std::size_t bytes) noexcept {
+        auto p   = reinterpret_cast<std::uintptr_t>(addr) & ~(CACHE_LINE - 1);
+        auto end = reinterpret_cast<std::uintptr_t>(addr) + bytes;
+        for (; p < end; p += CACHE_LINE)
+            dcCleanInvalidate(reinterpret_cast<const void*>(p));
     }
 
     // =====================================================================
@@ -940,7 +980,8 @@ private:
     void disableInterrupts() noexcept {
         for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
             writeReg(qIDR(q), 0xFFFFFFFFU);
-            writeReg(qISR(q), 0xFFFFFFFFU);
+            // Zynq GEM ISR is read-to-clear (no MACB_CAPS_ISR_CLEAR_ON_WRITE)
+            (void)readReg(qISR(q));
         }
     }
 
@@ -952,27 +993,28 @@ private:
     void resetForRebind() noexcept {
         if (!m_bus.isOpen()) return;
 
-        // 1. Full register reset — matches kernel macb_reset_hw().
-        writeReg(MACB_NCR, 0);
+        // 1. Gracefully halt TX DMA before touching any state.
+        //    Mirrors kernel macb_halt_tx(): set THALT, poll TGO → 0.
+        std::uint32_t ncr = readReg(MACB_NCR);
+        writeReg(MACB_NCR, ncr | MACB_BIT(THALT));
+        for (int i = 0; i < 4000; ++i) {
+            if (!(readReg(MACB_TSR) & MACB_BIT(TGO))) break;
+            for (int d = 0; d < 100; ++d) asm volatile("" ::: "memory");
+        }
+        if (readReg(MACB_TSR) & MACB_BIT(TGO))
+            fmt::println(stderr, "[GEM] resetForRebind: WARNING — THALT timed out, forcing TE off");
+
+        // 2. macb_reset_hw() — clear RE/TE, set CLRSTAT, flush status regs.
+        {
+            std::uint32_t n = readReg(MACB_NCR);
+            n &= ~(MACB_BIT(RE) | MACB_BIT(TE));
+            n |= MACB_BIT(CLRSTAT);
+            writeReg(MACB_NCR, n);
+        }
         writeReg(MACB_TSR, 0xFFFFFFFFU);
         writeReg(MACB_RSR, 0xFFFFFFFFU);
-        disableInterrupts();
-
-        // 2. Zero DMA ring pointers — our hugepages are about to be freed.
-        writeReg(MACB_TBQPH, 0);
-        writeReg(MACB_RBQPH, 0);
-        for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
-            writeReg(qTBQP(q), 0);
-            writeReg(qRBQP(q), 0);
-        }
-
-        // 3. Clear DMA config and network config.
-        writeReg(GEM_DMACFG, 0);
-        writeReg(GEM_NCFGR, 0);
-        writeReg(GEM_USRIO, 0);
         writeReg(GEM_PBUFRXCUT, 0);
-        for (std::size_t q = 1; q < GEM_NUM_QUEUES_HW; ++q)
-            writeReg(GEM_RBQS(0) + static_cast<std::uint32_t>((q - 1) << 2), 0);
+        disableInterrupts();
 
         fmt::println(stderr, "[GEM] resetForRebind: registers cleared");
 
@@ -991,8 +1033,8 @@ private:
             ::close(fd);
             if (p != MAP_FAILED) {
                 auto* crl = static_cast<volatile std::uint32_t*>(p);
-                crl[0x050 / 4] &= ~GEM_CLKACT_MASK;
-                crl[0x100 / 4] &= ~TSU_CLKACT_MASK;
+                crl[0x050 / 4] = crl[0x050 / 4] & ~GEM_CLKACT_MASK;
+                crl[0x100 / 4] = crl[0x100 / 4] & ~TSU_CLKACT_MASK;
                 ::munmap(p, CRL_APB_SIZE);
                 fmt::println(stderr, "[GEM] resetForRebind: CRL_APB clocks gated off");
             }
@@ -1095,6 +1137,7 @@ private:
                     if (i == NumTxDesc - 1) ctrl |= MACB_BIT(TX_WRAP);
                     tx[i].base.ctrl = ctrl;
                 }
+                dcCleanRange(tx, NumTxDesc * sizeof(GEMDescriptor64));
             }
             if constexpr (HAS_RX) {
                 auto* rx = static_cast<GEMDescriptor64*>(m_rxRings[q].getHugepageBuffer());
@@ -1107,9 +1150,10 @@ private:
                     rx[i].high.addrh = static_cast<std::uint32_t>(buf >> 32);
                     rx[i].high.resvd = 0;
                 }
+                dcCleanRange(rx, NumRxDesc * sizeof(GEMDescriptor64));
             }
         }
-        dmaStoreBarrier();
+        dsbSy();
         return true;
     }
 
@@ -1213,9 +1257,9 @@ private:
         {
             const std::uint16_t anar = mdioRead(ph, 4);   // ANAR (reg 4)
             const std::uint16_t toggled = anar ^ 0x0020u;  // flip 10BASE-T advert bit
-            mdioWrite(ph, 4, toggled);
+            if (!mdioWrite(ph, 4, toggled)) return false;
             const std::uint16_t readback = mdioRead(ph, 4);
-            mdioWrite(ph, 4, anar);                        // restore
+            if (!mdioWrite(ph, 4, anar)) return false;     // restore
             if (readback != toggled) {
                 fmt::println(stderr,
                     "[GEM] WARNING: MDIO write-readback FAILED at addr {} "
@@ -1299,17 +1343,23 @@ private:
         const std::size_t tail = m_rxTail[Q];
         auto& d = rxDesc<Q>(tail);
 
-        // Volatile read — HW writes the USED bit by DMA; without volatile the
-        // compiler may hoist this out of a polling loop.
+        // GEM DMA wrote this descriptor — invalidate so we read from DRAM
+        dcCleanInvalidate(&d);
+        dsbSy();
+
         const std::uint32_t addr = *reinterpret_cast<volatile const std::uint32_t*>(&d.base.addr);
         if (!(addr & MACB_BIT(RX_USED))) [[likely]] return {};
 
-        dmaLoadBarrier();
         const std::uint32_t ctrl = d.base.ctrl;
         const std::uint32_t len  = ctrl & MACB_RX_FRMLEN_MASK;
 
+        // Invalidate packet data written by GEM DMA
+        auto* pkt = m_rxBuffers[Q].template ptrAt<std::uint8_t>(tail * BuffSize);
+        dcCleanInvalidateRange(pkt, len);
+        dsbSy();
+
         return {
-            .data   = { m_rxBuffers[Q].template ptrAt<std::uint8_t>(tail * BuffSize), len },
+            .data   = { pkt, len },
             .sec    = 0,
             .nsec   = 0,
             .status = 1,
@@ -1330,9 +1380,9 @@ private:
 
         d.base.ctrl  = 0;
         d.high.addrh = static_cast<std::uint32_t>(buf >> 32);
-        dmaStoreBarrier();
         d.base.addr  = addr;                 // clears RX_USED — HW can refill
-        dmaStoreBarrier();
+        dcClean(&d);
+        dsbSy();
 
         m_rxTail[Q] = (tail + 1) & RX_RING_MASK;
     }
@@ -1364,19 +1414,22 @@ private:
         const std::size_t tail = m_txTail[Q];
         auto& d = txDesc<Q>(tail);
 
+        // Clean packet data to DRAM so GEM DMA reads what the CPU wrote
+        auto* pkt = m_txBuffers[Q].template ptrAt<std::uint8_t>(tail * BuffSize);
+        dcCleanRange(pkt, m_txPendingLen[Q]);
+
         const bool wrap = (tail == NumTxDesc - 1);
         std::uint32_t ctrl = (m_txPendingLen[Q] & 0x3FFF) | MACB_BIT(TX_LAST);
         if (wrap) ctrl |= MACB_BIT(TX_WRAP);
 
-        // Buffer writes must land before HW observes the cleared USED bit.
-        dmaStoreBarrier();
         d.base.ctrl = ctrl;                  // USED=0 signals HW
-        dmaStoreBarrier();
+        dcClean(&d);
+        // DSB: all cache cleans globally visible before TSTART (ARM K11.5.4)
+        dsbSy();
 
         m_txTail[Q]     = (tail + 1) & TX_RING_MASK;
         m_txInFlight[Q] = m_txInFlight[Q] + 1;
 
-        // Edge-triggered kick. Harmless if HW is already running.
         writeReg(MACB_NCR, readReg(MACB_NCR) | MACB_BIT(TSTART));
     }
 
@@ -1388,9 +1441,12 @@ private:
         std::size_t freed = 0;
         while (freed < m_txInFlight[Q]) {
             auto& d = txDesc<Q>(scan);
+            // GEM DMA sets TX_USED after transmit — invalidate to see it
+            dcCleanInvalidate(&d);
+            dsbSy();
             const std::uint32_t ctrl =
                 *reinterpret_cast<volatile const std::uint32_t*>(&d.base.ctrl);
-            if (!(ctrl & MACB_BIT(TX_USED))) break;     // oldest descriptor not yet sent
+            if (!(ctrl & MACB_BIT(TX_USED))) break;
             ++freed;
             scan = (scan + 1) & TX_RING_MASK;
         }
