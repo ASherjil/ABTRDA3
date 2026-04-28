@@ -6,7 +6,7 @@
 # Valid transports: "packet_mmap" | "af_xdp" | "intel_i210" | "cadence_gem"
 
 [general]
-watchdog_sec     = 120
+watchdog_sec     = 30
 ether_type       = 0x88B5
 frame_size       = 64
 nic_tuner        = "off"        # "off" | "nfs_safe" (NFS boot) | "full" (dedicated LAN)

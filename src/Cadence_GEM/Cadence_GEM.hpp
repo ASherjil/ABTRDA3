@@ -11,11 +11,13 @@
 #include <fmt/core.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>          // strcasecmp (POSIX, not in std::)
 #include <dirent.h>
 #include <fcntl.h>
 #include <span>
@@ -23,10 +25,14 @@
 #include <string_view>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <net/if.h>
+#include <net/route.h>
 #include <netinet/in.h>
 #include <sched.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -122,40 +128,34 @@ public:
     ~Cadence_GEM() {
         shutdown();
         if (m_unboundDriver) {
-            if (std::getenv("ABTRDA3_REBIND")) {
-                resetForRebind();
-                // Drop SCHED_FIFO + CPU pin BEFORE rebind.  macb_probe
-                // runs in our process context; it triggers uevent helpers,
-                // PHY driver probes, and workqueue items that are
-                // SCHED_NORMAL — they cannot preempt SCHED_FIFO, causing
-                // a priority-inversion deadlock inside the kernel.
-                {
-                    sched_param sp{};
-                    sp.sched_priority = 0;
-                    sched_setscheduler(0, SCHED_OTHER, &sp);
-                    cpu_set_t mask;
-                    CPU_ZERO(&mask);
-                    const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
-                    for (long c = 0; c < (n > 0 ? n : CPU_SETSIZE); ++c) CPU_SET(c, &mask);
-                    ::sched_setaffinity(0, sizeof(mask), &mask);
-                }
-                // Close our /dev/mem mapping so macb_probe's
-                // devm_ioremap_resource doesn't see a conflicting mapping.
-                m_bus.close();
-                rebindKernelDriver();
-                // rebindKernelDriver() sets m_unboundDriver = false on success.
-                // Only run the network/NFS recovery if rebind actually worked —
-                // otherwise end0 isn't back and there's nothing to reconfigure.
-                if (!m_unboundDriver) {
-                    restoreNetworkAndNfs();
-                } else {
-                    fmt::println(stderr,
-                        "[GEM] destructor: rebind failed — skipping network/NFS restore");
-                }
+            resetForRebind();
+            // Drop SCHED_FIFO + CPU pin BEFORE rebind.  macb_probe
+            // runs in our process context; it triggers uevent helpers,
+            // PHY driver probes, and workqueue items that are
+            // SCHED_NORMAL — they cannot preempt SCHED_FIFO, causing
+            // a priority-inversion deadlock inside the kernel.
+            {
+                sched_param sp{};
+                sp.sched_priority = 0;
+                sched_setscheduler(0, SCHED_OTHER, &sp);
+                cpu_set_t mask;
+                CPU_ZERO(&mask);
+                const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+                for (long c = 0; c < (n > 0 ? n : CPU_SETSIZE); ++c) CPU_SET(c, &mask);
+                ::sched_setaffinity(0, sizeof(mask), &mask);
+            }
+            // Close our /dev/mem mapping so macb_probe's
+            // devm_ioremap_resource doesn't see a conflicting mapping.
+            m_bus.close();
+            rebindKernelDriver();
+            // rebindKernelDriver() sets m_unboundDriver = false on success.
+            // Only run the network/NFS recovery if rebind actually worked —
+            // otherwise end0 isn't back and there's nothing to reconfigure.
+            if (!m_unboundDriver) {
+                restoreNetworkAndNfs();
             } else {
                 fmt::println(stderr,
-                    "[GEM] destructor: skipping rebind (ABTRDA3_REBIND not set) — "
-                    "device stays unbound, reboot to restore macb");
+                    "[GEM] destructor: rebind failed — skipping network/NFS restore");
             }
         }
     }
@@ -780,68 +780,179 @@ private:
         fmt::println(stderr, "[GEM] systemd-networkd stop: rc={}", WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
     }
 
+    // Find a netdev whose hardware address matches our GEM MAC (m_mac).
+    // After macb rebinds, udevd may be wedged on NFS and never run the rename
+    // rules — so the new netdev keeps its kernel-default name (eth0 etc.)
+    // instead of becoming end0. Find it by MAC, regardless of name.
+    [[nodiscard]] std::string findNetdevByMac() const noexcept {
+        DIR* d = ::opendir("/sys/class/net");
+        if (!d) return {};
+
+        char want[24];
+        std::snprintf(want, sizeof(want), "%02x:%02x:%02x:%02x:%02x:%02x",
+                      m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);
+
+        std::string found;
+        while (struct dirent* e = ::readdir(d)) {
+            const char* n = e->d_name;
+            if (n[0] == '.') continue;
+            if (std::strcmp(n, "lo") == 0) continue;
+            if (std::strncmp(n, "tap_", 4) == 0) continue;  // skip our own TAP
+
+            std::string path = "/sys/class/net/";
+            path += n;
+            path += "/address";
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            char buf[24]{};
+            const ssize_t r = ::read(fd, buf, sizeof(buf) - 1);
+            ::close(fd);
+            if (r <= 0) continue;
+            std::size_t len = static_cast<std::size_t>(r);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == ' ')) buf[--len] = '\0';
+            if (::strcasecmp(buf, want) == 0) { found = n; break; }
+        }
+        ::closedir(d);
+        return found;
+    }
+
+    // Rename a netdev via SIOCSIFNAME. Interface MUST be administratively
+    // DOWN for the kernel to accept the rename — bring it down first.
+    static bool renameNetdev(const std::string& from, const std::string& to) noexcept {
+        if (from == to) return true;
+        const int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s < 0) return false;
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, from.c_str(), IFNAMSIZ - 1);
+        if (::ioctl(s, SIOCGIFFLAGS, &ifr) >= 0 && (ifr.ifr_flags & IFF_UP)) {
+            ifr.ifr_flags &= ~static_cast<short>(IFF_UP);
+            ::ioctl(s, SIOCSIFFLAGS, &ifr);
+        }
+        std::strncpy(ifr.ifr_name,    from.c_str(), IFNAMSIZ - 1);
+        std::strncpy(ifr.ifr_newname, to.c_str(),   IFNAMSIZ - 1);
+        const int rc = ::ioctl(s, SIOCSIFNAME, &ifr);
+        ::close(s);
+        return rc >= 0;
+    }
+
+    // Bring up + assign IP/netmask + add default route, all via ioctls.
+    // Mirrors the TAP-bridge configuration in TransportDispatch — avoids
+    // forking ip(8) which can wedge if NFS-backed PATH lookup happens.
+    [[nodiscard]] bool configureNetdevByIoctl(const std::string& iface) noexcept {
+        if (m_savedAddr.empty() || m_savedGateway.empty()) {
+            fmt::println(stderr, "[GEM] configureNetdev: no saved address/gateway");
+            return false;
+        }
+        const int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s < 0) {
+            fmt::println(stderr, "[GEM] configureNetdev: socket: {}", std::strerror(errno));
+            return false;
+        }
+
+        // Parse "10.11.33.71/24"
+        std::string ip = m_savedAddr;
+        int prefix = 24;
+        if (auto slash = m_savedAddr.find('/'); slash != std::string::npos) {
+            ip = m_savedAddr.substr(0, slash);
+            prefix = std::stoi(m_savedAddr.substr(slash + 1));
+        }
+
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+
+        // IP
+        auto* sin = reinterpret_cast<sockaddr_in*>(&ifr.ifr_addr);
+        sin->sin_family = AF_INET;
+        ::inet_pton(AF_INET, ip.c_str(), &sin->sin_addr);
+        if (::ioctl(s, SIOCSIFADDR, &ifr) < 0)
+            fmt::println(stderr, "[GEM] SIOCSIFADDR: {}", std::strerror(errno));
+
+        // Netmask
+        auto* nmask = reinterpret_cast<sockaddr_in*>(&ifr.ifr_netmask);
+        nmask->sin_family = AF_INET;
+        nmask->sin_addr.s_addr = htonl(prefix == 0 ? 0U : ~((1U << (32 - prefix)) - 1));
+        if (::ioctl(s, SIOCSIFNETMASK, &ifr) < 0)
+            fmt::println(stderr, "[GEM] SIOCSIFNETMASK: {}", std::strerror(errno));
+
+        // UP + RUNNING
+        if (::ioctl(s, SIOCGIFFLAGS, &ifr) >= 0) {
+            ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+            if (::ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
+                fmt::println(stderr, "[GEM] SIOCSIFFLAGS UP: {}", std::strerror(errno));
+        }
+
+        // Default route via gateway
+        rtentry rt{};
+        reinterpret_cast<sockaddr_in*>(&rt.rt_dst)->sin_family     = AF_INET;
+        reinterpret_cast<sockaddr_in*>(&rt.rt_genmask)->sin_family = AF_INET;
+        auto* gwsin = reinterpret_cast<sockaddr_in*>(&rt.rt_gateway);
+        gwsin->sin_family = AF_INET;
+        ::inet_pton(AF_INET, m_savedGateway.c_str(), &gwsin->sin_addr);
+        rt.rt_flags = RTF_UP | RTF_GATEWAY;
+        char devBuf[IFNAMSIZ]{};
+        std::strncpy(devBuf, iface.c_str(), IFNAMSIZ - 1);
+        rt.rt_dev = devBuf;
+        if (::ioctl(s, SIOCADDRT, &rt) < 0)
+            fmt::println(stderr, "[GEM] SIOCADDRT: {}", std::strerror(errno));
+
+        ::close(s);
+        return true;
+    }
+
     // Restores networking and NFS after macb rebind.
     //
-    // systemd-networkd is dead (stopped before unbind to prevent it from hanging
-    // with threads stuck on NFS). We bypass it entirely and assign the saved
-    // IP/gateway manually with ip(8). NFS hard mounts auto-recover within ~1s
-    // once the TCP path is restored.
+    // udevd may be hung on NFS, so the rebound netdev keeps its kernel-default
+    // name. We find it by MAC, rename to m_ifname if needed, and configure it
+    // entirely via ioctls (no fork/exec, no PATH lookup). NFS hard-mounts
+    // auto-recover within ~1s once the TCP path is back.
     void restoreNetworkAndNfs() noexcept {
         if (std::getenv("ABTRDA3_SKIP_NET_RESTORE")) {
             fmt::println(stderr, "[GEM] ABTRDA3_SKIP_NET_RESTORE set — skipping");
             return;
         }
 
-        constexpr const char* ENV =
-            "PATH=/usr/sbin:/usr/bin:/sbin:/bin "
-            "LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/lib:/usr/lib/aarch64-linux-gnu:/usr/lib";
-        const auto run = [&](const char* label, const char* cmd, int sec) {
-            fmt::println(stderr, "[GEM] {}…", label);
-            const std::string full = fmt::format("{} timeout {} {} >/dev/null 2>&1", ENV, sec, cmd);
-            const int rc = std::system(full.c_str());
-            const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
-            fmt::println(stderr, "[GEM] {} → rc={}", label, code);
-            return code;
-        };
-
-        // 1. Wait for end0 via sysfs (NOT netlink — ip blocks on RTNL mutex
-        //    during deferred NFS teardown after interface removal).
-        fmt::println(stderr, "[GEM] waiting for /sys/class/net/{} …", m_ifname);
-        bool ifaceBack = false;
-        for (int i = 0; i < 150; ++i) {
-            struct stat st{};
-            if (::stat(("/sys/class/net/" + m_ifname).c_str(), &st) == 0) {
-                fmt::println(stderr, "[GEM] {} appeared after ~{} ms", m_ifname, i * 100);
-                ifaceBack = true;
+        // 1. Wait for ANY netdev with our MAC to appear (default name may differ).
+        fmt::println(stderr, "[GEM] scanning /sys/class/net for MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} …",
+                     m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);
+        std::string iface;
+        for (int i = 0; i < 600; ++i) {            // up to 60 s
+            iface = findNetdevByMac();
+            if (!iface.empty()) {
+                fmt::println(stderr, "[GEM] found '{}' after ~{} ms", iface, i * 100);
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        if (!ifaceBack) {
-            fmt::println(stderr, "[GEM] WARNING: {} never appeared — aborting recovery", m_ifname);
+        if (iface.empty()) {
+            fmt::println(stderr, "[GEM] WARNING: no netdev with our MAC after 60 s — aborting recovery");
             return;
         }
 
-        // 2. Manual IP assignment (bypass dead networkd).
-        if (m_savedAddr.empty() || m_savedGateway.empty()) {
-            fmt::println(stderr, "[GEM] no saved network config — cannot restore IP");
-            return;
+        // 2. Rename to m_ifname (e.g. eth0 → end0) if udev didn't.
+        if (iface != m_ifname) {
+            fmt::println(stderr, "[GEM] renaming '{}' → '{}' (udevd hung on NFS, doing it ourselves)",
+                         iface, m_ifname);
+            if (renameNetdev(iface, m_ifname)) {
+                fmt::println(stderr, "[GEM] rename OK");
+                iface = m_ifname;
+            } else {
+                fmt::println(stderr, "[GEM] rename failed: {} — continuing with name '{}'",
+                             std::strerror(errno), iface);
+            }
         }
-        run("ip link set up",
-            fmt::format("ip link set {} up", m_ifname).c_str(), 5);
-        run("ip addr add",
-            fmt::format("ip addr add {} dev {}", m_savedAddr, m_ifname).c_str(), 5);
-        run("ip route add default",
-            fmt::format("ip route add default via {} dev {}", m_savedGateway, m_ifname).c_str(), 5);
 
-        // 3. Wait for PHY link-up via sysfs carrier (no netlink).
+        // 3. Configure: UP + IP + netmask + default route, all via ioctl.
+        if (!configureNetdevByIoctl(iface)) return;
+        fmt::println(stderr, "[GEM] {} configured: addr={} gw={}", iface, m_savedAddr, m_savedGateway);
+
+        // 4. Wait for PHY link-up via sysfs carrier.
         fmt::println(stderr, "[GEM] waiting for PHY link-up (carrier)…");
-        const std::string carrierPath = "/sys/class/net/" + m_ifname + "/carrier";
+        const std::string carrierPath = "/sys/class/net/" + iface + "/carrier";
         for (int i = 0; i < 200; ++i) {
             char buf[4]{};
-            int fd = ::open(carrierPath.c_str(), O_RDONLY);
+            const int fd = ::open(carrierPath.c_str(), O_RDONLY);
             if (fd >= 0) {
-                ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+                const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
                 ::close(fd);
                 if (n > 0 && buf[0] == '1') {
                     fmt::println(stderr, "[GEM] link up after ~{} ms", i * 100);
@@ -851,33 +962,20 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        // 4. Wait for NFS auto-recovery (hard mount retries on its own).
-        fmt::println(stderr, "[GEM] waiting for /usr/local NFS auto-recovery (up to 90s)…");
-        bool nfsOk = false;
+        // 5. Wait for NFS to auto-recover.
+        fmt::println(stderr, "[GEM] waiting for /usr/local NFS auto-recovery (up to 90 s)…");
         for (int i = 0; i < 90; ++i) {
             struct stat st{};
             if (::stat("/usr/local/bin", &st) == 0) {
-                fmt::println(stderr, "[GEM] /usr/local recovered after ~{}s", i);
-                nfsOk = true;
-                break;
+                fmt::println(stderr, "[GEM] /usr/local recovered after ~{} s", i);
+                fmt::println(stderr, "[GEM] network/NFS recovery complete");
+                return;
             }
             if (i > 0 && (i % 15) == 0)
-                fmt::println(stderr, "[GEM] … still waiting ({}s)", i);
+                fmt::println(stderr, "[GEM] … still waiting ({} s)", i);
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        if (!nfsOk)
-            fmt::println(stderr, "[GEM] WARNING: /usr/local did not auto-recover after 90s");
-
-        // 5. Restart autofs NFS mounts.
-        run("systemctl restart remote-fs.target",
-            "systemctl restart remote-fs.target", 20);
-
-        // 6. Restart networkd last (for long-term DHCP lease renewal).
-        //    May timeout — non-critical since our static IP is already working.
-        run("systemctl restart systemd-networkd",
-            "systemctl restart systemd-networkd", 10);
-
-        fmt::println(stderr, "[GEM] network/NFS recovery complete");
+        fmt::println(stderr, "[GEM] WARNING: /usr/local did not auto-recover after 90 s");
     }
 
     void stopMonitoringDaemons() noexcept {
@@ -937,25 +1035,136 @@ private:
         return true;
     }
 
+    // Read a /proc file into a string for diagnostics. Returns empty on error.
+    static std::string readProcFile(const std::string& path) noexcept {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return {};
+        std::string out;
+        char buf[1024];
+        for (;;) {
+            const ssize_t n = ::read(fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            out.append(buf, static_cast<std::size_t>(n));
+        }
+        ::close(fd);
+        return out;
+    }
+
     void rebindKernelDriver() noexcept {
         if (m_driverName.empty() || m_deviceName.empty()) return;
         const std::string bind = "/sys/bus/platform/drivers/" + m_driverName + "/bind";
-        fmt::println(stderr, "[GEM] rebind: opening {}…", bind);
+
+        // macb_probe → __of_mdiobus_register → phy_device_create unconditionally
+        // calls request_module("mdio_bus_phy_id_0x...") even when the matching
+        // PHY driver is built-in.  /sbin/modprobe then searches the modules
+        // tree which lives on /usr/local (NFS via end0 — hung once we unbound
+        // macb).  Modprobe blocks indefinitely, taking macb_probe with it.
+        //
+        // The kernel comment in phy_device_create says request_module failure
+        // is non-fatal: the kernel falls back to built-in driver matching.  So
+        // point /proc/sys/kernel/modprobe at /bin/true for the bind window —
+        // it exits 0 immediately without touching NFS.  Restore afterwards.
+        constexpr const char* kModprobeProc = "/proc/sys/kernel/modprobe";
+        const std::string savedModprobe = readProcFile(kModprobeProc);
+        const std::string trimmedSaved  = savedModprobe.empty() ? std::string{}
+            : savedModprobe.substr(0, savedModprobe.find_last_not_of("\n \t") + 1);
+        const auto writeModprobe = [&](const char* val) noexcept {
+            const int pfd = ::open(kModprobeProc, O_WRONLY);
+            if (pfd < 0) return false;
+            const ssize_t n = ::write(pfd, val, std::strlen(val));
+            ::close(pfd);
+            return n == static_cast<ssize_t>(std::strlen(val));
+        };
+        const bool wrapperSet = writeModprobe("/bin/true");
+        if (wrapperSet) {
+            fmt::println(stderr, "[GEM] rebind: kernel.modprobe '{}' → /bin/true (avoids NFS hang)",
+                         trimmedSaved.empty() ? "(unread)" : trimmedSaved);
+        } else {
+            fmt::println(stderr, "[GEM] rebind: WARNING — failed to override kernel.modprobe ({}) — probe may hang",
+                         std::strerror(errno));
+        }
+
         const int fd = ::open(bind.c_str(), O_WRONLY);
         if (fd < 0) {
-            fmt::println(stderr, "[GEM] rebind: open failed: {}", std::strerror(errno));
+            fmt::println(stderr, "[GEM] rebind: open({}) failed: {}",
+                         bind, std::strerror(errno));
+            if (wrapperSet && !trimmedSaved.empty()) writeModprobe(trimmedSaved.c_str());
             return;
         }
-        // The sysfs write runs macb_probe() synchronously. On FECOS kernel
-        // 6.6.40-xlnxLTS20242-fecos03 this has been seen to hang in phylink
-        // init — if we never see the "write returned" line below, that's it.
-        fmt::println(stderr, "[GEM] rebind: writing '{}' (macb_probe runs synchronously — may hang on FECOS kernel)…",
+
+        fmt::println(stderr, "[GEM] rebind: writing '{}' — macb_probe runs synchronously…",
                      m_deviceName);
-        const ssize_t w = ::write(fd, m_deviceName.data(), m_deviceName.size());
-        fmt::println(stderr, "[GEM] rebind: write returned {} (errno={})",
-                     w, w < 0 ? errno : 0);
+        std::fflush(stderr);
+
+        // Run the sysfs write on a worker thread so we can detect a hang
+        // and capture the worker's kernel stack from /proc/<tid>/stack.
+        std::atomic<bool>     done{false};
+        std::atomic<pid_t>    workerTid{0};
+        ssize_t               writeResult = -1;
+        int                   writeErrno  = 0;
+
+        std::thread worker([&] {
+            workerTid.store(static_cast<pid_t>(::syscall(SYS_gettid)),
+                            std::memory_order_release);
+            writeResult = ::write(fd, m_deviceName.data(), m_deviceName.size());
+            writeErrno  = (writeResult < 0) ? errno : 0;
+            done.store(true, std::memory_order_release);
+        });
+
+        constexpr int TIMEOUT_SEC = 10;
+        for (int i = 0; i < TIMEOUT_SEC * 100; ++i) {
+            if (done.load(std::memory_order_acquire)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        if (!done.load(std::memory_order_acquire)) {
+            const pid_t tid = workerTid.load(std::memory_order_acquire);
+            fmt::println(stderr,
+                "[GEM] rebind: macb_probe HUNG (no return after {} s) — capturing kernel state of worker tid={}",
+                TIMEOUT_SEC, tid);
+
+            // /proc/<tid>/wchan  — symbolic name of the function the task is sleeping in
+            // /proc/<tid>/stack  — full kernel call stack (requires CONFIG_STACKTRACE)
+            // /proc/<tid>/status — task state (D = uninterruptible sleep, R = running)
+            // /proc/<tid>/syscall— current syscall + args, if in one
+            const std::string base = "/proc/" + std::to_string(tid);
+            const std::string wchan   = readProcFile(base + "/wchan");
+            const std::string status  = readProcFile(base + "/status");
+            const std::string syscall = readProcFile(base + "/syscall");
+            const std::string stack   = readProcFile(base + "/stack");
+
+            fmt::println(stderr, "[GEM] === wchan ===\n{}", wchan);
+            fmt::println(stderr, "[GEM] === syscall ===\n{}", syscall);
+            // status is verbose — print only the lines we care about.
+            for (std::size_t pos = 0; pos < status.size();) {
+                const std::size_t eol = status.find('\n', pos);
+                const std::string line = status.substr(pos, eol - pos);
+                if (line.starts_with("State:") || line.starts_with("Name:") ||
+                    line.starts_with("Tgid:")  || line.starts_with("Pid:"))
+                    fmt::println(stderr, "[GEM] status: {}", line);
+                pos = (eol == std::string::npos) ? status.size() : eol + 1;
+            }
+            fmt::println(stderr, "[GEM] === stack (top of kernel call stack — innermost first) ===\n{}",
+                         stack.empty() ? "(empty — CONFIG_STACKTRACE may be off, or 0 if task is running)" : stack);
+            std::fflush(stderr);
+
+            worker.detach();
+            ::close(fd);
+            if (wrapperSet && !trimmedSaved.empty()) writeModprobe(trimmedSaved.c_str());
+            return;
+        }
+
+        worker.join();
         ::close(fd);
-        if (w != static_cast<ssize_t>(m_deviceName.size())) {
+
+        if (wrapperSet && !trimmedSaved.empty()) {
+            writeModprobe(trimmedSaved.c_str());
+            fmt::println(stderr, "[GEM] rebind: kernel.modprobe restored to '{}'", trimmedSaved);
+        }
+
+        fmt::println(stderr, "[GEM] rebind: write returned {} (errno={})",
+                     writeResult, writeErrno);
+        if (writeResult != static_cast<ssize_t>(m_deviceName.size())) {
             fmt::println(stderr, "[GEM] rebind: short write — rebind failed");
             return;
         }

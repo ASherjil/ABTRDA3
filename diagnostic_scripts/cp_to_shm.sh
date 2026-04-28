@@ -3,17 +3,19 @@
 # /dev/shm is tmpfs — RAM-backed, survives the NFS mount dropping when macb is
 # unbound.  Files are written as root so they persist and are ready for sudo.
 #
-# Run from the project root (ABTRDA3/):
-#   ./cp_to_shm.sh
+# Run from anywhere — the script cd's to the project root itself:
+#   ./diagnostic_scripts/cp_to_shm.sh
 # Then on mkdev50:
 #   cd /dev/shm
 #   sudo ./abtrda3_test --txgen --config abtrda3_test.toml --count 100000
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 TARGET=cfd-865-mkdev50
 BIN=build/arm64-release/test/abtrda3_test
 CFG=test/abtrda3_test.toml
-CNT=gem_counter.sh
+CNT=diagnostic_scripts/gem_counter.sh
 
 for f in "$BIN" "$CFG" "$CNT"; do
     if [[ ! -f "$f" ]]; then
@@ -32,4 +34,4 @@ tar cf - "$BIN" "$CFG" "$CNT" \
 echo "Staged to $TARGET:/dev/shm:"
 ssh "$TARGET" "ls -la /dev/shm/abtrda3_test /dev/shm/abtrda3_test.toml /dev/shm/gem_counter.sh"
 echo
-echo "Next on $TARGET:  cd /dev/shm  &&  sudo ABTRDA3_REBIND=1 ./abtrda3_test --txgen --config abtrda3_test.toml"
+echo "Next on $TARGET:  cd /dev/shm  &&  sudo ./abtrda3_test --txgen --config abtrda3_test.toml"
