@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+cd "$(dirname "$0")/.."
+
 # ── 1. Clean or build only ──
 echo "1) Clean + Build"
 echo "2) Build only"

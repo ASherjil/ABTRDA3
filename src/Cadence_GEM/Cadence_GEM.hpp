@@ -1286,7 +1286,12 @@ private:
     void configureNcfgr() noexcept {
         std::uint32_t cfg = 0;
         cfg |= GEM_BF(CLK, GEM_CLK_DIV128);
-        cfg |= MACB_BF(RBOF, 2);                      // RBOF is a MACB-common field
+        // RBOF intentionally left at 0. The kernel macb driver sets
+        // RBOF=2 so the IP header lands on a 4-byte boundary (skb_reserve).
+        // Our PMD does pure L2 work on a custom ethertype — never parses
+        // IP — so the alignment isn't earning anything, and a non-zero
+        // RBOF means rxTryReceive must skip the same N bytes or every
+        // consumer reads junk + truncated dst MAC. Keep it 0.
         cfg |= MACB_BIT(DRFCS);
         cfg |= MACB_BIT(BIG);
         cfg |= MACB_BIT(FD);
