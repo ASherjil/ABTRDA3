@@ -16,7 +16,7 @@ output           = ""
 [server]
 transport    = "cadence_gem"          # runs on cfc-865-mkdev16 (x86_64)
 interface    = "end0"
-driver       = ""                 # kernel driver to unbind for the PMD
+driver       = "macb"                 # kernel driver to unbind for the PMD
 mac          = "fc:0f:e7:1b:8b:55"
 cpu_core     = 1
 xdp_queue_id = 0

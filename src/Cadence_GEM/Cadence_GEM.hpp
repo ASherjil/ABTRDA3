@@ -55,6 +55,124 @@ struct alignas(16) GEMDescriptor64 {
 static_assert(sizeof(GEMDescriptor64) == 16);
 static_assert(std::is_trivially_copyable_v<GEMDescriptor64>);
 
+// =============================================================================
+// CoherentDmaPool — userspace handle for the gem_uio kernel module's coherent
+// DMA buffer (uio mem[1]).  ARM with non-coherent DMA cannot safely back
+// 16-byte descriptors with cached memory: a CPU writeback covers the whole
+// 64-byte cache line and stomps HW writes to neighbouring descriptors.  The
+// kernel solves this with dma_alloc_coherent (= non-cached on this platform);
+// our gem_uio module exposes that buffer to userspace and we mmap it here.
+// =============================================================================
+class CoherentDmaPool {
+public:
+    CoherentDmaPool() = default;
+    CoherentDmaPool(const CoherentDmaPool&)            = delete;
+    CoherentDmaPool& operator=(const CoherentDmaPool&) = delete;
+
+    [[nodiscard]] bool open(const std::string& deviceName) noexcept {
+        // 1. Find /sys/bus/platform/devices/<dev>/uio/uio<N>
+        const std::string uioDir = "/sys/bus/platform/devices/" + deviceName + "/uio";
+        DIR* d = ::opendir(uioDir.c_str());
+        if (!d) {
+            fmt::println(stderr, "[CoherentDma] opendir({}): {}", uioDir, std::strerror(errno));
+            return false;
+        }
+        std::string uioName;
+        while (auto* e = ::readdir(d)) {
+            if (std::strncmp(e->d_name, "uio", 3) == 0 && e->d_name[3] != '\0') {
+                uioName = e->d_name;
+                break;
+            }
+        }
+        ::closedir(d);
+        if (uioName.empty()) {
+            fmt::println(stderr, "[CoherentDma] no uio entry under {}", uioDir);
+            return false;
+        }
+
+        // 2. Read /sys/class/uio/uio<N>/maps/map1/{addr,size}
+        const std::string mapDir = "/sys/class/uio/" + uioName + "/maps/map1";
+        const auto readNumber = [&](const std::string& fname) -> std::uint64_t {
+            const std::string path = mapDir + "/" + fname;
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) return 0;
+            char buf[32]{};
+            (void)::read(fd, buf, sizeof(buf) - 1);
+            ::close(fd);
+            return std::strtoull(buf, nullptr, 0);
+        };
+        m_paddr = readNumber("addr");
+        m_size  = readNumber("size");
+        if (m_paddr == 0 || m_size == 0) {
+            fmt::println(stderr, "[CoherentDma] {}/map1 missing addr/size", mapDir);
+            return false;
+        }
+
+        // 3. mmap from /dev/uio<N> at offset = page_size (UIO map[1] index)
+        const std::string devPath = "/dev/" + uioName;
+        m_fd = ::open(devPath.c_str(), O_RDWR | O_SYNC);
+        if (m_fd < 0) {
+            fmt::println(stderr, "[CoherentDma] open({}): {}", devPath, std::strerror(errno));
+            return false;
+        }
+        const long pageSize = ::sysconf(_SC_PAGESIZE);
+        m_vaddr = ::mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         m_fd, static_cast<off_t>(1L * pageSize));
+        if (m_vaddr == MAP_FAILED) {
+            fmt::println(stderr, "[CoherentDma] mmap({}, off={}): {}",
+                         devPath, pageSize, std::strerror(errno));
+            ::close(m_fd);
+            m_fd = -1;
+            m_vaddr = nullptr;
+            return false;
+        }
+
+        fmt::println(stderr,
+            "[CoherentDma] {} mapped: paddr=0x{:x} vaddr={} size={} (non-cached, kernel-coherent)",
+            devPath, m_paddr, m_vaddr, m_size);
+        return true;
+    }
+
+    void close() noexcept {
+        if (m_vaddr && m_vaddr != MAP_FAILED) {
+            ::munmap(m_vaddr, m_size);
+            m_vaddr = nullptr;
+        }
+        if (m_fd >= 0) {
+            ::close(m_fd);
+            m_fd = -1;
+        }
+    }
+
+    ~CoherentDmaPool() { close(); }
+
+    [[nodiscard]] void* virtAt(std::size_t offset) const noexcept {
+        return static_cast<std::uint8_t*>(m_vaddr) + offset;
+    }
+    [[nodiscard]] std::uint64_t physAt(std::size_t offset) const noexcept {
+        return m_paddr + offset;
+    }
+    [[nodiscard]] std::size_t   size() const noexcept { return m_size; }
+    [[nodiscard]] bool          isOpen() const noexcept { return m_vaddr != nullptr; }
+
+private:
+    int           m_fd{-1};
+    void*         m_vaddr{nullptr};
+    std::uint64_t m_paddr{0};
+    std::size_t   m_size{0};
+};
+
+// View of one descriptor ring inside a CoherentDmaPool.  Carries the same
+// API surface as the prior DMARing<GEMDescriptor64> usage so the rest of
+// the PMD doesn't need to know which backing store is in use.
+struct DescRingSlice {
+    GEMDescriptor64* virt{nullptr};
+    std::uint64_t    phys{0};
+
+    [[nodiscard]] GEMDescriptor64* getHugepageBuffer() const noexcept { return virt; }
+    [[nodiscard]] std::uint64_t    physicalBase()     const noexcept { return phys; }
+};
+
 template<GEMDriverMode M  = GEMDriverMode::RxTx, std::size_t NumRxDesc = 256, std::size_t NumTxDesc = 256, std::size_t BuffSize  = 2048>
 class Cadence_GEM {
     static_assert(M == GEMDriverMode::TxOnly || (NumRxDesc >= 8 && (NumRxDesc & (NumRxDesc - 1)) == 0),
@@ -147,6 +265,11 @@ public:
             // Close our /dev/mem mapping so macb_probe's
             // devm_ioremap_resource doesn't see a conflicting mapping.
             m_bus.close();
+
+            // Unbind gem_uio (closes pool, frees coherent DMA, gates clocks
+            // off via CCF) and clear driver_override so macb can rebind.
+            unbindGemUio();
+
             rebindKernelDriver();
             // rebindKernelDriver() sets m_unboundDriver = false on success.
             // Only run the network/NFS recovery if rebind actually worked —
@@ -189,13 +312,23 @@ public:
         if (!unbindKernelDriver()) return false;
         fmt::println(stderr, "[GEM] init: unbind OK — MMIO still valid");
 
-        // macb_remove() just gated our GEM reference clock off via the Linux
-        // clock framework (CLKACT bits on GEM0_REF_CTRL and GEM_TSU_REF both
-        // cleared). Without this restore, the MAC registers accept writes but
-        // the TX/RX state machines have no clock to run — TXGO latches and
-        // TXCNT stays at 0 forever.
-        fmt::println(stderr, "[GEM] init: restoreGemClocks (macb_remove gated the ref clock off)…");
-        restoreGemClocks();
+        // Bind the gem_uio kernel module to this device.  gem_uio:
+        //   1. Holds the GEM clocks alive via the kernel's CCF (no need
+        //      for the old direct-CRL_APB hack — firmware refcount stays
+        //      correct, macb_probe doesn't hang on rebind later).
+        //   2. Allocates a coherent (non-cached) DMA buffer and exposes it
+        //      via UIO mem[1].  We mmap it for our descriptor rings —
+        //      eliminates the cache-line-vs-DMA writeback race.
+        fmt::println(stderr, "[GEM] init: bindGemUio…");
+        if (!bindGemUio()) {
+            fmt::println(stderr, "[GEM] init: gem_uio bind failed — is the gem_uio.ko module loaded?");
+            return false;
+        }
+        fmt::println(stderr, "[GEM] init: openCoherentDmaPool…");
+        if (!m_descPool.open(m_deviceName)) {
+            fmt::println(stderr, "[GEM] init: failed to open coherent DMA pool from gem_uio");
+            return false;
+        }
 
         fmt::println(stderr, "[GEM] init: resetHw…");           resetHw();
         fmt::println(stderr, "[GEM] init: disableInterrupts…"); disableInterrupts();
@@ -231,6 +364,7 @@ public:
         writeReg(MACB_NCR, ncr);
         disableInterrupts();
     }
+
 
     // Print live silicon counters and per-queue state, alongside our own
     // SW view. Run this BEFORE macb rebind — macb_reset_hw() wipes stats.
@@ -428,10 +562,26 @@ private:
 #endif
     }
 
-    // DSB SY — completion barrier; all prior cache ops globally visible
+    // DSB SY — completion barrier; all prior memory ops globally visible
+    // (system-wide).  Used after descriptor stores before MMIO kicks (TSTART)
+    // and after cache maintenance ops on packet buffers.
     [[gnu::always_inline]] static inline void dsbSy() noexcept {
 #if defined(__aarch64__)
         asm volatile("dsb sy" ::: "memory");
+#else
+        asm volatile("" ::: "memory");
+#endif
+    }
+
+    // DMB ISHLD — load-load barrier within the inner shareable domain.
+    // Subsequent loads cannot be reordered before any preceding load.
+    // Used in rxTryReceive between the RX_USED probe and the dependent
+    // read of ctrl/length, to defeat speculative early-load of ctrl
+    // before HW's USED-bit write becomes observable to us.  Cheap (a
+    // handful of cycles) compared to the full dsbSy.
+    [[gnu::always_inline]] static inline void dmbIshLd() noexcept {
+#if defined(__aarch64__)
+        asm volatile("dmb ishld" ::: "memory");
 #else
         asm volatile("" ::: "memory");
 #endif
@@ -648,62 +798,8 @@ private:
             label, CRL_APB_BASE, g0, g1, g2, g3, tsu);
     }
 
-    // Zynq UltraScale+ CRL_APB (0xff5e0000) holds the reference-clock enables
-    // for all four PS GEMs. macb_remove() calls clk_disable_unprepare() which
-    // drops the refcount to zero and gates GEM0's CLKACT bits off. Without
-    // the reference clock the MAC's TX/RX state machines cannot shift bits
-    // to the PHY — TXGO latches at 1 waiting for carrier sense but TXCNT
-    // stays at 0 forever. We cannot talk to the Linux clock framework from
-    // userspace, so we force the CLKACT bits back on via direct MMIO.
-    //
-    // Bits (observed on mkdev50, kernel 6.6.40-xlnxLTS20242-fecos03):
-    //   GEM0_REF_CTRL @0xff5e0050 — bits 25+26 are the two CLKACT outputs
-    //   GEM_TSU_REF   @0xff5e0100 — bit 24 is CLKACT for the TSU clock
-    void restoreGemClocks() noexcept {
-        constexpr std::uint64_t CRL_APB_BASE     = 0xff5e0000;
-        constexpr std::size_t   CRL_APB_SIZE     = 0x1000;
-        constexpr std::uint32_t GEM_CLKACT_MASK  = (1u << 25) | (1u << 26);
-        constexpr std::uint32_t TSU_CLKACT_MASK  = (1u << 24);
-
-        const int fd = ::open("/dev/mem", O_RDWR | O_SYNC);
-        if (fd < 0) {
-            fmt::println(stderr, "[GEM] restoreGemClocks: /dev/mem open failed: {}",
-                         std::strerror(errno));
-            return;
-        }
-        void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
-                         fd, static_cast<off_t>(CRL_APB_BASE));
-        ::close(fd);
-        if (p == MAP_FAILED) {
-            fmt::println(stderr, "[GEM] restoreGemClocks: mmap CRL_APB failed: {}",
-                         std::strerror(errno));
-            return;
-        }
-        auto* crl = static_cast<volatile std::uint32_t*>(p);
-        const std::uint32_t oldRef = crl[0x050 / 4];
-        const std::uint32_t oldTsu = crl[0x100 / 4];
-        const std::uint32_t newRef = oldRef | GEM_CLKACT_MASK;
-        const std::uint32_t newTsu = oldTsu | TSU_CLKACT_MASK;
-        if (newRef != oldRef) {
-            crl[0x050 / 4] = newRef;
-            fmt::println(stderr,
-                "[GEM] restoreGemClocks: GEM0_REF_CTRL 0x{:08x} -> 0x{:08x} (CLKACT 25+26 forced on)",
-                oldRef, newRef);
-        } else {
-            fmt::println(stderr,
-                "[GEM] restoreGemClocks: GEM0_REF_CTRL 0x{:08x} — CLKACT already on", oldRef);
-        }
-        if (newTsu != oldTsu) {
-            crl[0x100 / 4] = newTsu;
-            fmt::println(stderr,
-                "[GEM] restoreGemClocks: GEM_TSU_REF   0x{:08x} -> 0x{:08x} (CLKACT 24 forced on)",
-                oldTsu, newTsu);
-        } else {
-            fmt::println(stderr,
-                "[GEM] restoreGemClocks: GEM_TSU_REF   0x{:08x} — CLKACT already on", oldTsu);
-        }
-        ::munmap(p, CRL_APB_SIZE);
-    }
+    // (restoreGemClocks removed — clocks are held alive by the gem_uio kernel
+    // module via the proper CCF/firmware path while the PMD owns the device.)
 
     // After a successful macb rebind, end0 is reborn as a fresh netdev but
     // nothing is auto-wired back up:
@@ -1002,6 +1098,61 @@ private:
         }
     }
 
+    // Shared helper: synchronous sysfs write of a string (no trailing newline).
+    [[nodiscard]] static bool sysfsWrite(const std::string& path,
+                                          std::string_view  value) noexcept {
+        const int fd = ::open(path.c_str(), O_WRONLY);
+        if (fd < 0) return false;
+        const ssize_t n = ::write(fd, value.data(), value.size());
+        ::close(fd);
+        return n == static_cast<ssize_t>(value.size());
+    }
+
+    // Is the gem_uio platform driver registered (module loaded)?
+    [[nodiscard]] static bool gemUioAvailable() noexcept {
+        struct stat st{};
+        return ::stat("/sys/bus/platform/drivers/gem_uio", &st) == 0;
+    }
+
+    // Bind the gem_uio kernel module to our device.  Sets driver_override so
+    // the platform bus matches this driver to ff0b0000.ethernet despite the
+    // device's compatible string ("cdns,gem") not naming gem_uio.
+    [[nodiscard]] bool bindGemUio() noexcept {
+        if (!gemUioAvailable()) {
+            fmt::println(stderr, "[GEM] gem_uio module not loaded — `sudo insmod gem_uio.ko` first");
+            return false;
+        }
+
+        const std::string overridePath =
+            "/sys/bus/platform/devices/" + m_deviceName + "/driver_override";
+        if (!sysfsWrite(overridePath, "gem_uio")) {
+            fmt::println(stderr, "[GEM] write driver_override gem_uio failed: {}",
+                         std::strerror(errno));
+            return false;
+        }
+        if (!sysfsWrite("/sys/bus/platform/drivers/gem_uio/bind", m_deviceName)) {
+            fmt::println(stderr, "[GEM] bind gem_uio failed: {}", std::strerror(errno));
+            return false;
+        }
+        m_useGemUio = true;
+        fmt::println(stderr, "[GEM] gem_uio bound — clocks alive via CCF, coherent DMA pool ready");
+        return true;
+    }
+
+    // Unbind gem_uio and clear the driver_override so macb can rebind.
+    void unbindGemUio() noexcept {
+        if (!m_useGemUio) return;
+
+        m_descPool.close();
+
+        const std::string overridePath =
+            "/sys/bus/platform/devices/" + m_deviceName + "/driver_override";
+        (void)sysfsWrite("/sys/bus/platform/drivers/gem_uio/unbind", m_deviceName);
+        (void)sysfsWrite(overridePath, "\n");                          // clear
+        m_useGemUio = false;
+        fmt::println(stderr, "[GEM] gem_uio unbound, driver_override cleared");
+    }
+
     [[nodiscard]] bool unbindKernelDriver() {
         if (m_driverName.empty()) return true;
 
@@ -1226,28 +1377,9 @@ private:
         disableInterrupts();
 
         fmt::println(stderr, "[GEM] resetForRebind: registers cleared");
-
-        // 4. Gate GEM clocks off — undo our restoreGemClocks() so the
-        //    kernel CCF (ref-count = 0 after macb_remove) matches HW.
-        //    macb_probe will call clk_prepare_enable() to turn them on.
-        constexpr std::uint64_t CRL_APB_BASE    = 0xff5e0000;
-        constexpr std::size_t   CRL_APB_SIZE    = 0x1000;
-        constexpr std::uint32_t GEM_CLKACT_MASK = (1u << 25) | (1u << 26);
-        constexpr std::uint32_t TSU_CLKACT_MASK = (1u << 24);
-
-        const int fd = ::open("/dev/mem", O_RDWR | O_SYNC);
-        if (fd >= 0) {
-            void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ | PROT_WRITE,
-                             MAP_SHARED, fd, static_cast<off_t>(CRL_APB_BASE));
-            ::close(fd);
-            if (p != MAP_FAILED) {
-                auto* crl = static_cast<volatile std::uint32_t*>(p);
-                crl[0x050 / 4] = crl[0x050 / 4] & ~GEM_CLKACT_MASK;
-                crl[0x100 / 4] = crl[0x100 / 4] & ~TSU_CLKACT_MASK;
-                ::munmap(p, CRL_APB_SIZE);
-                fmt::println(stderr, "[GEM] resetForRebind: CRL_APB clocks gated off");
-            }
-        }
+        // (Clocks are managed by gem_uio via the kernel CCF; unbinding
+        // gem_uio in the destructor disables them through the proper path,
+        // so no direct CRL_APB writes are needed here.)
     }
 
     // =====================================================================
@@ -1326,23 +1458,44 @@ private:
     // Descriptor rings
     // =====================================================================
     [[nodiscard]] bool initRings() {
-        for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
-            if constexpr (HAS_RX) {
-                if (!m_rxRings[q].allocate(NumRxDesc))                   return fail("RX ring", q);
-                if (!m_rxBuffers[q].allocate(NumRxDesc * BuffSize))      return fail("RX buffers", q);
+        // Descriptor rings come out of the gem_uio coherent DMA pool (mem[1])
+        // — non-cached on ARM, no software cache maintenance needed.  We
+        // partition the pool into 4 contiguous regions: RX[0], RX[1], TX[0],
+        // TX[1] — each NumRxDesc/NumTxDesc descriptors of 16 bytes.
+        constexpr std::size_t rxBytes = NumRxDesc * sizeof(GEMDescriptor64);
+        constexpr std::size_t txBytes = NumTxDesc * sizeof(GEMDescriptor64);
+        const     std::size_t needed  = HAS_RX * GEM_NUM_QUEUES_HW * rxBytes
+                                      + HAS_TX * GEM_NUM_QUEUES_HW * txBytes;
+        if (needed > m_descPool.size()) {
+            fmt::println(stderr, "[GEM] initRings: pool too small ({} need {})",
+                         m_descPool.size(), needed);
+            return false;
+        }
+
+        std::size_t off = 0;
+        if constexpr (HAS_RX) {
+            for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
+                m_rxRings[q].virt = static_cast<GEMDescriptor64*>(m_descPool.virtAt(off));
+                m_rxRings[q].phys = m_descPool.physAt(off);
+                if (!m_rxBuffers[q].allocate(NumRxDesc * BuffSize)) return fail("RX buffers", q);
+                off += rxBytes;
             }
-            if constexpr (HAS_TX) {
-                if (!m_txRings[q].allocate(NumTxDesc))                   return fail("TX ring", q);
-                if (!m_txBuffers[q].allocate(NumTxDesc * BuffSize))      return fail("TX buffers", q);
+        }
+        if constexpr (HAS_TX) {
+            for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
+                m_txRings[q].virt = static_cast<GEMDescriptor64*>(m_descPool.virtAt(off));
+                m_txRings[q].phys = m_descPool.physAt(off);
+                if (!m_txBuffers[q].allocate(NumTxDesc * BuffSize)) return fail("TX buffers", q);
+                off += txBytes;
             }
         }
 
-        // Cold-path init — runtime queue iteration. The hot-path descriptor
-        // accessors (rxDesc<Q>/txDesc<Q>) are compile-time-only; here we walk
-        // the rings directly through the hugepage buffers.
+        // Cold-path init — populate descriptor fields.  Memory is non-cached
+        // (kernel-coherent), so plain stores reach DRAM directly; no dcClean
+        // or dsb needed for descriptors.
         for (std::size_t q = 0; q < GEM_NUM_QUEUES_HW; ++q) {
             if constexpr (HAS_TX) {
-                auto* tx = static_cast<GEMDescriptor64*>(m_txRings[q].getHugepageBuffer());
+                auto* tx = m_txRings[q].virt;
                 for (std::size_t i = 0; i < NumTxDesc; ++i) {
                     tx[i].base.addr  = 0;
                     tx[i].high.addrh = 0;
@@ -1351,10 +1504,9 @@ private:
                     if (i == NumTxDesc - 1) ctrl |= MACB_BIT(TX_WRAP);
                     tx[i].base.ctrl = ctrl;
                 }
-                dcCleanRange(tx, NumTxDesc * sizeof(GEMDescriptor64));
             }
             if constexpr (HAS_RX) {
-                auto* rx = static_cast<GEMDescriptor64*>(m_rxRings[q].getHugepageBuffer());
+                auto* rx = m_rxRings[q].virt;
                 for (std::size_t i = 0; i < NumRxDesc; ++i) {
                     const std::uint64_t buf = m_rxBuffers[q].physicalAddrAt(i * BuffSize);
                     std::uint32_t addrLo = static_cast<std::uint32_t>(buf & ~0x3ULL);
@@ -1364,9 +1516,10 @@ private:
                     rx[i].high.addrh = static_cast<std::uint32_t>(buf >> 32);
                     rx[i].high.resvd = 0;
                 }
-                dcCleanRange(rx, NumRxDesc * sizeof(GEMDescriptor64));
             }
         }
+        // One dsb to publish all descriptor writes to DRAM before HW reads them
+        // (uncached writes still go through a write buffer until drained).
         dsbSy();
         return true;
     }
@@ -1541,13 +1694,13 @@ private:
     [[nodiscard, gnu::always_inline]]
     inline GEMDescriptor64& rxDesc(std::size_t i) noexcept {
         static_assert(Q < GEM_NUM_QUEUES_HW, "queue index out of range");
-        return static_cast<GEMDescriptor64*>(m_rxRings[Q].getHugepageBuffer())[i];
+        return m_rxRings[Q].virt[i];
     }
     template<std::size_t Q>
     [[nodiscard, gnu::always_inline]]
     inline GEMDescriptor64& txDesc(std::size_t i) noexcept {
         static_assert(Q < GEM_NUM_QUEUES_HW, "queue index out of range");
-        return static_cast<GEMDescriptor64*>(m_txRings[Q].getHugepageBuffer())[i];
+        return m_txRings[Q].virt[i];
     }
 
     template<std::size_t Q>
@@ -1557,17 +1710,24 @@ private:
         const std::size_t tail = m_rxTail[Q];
         auto& d = rxDesc<Q>(tail);
 
-        // GEM DMA wrote this descriptor — invalidate so we read from DRAM
-        dcCleanInvalidate(&d);
-        dsbSy();
-
+        // Descriptor lives in the gem_uio coherent DMA pool (non-cached);
+        // a plain volatile load reads the latest GEM-written value with no
+        // cache maintenance.
         const std::uint32_t addr = *reinterpret_cast<volatile const std::uint32_t*>(&d.base.addr);
         if (!(addr & MACB_BIT(RX_USED))) [[likely]] return {};
+
+        // ARM is weakly ordered: the load of ctrl below has only a control
+        // dependency (the if-branch) on the addr load, which AArch64 does
+        // NOT count as ordering.  Insert a load-load barrier so the ctrl
+        // read happens after the USED probe — otherwise the CPU may have
+        // speculatively read a stale ctrl from before HW's RX update.
+        dmbIshLd();
 
         const std::uint32_t ctrl = d.base.ctrl;
         const std::uint32_t len  = ctrl & MACB_RX_FRMLEN_MASK;
 
-        // Invalidate packet data written by GEM DMA
+        // Packet payload still lives on cached hugepages — invalidate before
+        // reading what the GEM DMA-wrote, so we don't see stale CPU cache.
         auto* pkt = m_rxBuffers[Q].template ptrAt<std::uint8_t>(tail * BuffSize);
         dcCleanInvalidateRange(pkt, len);
         dsbSy();
@@ -1595,7 +1755,9 @@ private:
         d.base.ctrl  = 0;
         d.high.addrh = static_cast<std::uint32_t>(buf >> 32);
         d.base.addr  = addr;                 // clears RX_USED — HW can refill
-        dcClean(&d);
+        // Descriptor is in coherent DMA memory — no dcClean needed.  A dsb
+        // ensures the writes drain from the CPU write buffer before the
+        // next HW DMA fetch.
         dsbSy();
 
         m_rxTail[Q] = (tail + 1) & RX_RING_MASK;
@@ -1637,8 +1799,9 @@ private:
         if (wrap) ctrl |= MACB_BIT(TX_WRAP);
 
         d.base.ctrl = ctrl;                  // USED=0 signals HW
-        dcClean(&d);
-        // DSB: all cache cleans globally visible before TSTART (ARM K11.5.4)
+        // Descriptor is non-cached (gem_uio coherent pool) — no dcClean.
+        // DSB drains the packet-buffer dcCleanRange above plus this store
+        // before TSTART (ARM K11.5.4: cache ops + uncached writes).
         dsbSy();
 
         m_txTail[Q]     = (tail + 1) & TX_RING_MASK;
@@ -1655,9 +1818,9 @@ private:
         std::size_t freed = 0;
         while (freed < m_txInFlight[Q]) {
             auto& d = txDesc<Q>(scan);
-            // GEM DMA sets TX_USED after transmit — invalidate to see it
-            dcCleanInvalidate(&d);
-            dsbSy();
+            // Descriptor is in non-cached coherent memory — a plain
+            // volatile load returns the latest GEM-written value with
+            // no cache ops needed.
             const std::uint32_t ctrl =
                 *reinterpret_cast<volatile const std::uint32_t*>(&d.base.ctrl);
             if (!(ctrl & MACB_BIT(TX_USED))) break;
@@ -1681,11 +1844,15 @@ private:
     std::string   m_deviceName;
     std::uint64_t m_mmioBase{};                  // parsed from device name
 
-    std::array<DMARing<GEMDescriptor64>, GEM_NUM_QUEUES_HW> m_rxRings;
+    // Descriptor rings live in the gem_uio module's coherent DMA buffer
+    // (non-cached on ARM).  Packet payload buffers stay on cached hugepages
+    // since we want CPU cache locality there.
+    CoherentDmaPool                                       m_descPool;
+    std::array<DescRingSlice,            GEM_NUM_QUEUES_HW> m_rxRings;
     std::array<HugepageBuffer,           GEM_NUM_QUEUES_HW> m_rxBuffers;
     std::array<std::size_t,              GEM_NUM_QUEUES_HW> m_rxTail{};
 
-    std::array<DMARing<GEMDescriptor64>, GEM_NUM_QUEUES_HW> m_txRings;
+    std::array<DescRingSlice,            GEM_NUM_QUEUES_HW> m_txRings;
     std::array<HugepageBuffer,           GEM_NUM_QUEUES_HW> m_txBuffers;
     std::array<std::size_t,              GEM_NUM_QUEUES_HW> m_txTail{};
     std::array<std::size_t,              GEM_NUM_QUEUES_HW> m_txInFlight{};
@@ -1694,6 +1861,7 @@ private:
     std::array<std::uint8_t, 6> m_mac{};
     std::int8_t                 m_phyAddr{-1};          // set by initPhy scan; -1 = not found
     bool                        m_unboundDriver{false};
+    bool                        m_useGemUio{false};     // gem_uio bound for descriptor pool
     std::string m_savedAddr;        // e.g. "10.11.33.71/24" — captured before unbind
     std::string m_savedGateway;     // e.g. "10.11.33.1" — captured before unbind
 
