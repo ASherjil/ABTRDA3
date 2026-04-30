@@ -639,6 +639,397 @@ The `restoreNetworkAndNfs()` method should follow the same pattern:
 4. Poll carrier via `/sys/class/net/end0/carrier` (no fork)
 5. NFS auto-recovers; `system("systemctl restart remote-fs.target")` for autofs mounts
 
+## Coherent DMA Descriptor Rings — the cache-line writeback race
+
+Investigation date: 2026-04-30
+
+### Symptom
+
+At line rate (~1.488 Mpps for 64-byte L2 frames on 1 GbE), bursts of 200–1000
+packets showed catastrophic loss in *both* directions, while the silicon reported
+clean operation:
+
+| Direction | HW counter | SW saw | Loss |
+|-----------|-----------|--------|------|
+| GEM as RxSink, 200 sent at gap=0 | 200 unicasts received, `resErr=0` | `Accepted=9`, `rx_tail=9` | 95.5 % |
+| GEM as RxSink, 400 sent at gap=0 | 400 received, `resErr=0` | `Accepted=13`, `rx_tail=13` | 96.7 % |
+| GEM as TxGen, 1000 sent at gap=0 | `TX=448`, all received by I210 RxSink | `Sent=447, Failed=553`, `tx_inflight=256` | 55 % "ring full" |
+
+End-state pattern was always the same shape: SW's tail/inflight tracker stuck mid-burst,
+DMA registers (RBQP / TBQP) pointing past it, the descriptor immediately under SW's tail
+read as `USED=0`, the next descriptor `USED=1`, and the rest of the ring untouched.
+
+### Root cause
+
+The Linux macb driver allocates descriptor rings with `dma_alloc_coherent`, which on
+ARM with non-coherent DMA returns Normal Non-Cacheable memory. Our PMD originally
+backed the rings with cached hugepages and bracketed every descriptor access with
+`dc cvac` / `dc civac` + `dsb sy`.
+
+```
+GEMDescriptor64  =  16 bytes
+ARM cache line   =  64 bytes
+                ↓
+4 descriptors share each cache line.
+```
+
+The race plays out over ~hundreds of nanoseconds during a line-rate burst:
+
+```
+T1: HW DMA writes desc[N]   USED=1 to DRAM
+T2: SW tryReceive(N) → reads USED=1, processes packet
+T3: SW release(N) modifies desc[N] fields. The CPU does
+    READ-FOR-OWNERSHIP of cache line covering descs[N..N+3].
+    Snapshot at T3:  desc[N]   USED=1 (HW just wrote)
+                     desc[N+1] USED=0 (HW hasn't written yet)
+                     desc[N+2] USED=0
+                     desc[N+3] USED=0
+T4: HW writes desc[N+1] USED=1 to DRAM.       ← key moment
+T5: SW modifies desc[N] in cache → USED=0.
+T6: dc cvac writes the entire 64-byte line back to DRAM,
+    INCLUDING desc[N+1]'s stale USED=0  ← STOMPS HW's T4 write.
+T7: HW writes desc[N+2] USED=1 (after our writeback — survives).
+T8: HW writes desc[N+3] USED=1 (survives).
+…
+T∞: SW polls desc[N+1], sees USED=0 forever, m_rxTail frozen.
+```
+
+The TX direction has the mirror image: SW's `txAcquire` modifies desc[N], the read-for-ownership picks
+up a stale `TX_USED=0` for desc[N+1] that HW has just transitioned to `TX_USED=1`, the writeback stomps
+it, `txReclaim` can never advance past it, the SW thinks the ring is full, and `Failed` shoots up.
+
+### Diagnostic that confirmed it
+
+A two-stage diagnostic was added during the investigation and **kept in the repository**
+even though the bug is fixed — it is generally useful and zero-overhead unless invoked:
+
+1. `dumpRxDescriptorCacheCoherency<Q>()` — at end-of-test, reads each descriptor twice:
+   once via the cached PMD view (with the same `dc civac + dsb` the hot path performs)
+   and once via a fresh `mmap("/dev/mem", O_SYNC)` of the same physical address (uncached
+   straight-from-DRAM read). Reports any disagreement.
+
+2. `RxWatcher` — a side-thread that, while the test runs, polls the first 32 descriptors
+   through the uncached `/dev/mem` mapping and records every `RX_USED`-bit transition with
+   a `CLOCK_MONOTONIC` timestamp. The "smoking gun" is a `1 → 0` transition on a descriptor
+   the SW never released.
+
+The first run of the cached-vs-uncached diagnostic showed *agreement* between the two
+views, which is misleading — the cache and DRAM agreed because the writeback had already
+corrupted DRAM in the past. The end-state pattern (USED=0 sandwiched between processed and
+unfilled USED=1 ranges, in different positions on every run) is itself the smoking-gun
+signature of partial-cache-line writeback. The watcher trace was muddled by long L2-writeback
+visibility delays on the uncached observer, but corroborated the pattern.
+
+### Fix — `gem_uio` kernel module + coherent DMA pool
+
+A new kernel module `src/Cadence_GEM/gem_uio/` does what the kernel macb driver does
+internally: `dma_alloc_coherent()` for the descriptor region. The module exposes the
+buffer through UIO, so userspace can `mmap` it directly:
+
+```
+mem[0]  GEM register window           (UIO_MEM_PHYS, kernel maps non-cached)
+mem[1]  64 KiB coherent DMA pool      (UIO_MEM_PHYS over dma_alloc_coherent
+                                       — guaranteed non-cached on this platform)
+```
+
+64 KiB easily fits 4 rings × 256 descriptors × 16 B = 16 KiB, with headroom.
+
+The module also holds the GEM clocks alive via the kernel CCF (`clk_prepare_enable`).
+That's a side benefit — the firmware's clock/power-domain state stays consistent
+during the PMD run, which lets us drop the old direct-`CRL_APB`-MMIO-poke that was
+in `restoreGemClocks()` (and the corresponding gate-off poke in `resetForRebind()`).
+
+### Userspace integration
+
+```
++------------------------------------------------------+
+| init() flow                                          |
+|                                                      |
+|   unbind macb                                        |
+|   bindGemUio()                  ← new                |
+|     ↓ writes driver_override = "gem_uio"             |
+|     ↓ writes gem_uio/bind                            |
+|   m_descPool.open(deviceName)   ← new                |
+|     ↓ scans /sys/.../uio/uio<N>                      |
+|     ↓ reads /sys/class/uio/uio<N>/maps/map1/{addr,size} |
+|     ↓ mmap /dev/uio<N> at offset = page_size         |
+|   initRings() partitions pool: RX[0] RX[1] TX[0] TX[1] |
+|   …                                                  |
+|                                                      |
+| destructor flow (mirrors)                            |
+|   m_descPool.close()                                 |
+|   unbindGemUio()                ← new                |
+|   modprobe wrapper + bind macb  (existing)           |
++------------------------------------------------------+
+```
+
+Two new userspace types:
+
+- **`CoherentDmaPool`** — RAII wrapper around `/dev/uio<N>`. Locates the UIO instance
+  for our platform device, mmaps `mem[1]`, exposes `virtAt(off)` / `physAt(off)`.
+- **`DescRingSlice`** — POD `{ GEMDescriptor64* virt; uint64_t phys; }`. Each
+  ring is a slice of the pool. Same API surface as the prior `DMARing<>` so the
+  rest of the PMD didn't change.
+
+### Cache maintenance — what stays, what goes
+
+| Boundary                                          | Before          | After          |
+|---------------------------------------------------|-----------------|----------------|
+| SW writes descriptor field                        | `dc cvac`       | (none)         |
+| SW reads descriptor field                         | `dc civac`      | (none)         |
+| Between USED-bit probe and ctrl/len read          | (relied on `dc civac`) | `dmb ishld` ✱ |
+| SW writes descriptor → kicks `TSTART` MMIO        | `dsb sy`        | `dsb sy` (kept) |
+| SW init descriptors → HW enabled                  | `dsb sy`        | `dsb sy` (kept) |
+| SW writes packet payload (cached) → HW reads      | `dc cvac` range + `dsb sy` | unchanged — payload is still cached |
+| HW writes packet payload (cached) → SW reads      | `dc civac` range + `dsb sy` | unchanged |
+
+✱ ARM is weakly ordered. The branch on `addr & RX_USED` is a control dependency, which
+on AArch64 is *not* sufficient to keep a subsequent load of `ctrl` from being speculatively
+executed before the addr load resolves. A `dmb ishld` (load-load barrier in inner-shareable
+domain, ~few cycles) closes that window.
+
+Cache maintenance ops on **packet buffers** stay because the buffers are still backed by
+cached hugepages — locality on payload bytes is real; spending those cycles is worth it.
+Only the descriptor *rings* moved to coherent memory.
+
+### Result
+
+End-to-end at line-rate burst, 1000 packets, `send_interval_us = 0`:
+
+| Direction                              | Sent | Delivered | Notes |
+|----------------------------------------|------|-----------|-------|
+| GEM TxGen → Intel I210 RxSink          | 1000 | 1000      | `Failed: 0`, HW `TX=1000` |
+| Intel I210 TxGen → GEM RxSink          | 1000 | 1000      | `Accepted: 1000, Rejected: 0`, HW `RX=1257` (incl. 257 broadcasts) |
+
+Cache stomp — gone in both directions.
+
+### Performance footnote — does uncached cost us latency?
+
+Negligibly, possibly imperceptibly, for our access pattern:
+
+- Every cached descriptor access on the old path was *already* a DRAM round-trip,
+  because we explicitly invalidated before every read and flushed after every write.
+  The cache never amortised anything for descriptors — we paid full DRAM latency *plus*
+  the cache-maintenance overhead.
+- Uncached descriptor accesses pay the same DRAM latency (~80–100 ns per access on
+  Cortex-A53) without the cache ops or barriers.
+- Net difference: a few tens of ns per packet, swamped by 670 ns inter-frame time at
+  line rate. Theoretically faster, indistinguishable in practice.
+
+This is also why the kernel macb driver does it this way — `dma_alloc_coherent` for
+descriptors, regular cached pages for skb payload.
+
+## Building gem_uio.ko against a kernel whose source we don't have
+
+Investigation date: 2026-04-30
+
+The FECOS kernel running on `cfd-865-mkdev50` is built from a private git tree at a
+specific commit:
+
+```
+$ uname -r
+6.6.40-xlnxLTS20242-fecos03-1-g8f9a3dc
+                          └─┬──────┘
+                            git short-hash, 1 commit ahead of the fecos03 tag
+```
+
+The available cross-compile headers (`/acc/sys/cdk/linux-headers/`) only carry the
+base `fecos03` headers — not the `-1-g8f9a3dc` topspot. So a module built normally
+gets a `vermagic` of `6.6.40-xlnxLTS20242-fecos03 SMP …` and `insmod` rejects it
+with `Invalid module format`. `CONFIG_MODULE_FORCE_LOAD` is not set on this kernel,
+so `insmod -f` doesn't help. We don't have permission to rebuild the kernel.
+
+### Constraints
+
+| Path | Status |
+|------|--------|
+| `/lib/modules/$(uname -r)/build` | does **not exist** on the device |
+| Modules tree at `/usr/local/lib/modules/<ver>/` | exists, but `modules.dep` etc. are empty (this kernel ships with everything built-in) |
+| Native build | impossible — no kernel build tree on the box |
+| Kernel source for `-1-g8f9a3dc` | not available to us |
+| `CONFIG_MODULE_FORCE_LOAD` | not set → `insmod -f` rejected |
+
+### What works — patch vermagic in the built `.ko`
+
+`gem_uio` only references stable kernel APIs (`clk_*`, `devm_*`, `dma_alloc_coherent`,
+`platform_driver_*`, `uio_*`, `_printk`). None of them is touched by a typical 1-commit
+delta on a maintenance branch. Cross-compile against the closest available headers,
+then **rewrite the vermagic string** in the `.modinfo` ELF section to match the running
+kernel exactly:
+
+```bash
+# 1. Cross-compile against fecos03 headers
+cd src/Cadence_GEM/gem_uio
+make KDIR=/acc/sys/cdk/linux-headers/6.6.40-xlnxLTS20242-fecos03-aarch64 \
+     ARCH=arm64 \
+     CROSS_COMPILE=/acc/sys/cdk/debian/12/aarch64/sysroots/host/usr/bin/aarch64-linux-gnu-
+
+# 2. Extract, patch, write back the .modinfo section
+CROSS=/acc/sys/cdk/debian/12/aarch64/sysroots/host/usr/bin/aarch64-linux-gnu-
+$CROSS objcopy -O binary --only-section=.modinfo gem_uio.ko /tmp/modinfo.bin
+python3 - <<'PY'
+data = open('/tmp/modinfo.bin','rb').read()
+old  = b'6.6.40-xlnxLTS20242-fecos03 SMP'
+new  = b'6.6.40-xlnxLTS20242-fecos03-1-g8f9a3dc SMP'
+assert old in data
+open('/tmp/modinfo.bin','wb').write(data.replace(old, new, 1))
+PY
+$CROSS objcopy --update-section .modinfo=/tmp/modinfo.bin gem_uio.ko
+
+# 3. Verify
+modinfo gem_uio.ko | grep vermagic
+# vermagic: 6.6.40-xlnxLTS20242-fecos03-1-g8f9a3dc SMP mod_unload modversions aarch64
+```
+
+The new vermagic is longer than the old one. `objcopy --update-section` rewrites the
+section size in the ELF header automatically — no manual ELF surgery needed.
+
+### Sanity-check the symbol set before deploying
+
+```bash
+$ aarch64-linux-gnu-nm gem_uio.ko | grep ' U '
+                 U clk_disable
+                 U clk_enable
+                 U clk_prepare
+                 U clk_unprepare
+                 U devm_clk_get
+                 U devm_clk_get_optional
+                 U devm_kmalloc
+                 U devm_platform_get_and_ioremap_resource
+                 U dma_alloc_attrs
+                 U dma_free_attrs
+                 U dma_set_coherent_mask
+                 U dma_set_mask
+                 U __platform_driver_register
+                 U platform_driver_unregister
+                 U _printk
+                 U __stack_chk_fail
+                 U __uio_register_device
+                 U uio_unregister_device
+```
+
+All EXPORT_SYMBOL_GPL/EXPORT_SYMBOL APIs that have been stable since at least 5.x.
+If a future module references something more volatile (e.g. `phylink_*`,
+`netdev_*`, anything from `drivers/net/phy/`), this technique gets riskier — those
+APIs change between kernel patch versions.
+
+### When this technique fails
+
+If the running kernel was built with `CONFIG_MODVERSIONS=y` AND any of the symbols
+you import had its CRC change between the headers' tag and the running kernel,
+`insmod` rejects the module per-symbol with `disagrees about version of symbol …`.
+Hit during the very first attempt with an early version that used `dev_info`,
+`dev_err`, `dev_err_probe` — fixed by switching those to `pr_info` / `pr_err`,
+which use `_printk` (CRC didn't change).
+
+### Operational note for teammates
+
+`insmod` once per boot and the module persists. There is no `modprobe` hook —
+binding only happens when the PMD invokes `bindGemUio()` at runtime via
+`driver_override`. Loading the module by itself doesn't disturb macb.
+
+```bash
+sudo insmod /dev/shm/gem_uio.ko
+lsmod | grep gem_uio                           # should show "gem_uio  12288  0"
+ls /sys/bus/platform/drivers/gem_uio/          # should show bind/unbind/uevent/module
+```
+
+## Cleanup TODO
+
+Tracked items, in approximate priority order. None of these affect correctness of
+the data path — they're polish for the public release.
+
+### 1. Suppress broadcast `resErr` saturation on RX
+
+Symptom: `resErr=262143` (0x3FFFF, 18-bit counter saturated) at end of every
+RxSink test, even though the data path delivers 100 % of the unicasts we care
+about.
+
+Root cause: the GEM has 5 hardware queues (`DCFG6` confirms this). We program
+descriptor rings only for Q0 and Q1. Network broadcasts that the EtherType
+screener doesn't classify get routed by a default policy to one of the unused
+queues (Q2/Q3/Q4), which has no `RBQP` programmed → BNA → `resErr++`.
+
+Three options, pick one:
+
+1. Set `NCFGR.NBC=1` to drop broadcasts at the SA filter (we don't need them
+   for our 0x88B5 traffic — kernel sees broadcasts via the TAP bridge anyway,
+   *if* it's enabled).
+2. Allocate empty descriptor rings for Q2–Q4 so broadcasts have somewhere to
+   land and get ignored cleanly.
+3. Configure a fall-through screener entry that routes everything not matching
+   our EtherType to Q0.
+
+Option 1 is the simplest. Option 3 matches what the kernel macb driver does.
+
+### 2. Fix the trailing `tx_inflight=256` cosmetic
+
+Symptom: at end of TxGen, even when every packet was actually transmitted,
+`tx_inflight` shows 256 because no `txReclaim` is called during the 10 ms
+drain sleep.
+
+Fix: in `run_txgen` after the loop, before the sleep, call `txReclaim` once
+(or repeatedly until `inflight == 0`). One-line change.
+
+### 3. Initialise `m_rxBuffers`/`m_txBuffers` only for queues we actually use
+
+Currently `initRings` allocates `NumRxDesc * BuffSize = 512 KiB` per queue
+and `NumTxDesc * BuffSize = 512 KiB` per queue, for both Q0 and Q1. The
+slow-path Q0 only carries TAP traffic — could use a smaller ring (64 entries)
+to save ~3.5 MiB of hugepages.
+
+Low value; defer until hugepages become tight.
+
+### 4. README.md and one-page architecture diagram
+
+For the GitHub release. Should cover:
+- What this PMD is and isn't (low-latency timing, not a NIC replacement)
+- Hardware support matrix (Intel I210, Cadence GEM)
+- Build, deploy, run instructions
+- The `gem_uio.ko` requirement on Zynq UltraScale+
+- Performance envelope (e.g. "100 % delivery up to ~200 K pps measured;
+  256-descriptor ring depth caps line-rate burst at ~256 packets")
+- Contributing guide
+
+### 5. Optional: silence `RxWatcher` and the cached-vs-uncached dump unless asked
+
+Right now the cache-coherency diagnostic and the watcher fire on every run.
+Now that the bug is fixed and unlikely to return, gate them behind an env var
+(`ABTRDA3_GEM_DESC_DEBUG=1`) so normal runs skip them and have less log spam.
+The watcher already supports this idea — just need to also gate the
+`dumpRxDescriptorCacheCoherency` call.
+
+(Strictly speaking these have already been removed from the live build —
+keep this entry only if you want to preserve them as opt-in diagnostics
+in some branch.)
+
+### 6. Verify the threaded-rebind diagnostic still reports correctly
+
+The hung-probe `/proc/<tid>/stack` capture in `rebindKernelDriver` was
+load-bearing during development. It should still work — but worth a smoke
+test on a kernel where the modprobe wrapper *isn't* applied, just to confirm
+the safety net is intact for future regressions.
+
+### 7. Document the per-queue rings on a schematic
+
+For the README. The four-slice partition of `gem_uio` `mem[1]` is the heart
+of the architecture and not obvious from code alone:
+
+```
+gem_uio mem[1]: 64 KiB coherent DMA at paddr=0x5ff00000
++------------------+
+| RX ring Q0       |  256 desc × 16 B = 4 KiB    @ 0x5ff00000
++------------------+
+| RX ring Q1       |  256 desc × 16 B = 4 KiB    @ 0x5ff01000
++------------------+
+| TX ring Q0       |  256 desc × 16 B = 4 KiB    @ 0x5ff02000
++------------------+
+| TX ring Q1       |  256 desc × 16 B = 4 KiB    @ 0x5ff03000
++------------------+
+|  unused (48 KiB) |
++------------------+
+```
+
 ## Reference Documentation
 
 - Xilinx UG1085: Zynq UltraScale+ TRM, Chapter 16 (GEM)
