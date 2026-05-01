@@ -284,80 +284,61 @@ public:
     }
 
     [[nodiscard]] bool init() {
-        fmt::println(stderr, "[GEM] init: resolveDeviceName…");
         if (!resolveDeviceName()) return false;
-        fmt::println(stderr, "[GEM] init: parseMmioBase ({}) ", m_deviceName);
         if (!parseMmioBase())     return false;
-        // Open MMIO BEFORE unbinding macb so we can snapshot macb's register
-        // baseline. /dev/mem mappings aren't exclusive — both macb's ioremap
-        // and our /dev/mem view of the same physical window can coexist for
-        // read-only diagnostics here.
-        fmt::println(stderr, "[GEM] init: mmap /dev/mem @ 0x{:x} (before unbind, for baseline snapshot)…", m_mmioBase);
         if (!m_bus.open("/dev/mem", m_mmioBase, GEM_MMIO_SIZE)) {
             fmt::println(stderr, "[GEM] mmap of 0x{:x} failed", m_mmioBase);
             return false;
         }
-        fmt::println(stderr, "[GEM] {} mapped at 0x{:x} ({} bytes)",
-                     m_deviceName, m_mmioBase, GEM_MMIO_SIZE);
 
-        dumpRegisterSnapshot("BEFORE unbind (macb baseline)");
-
-        fmt::println(stderr, "[GEM] init: saveNetworkConfig (capture IP/gateway while interface is up)…");
         saveNetworkConfig();
-
-        fmt::println(stderr, "[GEM] init: stopMonitoringDaemons (prevents collectd ethtool oops during unbind window)…");
         stopMonitoringDaemons();
         stopNetworkd();
-        fmt::println(stderr, "[GEM] init: unbindKernelDriver (driver={}) — sysfs write is synchronous", m_driverName);
+
         if (!unbindKernelDriver()) return false;
-        fmt::println(stderr, "[GEM] init: unbind OK — MMIO still valid");
-
-        // Bind the gem_uio kernel module to this device.  gem_uio:
-        //   1. Holds the GEM clocks alive via the kernel's CCF (no need
-        //      for the old direct-CRL_APB hack — firmware refcount stays
-        //      correct, macb_probe doesn't hang on rebind later).
-        //   2. Allocates a coherent (non-cached) DMA buffer and exposes it
-        //      via UIO mem[1].  We mmap it for our descriptor rings —
-        //      eliminates the cache-line-vs-DMA writeback race.
-        fmt::println(stderr, "[GEM] init: bindGemUio…");
         if (!bindGemUio()) {
-            fmt::println(stderr, "[GEM] init: gem_uio bind failed — is the gem_uio.ko module loaded?");
+            fmt::println(stderr, "[GEM] gem_uio bind failed — `sudo insmod gem_uio.ko` first");
             return false;
         }
-        fmt::println(stderr, "[GEM] init: openCoherentDmaPool…");
         if (!m_descPool.open(m_deviceName)) {
-            fmt::println(stderr, "[GEM] init: failed to open coherent DMA pool from gem_uio");
+            fmt::println(stderr, "[GEM] coherent DMA pool open failed");
             return false;
         }
 
-        fmt::println(stderr, "[GEM] init: resetHw…");           resetHw();
-        fmt::println(stderr, "[GEM] init: disableInterrupts…"); disableInterrupts();
-        fmt::println(stderr, "[GEM] init: readMacAddress…");    readMacAddress();
-        fmt::println(stderr, "[GEM] init: setMacAddress…");     setMacAddress();
-        fmt::println(stderr, "[GEM] init: configureNcfgr…");    configureNcfgr();
-        fmt::println(stderr, "[GEM] init: configureDma…");      configureDma();
-        fmt::println(stderr, "[GEM] init: configureUsrio…");    configureUsrio();
+        resetHw();
+        disableInterrupts();
+        readMacAddress();
+        setMacAddress();
+        configureNcfgr();
+        configureDma();
+        configureUsrio();
 
-        fmt::println(stderr, "[GEM] init: initRings (alloc hugepage-backed descriptor rings)…");
         if (!initRings()) return false;
-        fmt::println(stderr, "[GEM] init: initBuffers (program RBQP/TBQP)…");      initBuffers();
-        fmt::println(stderr, "[GEM] init: configureScreeners…");                   configureScreeners();
+        initBuffers();
+        configureScreeners();
 
-        fmt::println(stderr, "[GEM] init: initPhy (MDIO read — may wait for link)…");
         if (!initPhy()) return false;
-        fmt::println(stderr, "[GEM] init: enableRxTx…"); enableRxTx();
+        enableRxTx();
 
-        fmt::println(stderr, "[GEM] Initialised. MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
-                     m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5],
-                     isLinkUp() ? "up" : "down");
-
-        dumpRegisterSnapshot("AFTER init (our config)");
+        fmt::println(stderr,
+            "[GEM] init OK — {} @ 0x{:x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
+            m_deviceName, m_mmioBase,
+            m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5],
+            isLinkUp() ? "up" : "down");
 
         return true;
     }
 
     void shutdown() noexcept {
         if (!m_bus.isOpen()) return;
+        // Reap any TX descriptors HW finished after the dispatcher's drain
+        // sleep — without this, m_txInFlight stays inflated by whatever was
+        // outstanding at the last successful txCommit and the counter dump
+        // shows e.g. tx_inflight=256 even though every packet hit the wire.
+        if constexpr (HAS_TX) {
+            txReclaim<Q_HOT>();
+            txReclaim<Q_SLOW>();
+        }
         dumpHwCounters();
         std::uint32_t ncr = readReg(MACB_NCR);
         ncr &= ~(MACB_BIT(RE) | MACB_BIT(TE));
@@ -728,75 +709,9 @@ private:
     //
     // Best-effort: ignore failures (service may be absent, not running, or we
     // may lack perms). Opt out with ABTRDA3_KEEP_COLLECTD=1 for debugging.
-    // Diagnostic: dump a snapshot of key GEM registers plus the CRL_APB
-    // GEM-clock controls. Called at two points in init() (before unbind —
-    // macb's baseline — and after our own configuration) so a diff of the
-    // log tells us (a) what macb configures that we do not, and (b) whether
-    // macb_remove gated the GEM reference clock off, which would explain
-    // TXGO-latched-but-TXCNT=0. Read-only: safe to call anytime the GEM MMIO
-    // is mapped.
-    void dumpRegisterSnapshot(const char* label) noexcept {
-        if (m_bus.isOpen()) {
-            fmt::println(stderr,
-                "[GEM snapshot {}] GEM regs @0x{:x}:\n"
-                "  NCR     =0x{:08x}  NCFGR   =0x{:08x}  NSR     =0x{:08x}  DMACFG  =0x{:08x}\n"
-                "  TSR     =0x{:08x}  RSR     =0x{:08x}  ISR     =0x{:08x}  IMR     =0x{:08x}\n"
-                "  MAN     =0x{:08x}  USRIO   =0x{:08x}  JML     =0x{:08x}  PBUFRX  =0x{:08x}\n"
-                "  SA1B    =0x{:08x}  SA1T    =0x{:08x}  HRB     =0x{:08x}  HRT     =0x{:08x}\n"
-                "  TBQP(0) =0x{:08x}  RBQP(0) =0x{:08x}  TBQP(1) =0x{:08x}  RBQP(1) =0x{:08x}\n"
-                "  TBQPH   =0x{:08x}  RBQPH   =0x{:08x}  RBQS(1) =0x{:08x}\n"
-                "  ETHT(0) =0x{:08x}  SCRT2(0)=0x{:08x}\n"
-                "  DCFG1   =0x{:08x}  DCFG2   =0x{:08x}  DCFG5   =0x{:08x}  DCFG6   =0x{:08x}",
-                label, m_mmioBase,
-                readReg(MACB_NCR),    readReg(GEM_NCFGR),   readReg(MACB_NSR),    readReg(GEM_DMACFG),
-                readReg(MACB_TSR),    readReg(MACB_RSR),    readReg(MACB_ISR),    readReg(MACB_IMR),
-                readReg(MACB_MAN),    readReg(GEM_USRIO),   readReg(GEM_JML),     readReg(GEM_PBUFRXCUT),
-                readReg(GEM_SA1B),    readReg(GEM_SA1T),    readReg(MACB_HRB),    readReg(MACB_HRT),
-                readReg(qTBQP(0)),    readReg(qRBQP(0)),    readReg(qTBQP(1)),    readReg(qRBQP(1)),
-                readReg(MACB_TBQPH),  readReg(MACB_RBQPH),  readReg(GEM_RBQS(0)),
-                readReg(GEM_ETHT),    readReg(GEM_SCRT2),
-                readReg(GEM_DCFG1),   readReg(GEM_DCFG2),   readReg(GEM_DCFG5),   readReg(GEM_DCFG6));
-        } else {
-            fmt::println(stderr, "[GEM snapshot {}] GEM MMIO not mapped — skipping GEM regs", label);
-        }
-
-        // CRL_APB clock controls — mmap a separate 4 KiB window at 0xff5e0000
-        // just for this read. All four PS GEMs' reference clocks plus the
-        // shared TSU clock live here. Comparing the baseline (macb bound)
-        // against the post-init snapshot tells us whether macb_remove gated
-        // our GEM's reference clock off.
-        constexpr std::uint64_t CRL_APB_BASE = 0xff5e0000;
-        constexpr std::size_t   CRL_APB_SIZE = 0x1000;
-        const int fd = ::open("/dev/mem", O_RDONLY | O_SYNC);
-        if (fd < 0) {
-            fmt::println(stderr, "[GEM snapshot {}] CRL_APB /dev/mem open failed: {}",
-                         label, std::strerror(errno));
-            return;
-        }
-        void* p = ::mmap(nullptr, CRL_APB_SIZE, PROT_READ, MAP_SHARED, fd,
-                         static_cast<off_t>(CRL_APB_BASE));
-        ::close(fd);
-        if (p == MAP_FAILED) {
-            fmt::println(stderr, "[GEM snapshot {}] CRL_APB mmap failed: {}",
-                         label, std::strerror(errno));
-            return;
-        }
-        auto* crl = static_cast<volatile const std::uint32_t*>(p);
-        const std::uint32_t g0  = crl[0x050 / 4];
-        const std::uint32_t g1  = crl[0x054 / 4];
-        const std::uint32_t g2  = crl[0x058 / 4];
-        const std::uint32_t g3  = crl[0x05c / 4];
-        const std::uint32_t tsu = crl[0x100 / 4];
-        ::munmap(p, CRL_APB_SIZE);
-        fmt::println(stderr,
-            "[GEM snapshot {}] CRL_APB @0x{:x}:\n"
-            "  [0x050] GEM0_REF_CTRL = 0x{:08x}   <-- our device (0xff0b0000 = GEM0)\n"
-            "  [0x054] GEM1_REF_CTRL = 0x{:08x}\n"
-            "  [0x058] GEM2_REF_CTRL = 0x{:08x}\n"
-            "  [0x05c] GEM3_REF_CTRL = 0x{:08x}\n"
-            "  [0x100] GEM_TSU_REF   = 0x{:08x}",
-            label, CRL_APB_BASE, g0, g1, g2, g3, tsu);
-    }
+    // (dumpRegisterSnapshot was used during driver bring-up to diff macb's
+    // baseline configuration against ours.  Removed for log hygiene now that
+    // the PMD is stable; recover from git history if future debugging needs it.)
 
     // (restoreGemClocks removed — clocks are held alive by the gem_uio kernel
     // module via the proper CCF/firmware path while the PMD owns the device.)
@@ -867,13 +782,10 @@ private:
     }
 
     void stopNetworkd() noexcept {
-        if (!driverIsBound()) {
-            fmt::println(stderr, "[GEM] macb already unbound — skipping networkd stop");
-            return;
-        }
-        fmt::println(stderr, "[GEM] stopping systemd-networkd (while healthy, before unbind)…");
+        if (!driverIsBound()) return;  // already unbound — nothing to stop
         const int rc = std::system("timeout 5 systemctl stop systemd-networkd >/dev/null 2>&1");
-        fmt::println(stderr, "[GEM] systemd-networkd stop: rc={}", WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+        const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+        if (code != 0) fmt::println(stderr, "[GEM] systemd-networkd stop: rc={}", code);
     }
 
     // Find a netdev whose hardware address matches our GEM MAC (m_mac).
@@ -1094,7 +1006,8 @@ private:
                 "timeout 5 systemctl stop {} >/dev/null 2>&1", svc);
             const int rc = std::system(cmd.c_str());
             const int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
-            fmt::println(stderr, "[GEM] stop {}: rc={}", svc, code);
+            if (code != 0)
+                fmt::println(stderr, "[GEM] stop {}: rc={}", svc, code);
         }
     }
 
@@ -1166,23 +1079,19 @@ private:
         const std::string unbind = "/sys/bus/platform/drivers/" + m_driverName + "/unbind";
         const int fd = ::open(unbind.c_str(), O_WRONLY);
         if (fd < 0) {
-            fmt::println(stderr, "[GEM] open({}) failed", unbind);
+            fmt::println(stderr, "[GEM] open({}) failed: {}", unbind, std::strerror(errno));
             return false;
         }
-
-        // The sysfs write synchronously runs macb_remove() in the kernel.
-        // If it oopses (phylink teardown NULL deref has been seen), we never
-        // come back from this call. Log before AND after so we can tell.
-        fmt::println(stderr, "[GEM] writing '{}' to {}  (kernel runs macb_remove synchronously…)",
-                     m_deviceName, unbind);
+        // Sysfs write runs macb_remove() synchronously in-kernel.
         const ssize_t w = ::write(fd, m_deviceName.data(), m_deviceName.size());
-        fmt::println(stderr, "[GEM] write returned {} (errno={})",
-                     w, w < 0 ? errno : 0);
         ::close(fd);
-        if (w != static_cast<ssize_t>(m_deviceName.size())) return false;
-
+        if (w != static_cast<ssize_t>(m_deviceName.size())) {
+            fmt::println(stderr, "[GEM] unbind {}: write returned {} (errno={})",
+                         m_deviceName, w, w < 0 ? errno : 0);
+            return false;
+        }
         m_unboundDriver = true;
-        fmt::println(stderr, "[GEM] Unbound {} from {}", m_deviceName, m_driverName);
+        fmt::println(stderr, "[GEM] unbound {} from {}", m_deviceName, m_driverName);
         return true;
     }
 
@@ -1227,12 +1136,10 @@ private:
             return n == static_cast<ssize_t>(std::strlen(val));
         };
         const bool wrapperSet = writeModprobe("/bin/true");
-        if (wrapperSet) {
-            fmt::println(stderr, "[GEM] rebind: kernel.modprobe '{}' → /bin/true (avoids NFS hang)",
-                         trimmedSaved.empty() ? "(unread)" : trimmedSaved);
-        } else {
-            fmt::println(stderr, "[GEM] rebind: WARNING — failed to override kernel.modprobe ({}) — probe may hang",
-                         std::strerror(errno));
+        if (!wrapperSet) {
+            fmt::println(stderr,
+                "[GEM] rebind: WARNING — failed to override kernel.modprobe ({}) — probe may hang on NFS",
+                std::strerror(errno));
         }
 
         const int fd = ::open(bind.c_str(), O_WRONLY);
@@ -1242,9 +1149,6 @@ private:
             if (wrapperSet && !trimmedSaved.empty()) writeModprobe(trimmedSaved.c_str());
             return;
         }
-
-        fmt::println(stderr, "[GEM] rebind: writing '{}' — macb_probe runs synchronously…",
-                     m_deviceName);
         std::fflush(stderr);
 
         // Run the sysfs write on a worker thread so we can detect a hang
@@ -1308,19 +1212,15 @@ private:
         worker.join();
         ::close(fd);
 
-        if (wrapperSet && !trimmedSaved.empty()) {
-            writeModprobe(trimmedSaved.c_str());
-            fmt::println(stderr, "[GEM] rebind: kernel.modprobe restored to '{}'", trimmedSaved);
-        }
+        if (wrapperSet && !trimmedSaved.empty()) writeModprobe(trimmedSaved.c_str());
 
-        fmt::println(stderr, "[GEM] rebind: write returned {} (errno={})",
-                     writeResult, writeErrno);
         if (writeResult != static_cast<ssize_t>(m_deviceName.size())) {
-            fmt::println(stderr, "[GEM] rebind: short write — rebind failed");
+            fmt::println(stderr, "[GEM] rebind: short write {} (errno={}) — rebind failed",
+                         writeResult, writeErrno);
             return;
         }
         m_unboundDriver = false;
-        fmt::println(stderr, "[GEM] Rebound {} to {}", m_deviceName, m_driverName);
+        fmt::println(stderr, "[GEM] rebound {} to {}", m_deviceName, m_driverName);
     }
 
     // =====================================================================
@@ -1430,6 +1330,13 @@ private:
         cfg |= GEM_BIT(GBE);
         cfg |= GEM_BIT(RXCOEN);
         cfg |= GEM_BF(DBW, GEM_DBW64);
+        // NBC intentionally NOT set — broadcast/multicast frames pass the
+        // SA filter and get steered by the Type-2 screeners.  Slot 0
+        // matches our 0x88B5 ethertype to Q1 (hot path); slot 1 is a
+        // wildcard fall-through to Q0 (slow path → TAP bridge).  This
+        // keeps the GEM's RX resource error counter at 0 *and* gives the
+        // TAP bridge incoming ARP / DHCP / mDNS so SSH and NFS work
+        // during the PMD run window.  See configureScreeners().
         writeReg(GEM_NCFGR, cfg);
     }
 
@@ -1545,15 +1452,47 @@ private:
     // Screener — steer our EtherType to Q_HOT, everything else to Q_SLOW
     // =====================================================================
     void configureScreeners() noexcept {
-        // GEM_ETHT and GEM_SCRT2 are base addresses; each entry is 4 bytes.
-        constexpr std::uint32_t ETHT_IDX  = 0;
-        constexpr std::uint32_t SCR2_SLOT = 0;
+        // GEM_ETHT and GEM_SCRT2 are register banks — each entry is 4 bytes.
+        // The Cadence GEM evaluates Type-2 screener slots in index order;
+        // the first slot whose enabled compares all match wins, and the
+        // packet is steered to that slot's QUEUE.
+        //
+        // Slot 0: 0x88B5 EtherType  → Q_HOT  (our test traffic, line-rate)
+        // Slot 1: wildcard match    → Q_SLOW (everything else → TAP bridge)
+        //
+        // The slot-1 fall-through is what makes ARP / DHCP / mDNS / general
+        // kernel networking traffic reach the TAP bridge — without it,
+        // unmatched frames hit the GEM's "no descriptor" path on whatever
+        // queue the chip picks as default and the resErr counter saturates.
 
-        writeReg(GEM_ETHT  + (ETHT_IDX  << 2), GEM_LOCAL_EXPERIMENTAL_ETHERTYPE);
-        writeReg(GEM_SCRT2 + (SCR2_SLOT << 2),
+        constexpr std::uint32_t ETHT_HOT_IDX  = 0;
+        constexpr std::uint32_t SCR2_HOT_SLOT = 0;
+
+        // Slot 0 — exact-match the hot-path EtherType, route to Q_HOT
+        writeReg(GEM_ETHT  + (ETHT_HOT_IDX  << 2), GEM_LOCAL_EXPERIMENTAL_ETHERTYPE);
+        writeReg(GEM_SCRT2 + (SCR2_HOT_SLOT << 2),
                    GEM_BF(QUEUE,    Q_HOT)
-                 | GEM_BF(ETHT2IDX, ETHT_IDX)
+                 | GEM_BF(ETHT2IDX, ETHT_HOT_IDX)
                  | GEM_BIT(ETHTEN));
+
+        // Compare register slot 0 — wildcard "match every frame".
+        //   T2CMPW0:  value=0x0000, mask=0x0000  →  (frame & 0) == (0 & 0) → always true
+        //   T2CMPW1:  T2CMPOFST=1 (compare from start of L2 frame),
+        //             T2OFST=0 (byte 0 of frame), T2DISMSK=0 (mask mode)
+        // The compare register pair lives at T2CMPW0/W1 + slot*8.
+        constexpr std::uint32_t T2CMP_WILDCARD_SLOT = 0;
+        writeReg(GEM_T2CMPW0 + (T2CMP_WILDCARD_SLOT << 3), 0x00000000u);
+        writeReg(GEM_T2CMPW1 + (T2CMP_WILDCARD_SLOT << 3),
+                   GEM_BF(T2CMPOFST, 1)   // start at L2 frame offset 0
+                 | GEM_BF(T2OFST,    0)
+                 /* T2DISMSK = 0 → mask-mode 16-bit compare */);
+
+        // Slot 1 — fall-through catch-all, route to Q_SLOW (TAP bridge)
+        constexpr std::uint32_t SCR2_SLOW_SLOT = 1;
+        writeReg(GEM_SCRT2 + (SCR2_SLOW_SLOT << 2),
+                   GEM_BF(QUEUE, Q_SLOW)
+                 | GEM_BF(CMPA,  T2CMP_WILDCARD_SLOT)
+                 | GEM_BIT(CMPAEN));
     }
 
     // =====================================================================
