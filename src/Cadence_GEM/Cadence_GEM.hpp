@@ -474,7 +474,9 @@ public:
     // ---------------------------------------------------------------------
     // Introspection
     // ---------------------------------------------------------------------
-    [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept { return m_mac; }
+    [[nodiscard]] std::array<std::uint8_t, 6> macAddress()    const noexcept { return m_mac; }
+    [[nodiscard]] const std::string&          savedAddr()     const noexcept { return m_savedAddr; }
+    [[nodiscard]] const std::string&          savedGateway()  const noexcept { return m_savedGateway; }
 
     [[nodiscard]] bool isLinkUp() noexcept {
         if (m_phyAddr < 0) return false;

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <net/if.h>           // POSIX — IFNAMSIZ, struct ifreq, IFF_UP/RUNNING.
                               // Use this instead of <linux/if.h> so the kernel
@@ -21,6 +22,7 @@
                               // they define overlapping anonymous unions with
                               // incompatible layouts (ODR-violation warning at
                               // link time on the CERN FECOS sysroot).
+#include <net/route.h>
 #include <linux/if_tun.h>     // TUN/TAP macros (TUNSETIFF, IFF_TAP, IFF_NO_PI)
                               // — standalone, does not pull in <linux/if.h>.
 #include <stdexcept>
@@ -176,5 +178,114 @@ private:
   std::uint64_t m_rxCount{};
   std::uint64_t m_txCount{};
 };
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setupTapAlias — give an existing TAP device the L3 identity of the NIC it's
+// proxying for, via raw ioctls (no fork/exec, no PATH lookup).
+//
+// TapBridge by itself only pumps L2 frames between a NIC's slow-path ring and
+// /dev/net/tun.  For traffic to actually traverse the kernel stack — i.e. for
+// the kernel to accept incoming unicasts addressed to *us* and to generate
+// proper replies/ARPs/ICMPs back through the TAP — the kernel-side end of the
+// TAP needs to look like the NIC we just unbound:
+//
+//   * hwaddr  = NIC's MAC      (so unicast for our MAC isn't rejected)
+//   * IPv4    = saved address  (so the kernel knows what's "our" IP)
+//   * route   = saved gateway  (so outbound traffic goes through tap_<iface>)
+//
+// Caller supplies the values; this helper has no opinion on where they came
+// from.  Returns true if every required ioctl succeeded.  Failures are logged
+// to stderr but do not throw — a partly-configured TAP is still better than
+// no TAP at all (e.g. local subnet ARP may still work without a default route).
+//
+// Why this lives in TapBridge.hpp rather than the NIC class:
+// TapBridge is templated on the TxRing/RxRing concepts and works with any
+// backend.  The L3 identity is logically a TAP-side concern, not a NIC-side
+// one — any future PMD that wants kernel transparency can call this helper
+// without taking on the implementation itself.
+// ─────────────────────────────────────────────────────────────────────────────
+inline bool setupTapAlias(const std::string&                 tapName,
+                          const std::array<std::uint8_t, 6>& mac,
+                          const std::string&                 cidr,     // "10.11.33.71/24"
+                          const std::string&                 gateway)  // "10.11.33.1"
+                          noexcept
+{
+    if (cidr.empty() || gateway.empty()) {
+        std::fprintf(stderr,
+            "[TapBridge] setupTapAlias: empty cidr/gateway — leaving %s without IP/route\n",
+            tapName.c_str());
+        return false;
+    }
+    const int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) {
+        std::fprintf(stderr, "[TapBridge] setupTapAlias: socket: %s\n", std::strerror(errno));
+        return false;
+    }
+
+    ifreq ifr{};
+    std::strncpy(ifr.ifr_name, tapName.c_str(), IFNAMSIZ - 1);
+
+    // Bring DOWN — SIOCSIFHWADDR is rejected on a live interface
+    if (::ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags &= ~static_cast<short>(IFF_UP);
+        ::ioctl(s, SIOCSIFFLAGS, &ifr);
+    }
+
+    // hwaddr ← NIC's MAC
+    ifr.ifr_hwaddr.sa_family = 1;   // ARPHRD_ETHER
+    std::memcpy(ifr.ifr_hwaddr.sa_data, mac.data(), 6);
+    if (::ioctl(s, SIOCSIFHWADDR, &ifr) < 0)
+        std::fprintf(stderr, "[TapBridge] %s: SIOCSIFHWADDR: %s\n", tapName.c_str(), std::strerror(errno));
+
+    // Parse "<ip>/<prefix>" → ip + mask
+    std::string ip = cidr;
+    int prefix = 24;
+    if (auto slash = cidr.find('/'); slash != std::string::npos) {
+        ip = cidr.substr(0, slash);
+        prefix = std::stoi(cidr.substr(slash + 1));
+    }
+
+    auto* sin = reinterpret_cast<sockaddr_in*>(&ifr.ifr_addr);
+    sin->sin_family = AF_INET;
+    ::inet_pton(AF_INET, ip.c_str(), &sin->sin_addr);
+    if (::ioctl(s, SIOCSIFADDR, &ifr) < 0)
+        std::fprintf(stderr, "[TapBridge] %s: SIOCSIFADDR: %s\n", tapName.c_str(), std::strerror(errno));
+
+    auto* nmask = reinterpret_cast<sockaddr_in*>(&ifr.ifr_netmask);
+    nmask->sin_family = AF_INET;
+    nmask->sin_addr.s_addr = htonl(prefix == 0 ? 0U : ~((1U << (32 - prefix)) - 1));
+    if (::ioctl(s, SIOCSIFNETMASK, &ifr) < 0)
+        std::fprintf(stderr, "[TapBridge] %s: SIOCSIFNETMASK: %s\n", tapName.c_str(), std::strerror(errno));
+
+    // Bring UP + RUNNING
+    if (::ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+        if (::ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
+            std::fprintf(stderr, "[TapBridge] %s: SIOCSIFFLAGS UP: %s\n", tapName.c_str(), std::strerror(errno));
+    }
+
+    // Default route via gateway through this TAP
+    rtentry rt{};
+    reinterpret_cast<sockaddr_in*>(&rt.rt_dst)->sin_family     = AF_INET;
+    reinterpret_cast<sockaddr_in*>(&rt.rt_genmask)->sin_family = AF_INET;
+    auto* gwsin = reinterpret_cast<sockaddr_in*>(&rt.rt_gateway);
+    gwsin->sin_family = AF_INET;
+    ::inet_pton(AF_INET, gateway.c_str(), &gwsin->sin_addr);
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    char devBuf[IFNAMSIZ]{};
+    std::strncpy(devBuf, tapName.c_str(), IFNAMSIZ - 1);
+    rt.rt_dev = devBuf;
+    if (::ioctl(s, SIOCADDRT, &rt) < 0)
+        std::fprintf(stderr, "[TapBridge] %s: SIOCADDRT: %s\n", tapName.c_str(), std::strerror(errno));
+
+    ::close(s);
+    std::fprintf(stderr,
+        "[TapBridge] %s alias set: mac=%02x:%02x:%02x:%02x:%02x:%02x addr=%s gw=%s\n",
+        tapName.c_str(),
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        cidr.c_str(), gateway.c_str());
+    return true;
+}
 
 #endif //ABTRDA3_TAPBRIDGE_HPP

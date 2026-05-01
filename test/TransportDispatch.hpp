@@ -63,7 +63,7 @@ void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
 template<TxRing Tx, RxRing Rx>
 [[nodiscard]]
 std::jthread spawnTapDeviceThread(TapBridge<Tx, Rx>& tap) {
-    return std::jthread([&tap](std::stop_token st) {
+    auto t = std::jthread([&tap](std::stop_token st) {
         sched_param sp{};
         pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
 
@@ -74,6 +74,14 @@ std::jthread spawnTapDeviceThread(TapBridge<Tx, Rx>& tap) {
 
         tap(st);
     });
+    // The child inherits our SCHED_FIFO + CPU-1 pin from the runtime setup
+    // and is non-preemptible at equal priority until it runs the
+    // sched_setscheduler/sched_setaffinity prologue above.  Yield long
+    // enough for it to execute that prologue and migrate to another core,
+    // otherwise it never gets CPU during the hot test loop and Q0 fills up
+    // un-drained.  Same trick used in startRxWatcher() during development.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return t;
 }
 
 // ── Transport creation + dispatch ───────────────────────────────────────────
@@ -169,6 +177,15 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         auto& slow = nic.slowPath();
         const std::string tapName = "tap_" + role.interface;
         TapBridge tap(slow, slow, tapName);
+
+        // Hand the TAP the NIC's L3 identity — without this, the kernel won't
+        // recognise traffic the bridge forwards (wrong MAC) and won't have a
+        // route or address to reply on, so SSH/NFS/ICMP all drop.
+        (void)setupTapAlias(tapName,
+                            nic.macAddress(),
+                            nic.savedAddr(),
+                            nic.savedGateway());
+
         std::jthread tapThread = spawnTapDeviceThread(tap);
 
         fmt::println("[{}] Transport: cadence_gem (PMD) on {} (driver={}, tap={})",
