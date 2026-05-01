@@ -1,104 +1,101 @@
-# ABTRDA3
+# Accelerator Beam Transfer Remote Device Access 3 (ABTRDA3)
 
-Ultra-low-latency Ethernet timing library with two transport backends:
-**packet_mmap** and **AF_XDP**.
+Ultra-low-latency Ethernet timing library with four transport backends.
+Sub-25 µs round-trip on stock hardware with a custom poll-mode driver.
 
-## Build
+![Intel I210 packet_mmap latency](test/latency_analysis/packet_mmap_intel_i210.png)
 
-### packet_mmap only (default)
+## Quick start
 
 ```bash
+# Build
 cmake -B build/x86_64-release -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64.cmake \
   -DCMAKE_BUILD_TYPE=Release
-
 cmake --build build/x86_64-release
 ```
 
-### With AF_XDP enabled
-
-Requires `clang` (for BPF compilation) and `libelf`/`zlib` on the build host.
-`libbpf` is fetched automatically via CMake FetchContent.
-
-```bash
-cmake -B build/x86_64-release -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64.cmake \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DABTRDA3_ENABLE_AF_XDP=ON
-
-cmake --build build/x86_64-release
-```
-
-## Configuration
-
-Edit `test/abtrda3_test.toml`:
+**Config** — edit `test/abtrda3_test.toml`:
 
 ```toml
 [general]
-transport    = "packet_mmap"   # "packet_mmap" or "af_xdp"
-ether_type   = 0x88B5
-frame_size   = 64
-watchdog_sec = 30
-
-# packet_mmap settings
-block_size   = 4096
-block_number = 64
+ether_type       = 0x88B5
+frame_size       = 64
+watchdog_sec     = 30
+send_interval_us = 0            # 0 = line rate, 1000 = 1 ms paced
 
 [server]
+transport = "packet_mmap"       # or af_xdp, intel_i210, cadence_gem
 interface = "eno2"
 mac       = "d4:f5:27:2a:a9:59"
 cpu_core  = 4
 
 [client]
+transport = "packet_mmap"
 interface = "eno2"
 mac       = "20:87:56:b6:33:67"
 cpu_core  = 4
-
-[af_xdp]
-queue_id        = 0
-umem_frame_size = 4096
-frame_count     = 64
-zero_copy       = false
-need_wakeup     = true
+count     = 1000
 ```
 
-## Run
-
-The test binary is at `build/x86_64-release/test/abtrda3_test`.
-Copy both the binary and the TOML config to each target machine.
-
-### Server (reflector)
+**Run** — same binary, four modes:
 
 ```bash
-sudo taskset -c 4 ./abtrda3_test --server --config abtrda3_test.toml
+# Ping-pong server (reflector)
+sudo ./abtrda3_test --server --config abtrda3_test.toml
+
+# Ping-pong client (measures RTT in µs)
+sudo ./abtrda3_test --client --count 1000 --config abtrda3_test.toml
+
+# Traffic generator (unidirectional TX)
+sudo ./abtrda3_test --txgen --count 1000000 --config abtrda3_test.toml
+
+# Packet sink (unidirectional RX, validates dst MAC)
+sudo ./abtrda3_test --rxsink --config abtrda3_test.toml
 ```
 
-### Client (latency measurement)
+Server and client pick their transport independently — pair an x86_64 Intel I210
+with an ARM64 Cadence GEM, or two AF_XDP sockets on the same machine.
+
+## Transports
+
+| Transport | Backend | Platforms | Notes |
+|-----------|---------|-----------|-------|
+| `packet_mmap` | AF_PACKET + `TPACKET_V2` rings | Any | Zero-dependency baseline, ~30 µs RTT |
+| `af_xdp` | AF_XDP + XDP redirect | Linux 5.4+ | Higher throughput, needs BPF |
+| `intel_i210` | Custom PMD (unbinds `igb`) | x86_64, I210 only | Sub-25 µs RTT, hardware timestamping |
+| `cadence_gem` | Custom PMD (unbinds `macb`) | ARM64, Zynq UltraScale+ | The only PMD for this hardware — no DPDK driver exists. Built-in TAP bridge keeps SSH/NFS alive while the driver is unbound. |
+
+Cadence GEM requires a one-time `insmod` of the `gem_uio.ko` kernel module
+(provided under `src/Cadence_GEM/gem_uio/`) for coherent DMA descriptor rings.
+
+## Build options
 
 ```bash
-sudo taskset -c 4 ./abtrda3_test --client --count 1000 --config abtrda3_test.toml
+# With AF_XDP (needs clang + libelf + zlib, libbpf fetched automatically)
+cmake -B build/x86_64-release -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DABTRDA3_ENABLE_AF_XDP=ON
+
+# ARM64 cross-compile (FECOS sysroot)
+cmake -B build/arm64-release -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake \
+  -DCMAKE_BUILD_TYPE=Release
 ```
 
-Start the server first, then the client. The client sends `--count` packets
-and prints min/median/max/avg RTT in microseconds.
+## TOML reference
 
-## Switching transports
+Each role specifies its own transport, interface, driver, MAC, and CPU core.
+Transports that unbind a kernel driver (`intel_i210`, `cadence_gem`) require
+the `driver` field. The `mac` is the **destination** MAC for that role.
 
-Change `transport` in the TOML file:
-
-- `"packet_mmap"` — classic packet_mmap rings (works everywhere, no BPF)
-- `"af_xdp"` — AF_XDP with XDP EtherType filter (requires `ABTRDA3_ENABLE_AF_XDP=ON` at build time and `sudo`)
-
-No recompilation needed to switch — same binary, different config value.
-
-## Safety (AF_XDP on NFS boot port)
-
-The XDP filter only redirects EtherType `0x88B5` to userspace.
-All other traffic (NFS, SSH, DHCP) passes through to the kernel untouched.
-If the process exits or crashes, the XDP program is detached automatically.
-
-Manual detach if needed:
-
-```bash
-sudo ip link set <interface> xdp off
+```toml
+[general]         # global settings
+[server]          # --server / --rxsink role
+[client]          # --client / --txgen role
+[packet_mmap]     # block_size, block_number (if using packet_mmap)
+[af_xdp]          # umem_frame_size, frame_count, need_wakeup (if using AF_XDP)
 ```
+
+No recompilation to switch transports — same binary, different `transport` value.
