@@ -181,10 +181,7 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         // Hand the TAP the NIC's L3 identity — without this, the kernel won't
         // recognise traffic the bridge forwards (wrong MAC) and won't have a
         // route or address to reply on, so SSH/NFS/ICMP all drop.
-        (void)setupTapAlias(tapName,
-                            nic.macAddress(),
-                            nic.savedAddr(),
-                            nic.savedGateway());
+        (void)tap.setupAlias(nic.macAddress(), nic.savedAddr(), nic.savedGateway());
 
         std::jthread tapThread = spawnTapDeviceThread(tap);
 
