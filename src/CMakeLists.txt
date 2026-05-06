@@ -40,10 +40,10 @@ target_link_libraries(abtrda3
 # =============================================================================
 
 # 1. Fetch + build libbpf (provides libbpf::libbpf IMPORTED target)
-include(${CMAKE_SOURCE_DIR}/cmake/Libbpf.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Libbpf.cmake)
 
 # 2. Compile XDP filter program and embed as C header
-include(${CMAKE_SOURCE_DIR}/cmake/BpfCompile.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/BpfCompile.cmake)
 bpf_compile(
     TARGET     abtrda3
     SOURCE     "${CMAKE_CURRENT_SOURCE_DIR}/bpf/xdp_filter.bpf.c"

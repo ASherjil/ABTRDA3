@@ -1046,3 +1046,4 @@ gem_uio mem[1]: 64 KiB coherent DMA at paddr=0x5ff00000
   - `InterfaceDiscovery.hpp` — driver unbind/rebind via sysfs
   - `HugepageBuffer.hpp` — replaces `dma_alloc_coherent`
   - `DMARing.hpp` — ring management helpers
+

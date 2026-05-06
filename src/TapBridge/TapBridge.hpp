@@ -25,7 +25,8 @@
 #include <net/route.h>
 #include <linux/if_tun.h>     // TUN/TAP macros (TUNSETIFF, IFF_TAP, IFF_NO_PI)
                               // — standalone, does not pull in <linux/if.h>.
-#include <stdexcept>
+#include <cstdlib>
+#include <fmt/core.h>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -57,21 +58,24 @@ public:
 
     m_fd = ::open("/dev/net/tun", O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (m_fd <0) {
-      throw std::runtime_error{"TapBridge: open /dev/net/tun: " + std::string{std::strerror(errno)}};
+      fmt::print(stderr, "FATAL: TapBridge: open /dev/net/tun: {}\n", std::strerror(errno));
+      std::abort();
     }
 
     ifreq ifr1{};
     ifr1.ifr_flags = IFF_TAP | IFF_NO_PI; // L2 frames, no protocol info header
 
     if (tapName.size() >= IFNAMSIZ) {
-      throw std::invalid_argument{"TapBridge: interface name exceeds IFNAMSIZ"};
+      fmt::print(stderr, "FATAL: TapBridge: interface name exceeds IFNAMSIZ\n");
+      std::abort();
     }
 
     tapName.copy(ifr1.ifr_name, tapName.size());
 
     if (::ioctl(m_fd, TUNSETIFF, &ifr1) < 0) {
       ::close(m_fd);
-      throw std::runtime_error{"TapBridge: TUNSETIFF: " + std::string{std::strerror(errno)}};
+      fmt::print(stderr, "FATAL: TapBridge: TUNSETIFF: {}\n", std::strerror(errno));
+      std::abort();
     }
 
     m_name = ifr1.ifr_name;
@@ -80,7 +84,8 @@ public:
     if (sock < 0) {
       ::close(m_fd);
       m_fd = -1;
-      throw std::runtime_error{"TapBridge: socket() for bringUp: " + std::string{std::strerror(errno)}};
+      fmt::print(stderr, "FATAL: TapBridge: socket() for bringUp: {}\n", std::strerror(errno));
+      std::abort();
     }
 
     ifreq ifr2{}; // reset the ifreq and reuse it

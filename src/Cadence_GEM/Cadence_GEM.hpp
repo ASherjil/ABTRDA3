@@ -684,9 +684,9 @@ private:
                          m_deviceName.c_str());
             return false;
         }
-        try {
-            m_mmioBase = std::stoull(m_deviceName.substr(0, dot), nullptr, 16);
-        } catch (...) {
+        char* end = nullptr;
+        m_mmioBase = std::strtoull(m_deviceName.substr(0, dot).c_str(), &end, 16);
+        if (*end != '\0') {
             std::fprintf(stderr, "[GEM] cannot parse hex prefix of '%s'\n",
                          m_deviceName.c_str());
             return false;
