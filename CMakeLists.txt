@@ -84,7 +84,7 @@ include(FetchContent)
 
 # ABTEdge — kernel-bypass hardware access (Intel I210 DMA, hugepages)
 FetchContent_Declare(abtedge
-    GIT_REPOSITORY ssh://git@gitlab.cern.ch:7999/abt-projects/software/kitr/drivers/abtedge.git
+    GIT_REPOSITORY https://github.com/ASherjil/ABTEdge.git
     GIT_TAG        master
 )
 FetchContent_MakeAvailable(abtedge)

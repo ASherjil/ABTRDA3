@@ -1,5 +1,5 @@
 # =============================================================================
-# x86_64 Cross-Compilation Toolchain (CERN CDK Debian 12)
+# x86_64 Toolchain — CERN CDK Debian 12, with fallback to local compiler
 # =============================================================================
 
 set(CMAKE_SYSTEM_NAME Linux)
@@ -8,22 +8,35 @@ set(CMAKE_SYSTEM_PROCESSOR x86_64)
 # CERN CDK toolchain paths
 set(TOOLCHAIN_ROOT "/acc/sys/cdk/debian/12/x86_64/sysroots/host/usr/bin")
 
-set(CMAKE_C_COMPILER   "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc")
-set(CMAKE_CXX_COMPILER "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-g++")
+if(EXISTS "${TOOLCHAIN_ROOT}")
+    message(STATUS "Toolchain: CERN CDK x86_64 (${TOOLCHAIN_ROOT})")
 
-# Use toolchain's own linker (system /bin/ld is too old for Debian 12 sysroot)
-set(CMAKE_LINKER        "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-ld")
+    set(CMAKE_C_COMPILER   "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc")
+    set(CMAKE_CXX_COMPILER "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-g++")
 
-# LTO requires gcc-ar and gcc-ranlib (they have the LTO plugin)
-set(CMAKE_AR            "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc-ar")
-set(CMAKE_RANLIB        "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc-ranlib")
+    # Use toolchain's own linker (system /bin/ld is too old for Debian 12 sysroot)
+    set(CMAKE_LINKER        "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-ld")
 
-# Tell GCC to find its binutils (linker, assembler) from the toolchain
-add_compile_options(-B${TOOLCHAIN_ROOT})
-add_link_options(-B${TOOLCHAIN_ROOT})
+    # LTO requires gcc-ar and gcc-ranlib (they have the LTO plugin)
+    set(CMAKE_AR            "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc-ar")
+    set(CMAKE_RANLIB        "${TOOLCHAIN_ROOT}/x86_64-linux-gnu-gcc-ranlib")
 
-# Search paths for cross-compilation
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+    # Tell GCC to find its binutils (linker, assembler) from the toolchain
+    add_compile_options(-B${TOOLCHAIN_ROOT})
+    add_link_options(-B${TOOLCHAIN_ROOT})
+
+    # Search paths for cross-compilation
+    set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+else()
+    message(STATUS "Toolchain: local system compiler (CERN CDK not found at ${TOOLCHAIN_ROOT})")
+    # Clear any stale compiler paths from a previous failed configure
+    unset(CMAKE_C_COMPILER CACHE)
+    unset(CMAKE_CXX_COMPILER CACHE)
+    unset(CMAKE_LINKER CACHE)
+    unset(CMAKE_AR CACHE)
+    unset(CMAKE_RANLIB CACHE)
+    # Let CMake discover g++/gcc from PATH — C++20 is already enforced in CMakeLists.txt
+endif()

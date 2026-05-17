@@ -3,6 +3,8 @@
 //
 
 #include "PacketMmapTx.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 
@@ -10,7 +12,8 @@ PacketMmapTx::PacketMmapTx(const RingConfig& cfg)
   :m_frameSize{cfg.blockSize}, m_socketHandler{cfg} {
 
   if (cfg.packetVersion != TPACKET_V2) {
-    throw std::invalid_argument("PacketMmapTx requires the TPACKET_V2 ring configuration");
+    std::fprintf(stderr, "PacketMmapTx: only TPACKET_V2 is supported\n");
+    std::abort();
   }
 
   m_fd        = m_socketHandler.m_fd;

@@ -57,3 +57,29 @@ cmake --build "${build_dir}" -j"$(nproc)"
 
 echo ""
 echo "── Done: ${build_dir} ──"
+
+# ── 4. SCP to remote ──
+echo ""
+echo "── SCP to remote server ──"
+echo "1) Skip"
+echo "2) scp → asherjil@100.72.135.7:~/ABTTiming/ABTRDA3/"
+read -rp "SCP [1/2]: " scp_choice
+
+if [[ "${scp_choice}" == "2" ]]; then
+    remote="asherjil@100.72.135.7:~/ABTTiming/ABTRDA3/"
+    binary="${build_dir}/test/abtrda3_test"
+    config="test/abtrda3_test.toml"
+
+    if [[ ! -f "${binary}" ]]; then
+        echo "ERROR: binary not found: ${binary}"
+        exit 1
+    fi
+    if [[ ! -f "${config}" ]]; then
+        echo "ERROR: config not found: ${config}"
+        exit 1
+    fi
+
+    echo "Transferring abtrda3_test + abtrda3_test.toml → ${remote} ..."
+    scp "${binary}" "${config}" "${remote}"
+    echo "── SCP complete ──"
+fi
