@@ -69,6 +69,7 @@ if [[ "${scp_choice}" == "2" ]]; then
     remote="asherjil@100.72.135.7:~/ABTTiming/ABTRDA3/"
     binary="${build_dir}/test/abtrda3_test"
     config="test/abtrda3_test.toml"
+    bpf="${build_dir}/test/af_xdp_kern.o"
 
     if [[ ! -f "${binary}" ]]; then
         echo "ERROR: binary not found: ${binary}"
@@ -78,8 +79,12 @@ if [[ "${scp_choice}" == "2" ]]; then
         echo "ERROR: config not found: ${config}"
         exit 1
     fi
+    if [[ ! -f "${bpf}" ]]; then
+        echo "ERROR: BPF object not found: ${bpf}"
+        exit 1
+    fi
 
-    echo "Transferring abtrda3_test + abtrda3_test.toml → ${remote} ..."
-    scp "${binary}" "${config}" "${remote}"
+    echo "Transferring abtrda3_test + abtrda3_test.toml + af_xdp_kern.o → ${remote} ..."
+    scp "${binary}" "${config}" "${bpf}" "${remote}"
     echo "── SCP complete ──"
 fi

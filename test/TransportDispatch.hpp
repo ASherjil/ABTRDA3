@@ -9,8 +9,7 @@
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
 #include "AFXDPSocket.hpp"
-#include "AFXDPTx.hpp"
-#include "AFXDPRx.hpp"
+#include "AFXDP.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
@@ -126,15 +125,15 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         xdp_cfg.frameSize  = cfg.xdpUmemFrameSize;
         xdp_cfg.frameCount = cfg.xdpFrameCount;
         xdp_cfg.etherType  = cfg.etherType;
-        xdp_cfg.needWakeup = cfg.xdpNeedWakeup;
+        xdp_cfg.needWakeup  = cfg.xdpNeedWakeup;
+        xdp_cfg.bpfProgPath = "af_xdp_kern.o";  // ethertype 0x88B5 filter
 
         AFXDPSocket sock(xdp_cfg);
-        AFXDPTx tx(sock);
-        AFXDPRx rx(sock);
+        AFXDP<AFXDPMode::RxTx> af_xdp(sock);
 
         fmt::println("[{}] Transport: af_xdp on {} (queue {})",
                      roleName, role.interface, role.xdpQueueId);
-        dispatchMode(tx, rx, mode, cfg, count, stop);
+        dispatchMode(af_xdp, af_xdp, mode, cfg, count, stop);
         return 0;
     }
 

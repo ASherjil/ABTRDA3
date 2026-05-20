@@ -37,8 +37,10 @@ int xdp_filter_ethertype(struct xdp_md* ctx) {
     return XDP_PASS;
   }
 
-  // Redirect to AF_XDP socket on this queue, (third argument pass it to the kernel if no socket is bound)
-  return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
+  // Redirect to AF_XDP socket bound to queue 0.
+  // Using a fixed key (not rx_queue_index) so that RSS on multi-queue NICs
+  // always delivers to our single socket — same behaviour as libxdp's built-in.
+  return bpf_redirect_map(&xsks_map, 0, 0);
 }
 
 char _license[] SEC("license") = "GPL";

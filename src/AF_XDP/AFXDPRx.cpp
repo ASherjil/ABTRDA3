@@ -1,69 +1,56 @@
 //
 // Created by asherjil on 3/3/26.
+// Refactored 5/2026 — libxdp ring access.
 //
 
 #include "AFXDPRx.hpp"
-
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
-AFXDPRx::AFXDPRx(const AFXDPSocket& sock)
+AFXDPRx::AFXDPRx(AFXDPSocket& sock)
   : m_umem{sock.umemArea()},
-    m_rxDescs{sock.rxRing.descs},
-    m_rxProdPtr{sock.rxRing.producer},
-    m_rxConsPtr{sock.rxRing.consumer},
-    m_rxMask{sock.rxRing.mask},
-    m_fillDescs{sock.fillRing.descs},
-    m_fillProdPtr{sock.fillRing.producer},
-    m_fillMask{sock.fillRing.mask},
-    m_fillFlags{sock.fillRing.flags},
+    m_rxRing{&sock.rxRing()},
+    m_fillRing{&sock.fillRing()},
     m_fd{sock.fd()},
     m_needWakeup{sock.needWakeup()} {
 
-  // Pre-fill the Fill ring with RX frame addresses.
-  // RX frames use the second half of UMEM.
-  // This tells the kernel: "here are empty buffers, place received packets here."
+  // Pre-fill the fill ring with RX buffer addresses.
+  // RX frames occupy the second half of UMEM.
   std::uint32_t rxFrames = sock.rxFrames();
-  std::uint32_t txFrames = sock.txFrames();  // offset: RX starts after TX
-  for (std::uint32_t i = 0; i < rxFrames; ++i) {
-    std::uint64_t addr = static_cast<std::uint64_t>(txFrames + i) * sock.frameSize();
-    m_fillDescs[i & m_fillMask] = addr;
+  std::uint32_t txFrames = sock.txFrames();
+
+  // Reserve and fill all RX frames
+  __u32 idx;
+  if (xsk_ring_prod__reserve(m_fillRing, rxFrames, &idx) < rxFrames) {
+    std::fprintf(stderr, "AFXDPRx: fill ring reserve failed\n");
+    std::abort();
   }
 
-  // Publish all Fill ring entries to the kernel
-  m_fillProd = rxFrames;
-  std::atomic_ref<std::uint32_t> fprod(*m_fillProdPtr);
-  fprod.store(m_fillProd, std::memory_order_release);
+  for (std::uint32_t i = 0; i < rxFrames; ++i)
+    *xsk_ring_prod__fill_addr(m_fillRing, idx++) =
+      static_cast<std::uint64_t>(txFrames + i) * sock.frameSize();
+
+  xsk_ring_prod__submit(m_fillRing, rxFrames);
+
+  // Kick the kernel to notice the fill ring buffers
+  if (xsk_ring_prod__needs_wakeup(m_fillRing) || !m_needWakeup)
+    ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
 }
 
 AFXDPRx::AFXDPRx(AFXDPRx&& other) noexcept
-    : m_umem{std::exchange(other.m_umem, nullptr)},
-      m_rxDescs{std::exchange(other.m_rxDescs, nullptr)},
-      m_rxProdPtr{std::exchange(other.m_rxProdPtr, nullptr)},
-      m_rxConsPtr{std::exchange(other.m_rxConsPtr, nullptr)},
-      m_rxCons{std::exchange(other.m_rxCons, 0)},
-      m_rxMask{std::exchange(other.m_rxMask, 0)},
-      m_fillDescs{std::exchange(other.m_fillDescs, nullptr)},
-      m_fillProdPtr{std::exchange(other.m_fillProdPtr, nullptr)},
-      m_fillProd{std::exchange(other.m_fillProd, 0)},
-      m_fillMask{std::exchange(other.m_fillMask, 0)},
-      m_fillFlags{std::exchange(other.m_fillFlags, nullptr)},
-      m_fd{std::exchange(other.m_fd, -1)},
-      m_needWakeup{other.m_needWakeup},
-      m_pendingAddr{other.m_pendingAddr} {}
+  : m_umem{std::exchange(other.m_umem, nullptr)},
+    m_rxRing{std::exchange(other.m_rxRing, nullptr)},
+    m_fillRing{std::exchange(other.m_fillRing, nullptr)},
+    m_fd{std::exchange(other.m_fd, -1)},
+    m_needWakeup{other.m_needWakeup},
+    m_pendingAddr{other.m_pendingAddr} {}
 
 AFXDPRx& AFXDPRx::operator=(AFXDPRx&& other) noexcept {
   if (this != &other) {
     m_umem        = std::exchange(other.m_umem, nullptr);
-    m_rxDescs     = std::exchange(other.m_rxDescs, nullptr);
-    m_rxProdPtr   = std::exchange(other.m_rxProdPtr, nullptr);
-    m_rxConsPtr   = std::exchange(other.m_rxConsPtr, nullptr);
-    m_rxCons      = std::exchange(other.m_rxCons, 0);
-    m_rxMask      = std::exchange(other.m_rxMask, 0);
-    m_fillDescs   = std::exchange(other.m_fillDescs, nullptr);
-    m_fillProdPtr = std::exchange(other.m_fillProdPtr, nullptr);
-    m_fillProd    = std::exchange(other.m_fillProd, 0);
-    m_fillMask    = std::exchange(other.m_fillMask, 0);
-    m_fillFlags   = std::exchange(other.m_fillFlags, nullptr);
+    m_rxRing      = std::exchange(other.m_rxRing, nullptr);
+    m_fillRing    = std::exchange(other.m_fillRing, nullptr);
     m_fd          = std::exchange(other.m_fd, -1);
     m_needWakeup  = other.m_needWakeup;
     m_pendingAddr = other.m_pendingAddr;

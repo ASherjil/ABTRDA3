@@ -15,17 +15,17 @@ output           = ""
 
 [server]
 transport    = "af_xdp"          # runs on cfc-865-mkdev16 (x86_64)
-interface    = "enp1s0f0np0"
+interface    = "enp1s0f1np1"
 driver       = ""                 # kernel driver to unbind for the PMD
-mac          = "40:a6:b7:02:b3:10"
+mac          = "40:a6:b7:02:b3:11"
 cpu_core     = 2
 xdp_queue_id = 0
 
 [client]
 transport    = "af_xdp"         # runs on cfd-865-mkdev50 (aarch64 Zynq UltraScale+)
-interface    = "enp1s0f1np1"
+interface    = "enp1s0f0np0"
 driver       = ""
-mac          = "40:a6:b7:02:b3:11"
+mac          = "40:a6:b7:02:b3:10"
 cpu_core     = 3
 xdp_queue_id = 0
 count        = 1000             # overridable with --count

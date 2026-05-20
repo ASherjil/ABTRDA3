@@ -1,371 +1,312 @@
 //
-// Created by asherjil on 3/3/26.
+// AFXDPSocket — xdpsock-style UMEM + socket + XDP initialisation.
 //
 
 #include "AFXDPSocket.hpp"
-#include "xdp_filter_embed.h"   // generated Phase 2: xdp_filter_bpf[], xdp_filter_bpf_len
 
-#include <bpf/libbpf.h>        // bpf_object__open_mem, bpf_object__load, etc.
-#include <bpf/bpf.h>           // bpf_map_update_elem (low-level syscall wrapper)
+#include <bpf/bpf.h>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
-#include <linux/if_link.h>  // XDP_FLAGS_DRV_MODE, XDP_FLAGS_SKB_MODE
+#include <fmt/core.h>
+#include <linux/if_link.h>
 #include <net/if.h>
+#include <netpacket/packet.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <system_error>
 #include <unistd.h>
 #include <utility>
 
+// Busy-poll socket options (may be missing from older headers).
+#ifndef SO_BUSY_POLL
+#define SO_BUSY_POLL 46
+#endif
+#ifndef SO_PREFER_BUSY_POLL
+#define SO_PREFER_BUSY_POLL 69
+#endif
+#ifndef SO_BUSY_POLL_BUDGET
+#define SO_BUSY_POLL_BUDGET 70
+#endif
+#ifndef SOL_PACKET
+#define SOL_PACKET 263
+#endif
+
 AFXDPSocket::AFXDPSocket(const XdpConfig& cfg)
-  :m_frameSize{cfg.frameSize}, m_txFrameCount{cfg.frameCount / 2}, m_rxFrameCount{cfg.frameCount - m_txFrameCount}, m_needWakeup {cfg.needWakeup} {
-
-  // 1. Create the AF_XDP socket
-  m_fd = ::socket(AF_XDP, SOCK_RAW, 0);
-  if (m_fd < 0) {
-    throw std::system_error(errno, std::generic_category(), "socket(AF_XDP)");
+  : m_frameSize{cfg.frameSize},
+    m_frameCount{cfg.frameCount},
+    m_needWakeup{cfg.needWakeup},
+    m_ifindex{static_cast<int>(::if_nametoindex(cfg.interface))}
+{
+  if (m_ifindex == 0) {
+    fmt::print(stderr, "[AFXDPSocket] bad interface: {}\n", cfg.interface);
+    std::abort();
   }
 
-  // 2. Allocate the UMEM
-  // MAP_ANONYMOUS -> not backed by a file(pure RAM)
-  // MAP_POPULATE -> pre-fault all pages(avoid page faults on hot paths)
-  // MAP_PRIVATE -> our copy no other process uses this
-  m_umemSize = static_cast<std::size_t>(cfg.frameCount) * cfg.frameSize;
-  m_umem = static_cast<std::uint8_t*>(
-    ::mmap(
-      nullptr,
-      m_umemSize,
-      PROT_READ | PROT_WRITE,
-      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
-      -1,
-      0)
-    );
-  if (m_umem == MAP_FAILED) {
-    m_umem = nullptr;
-    throw std::system_error(errno, std::generic_category(), "mmap UMEM");
+  // ── 1. Clean old XDP programs ────────────────────────────────────────
+  bpf_xdp_detach(m_ifindex, XDP_FLAGS_DRV_MODE, nullptr);
+  bpf_xdp_detach(m_ifindex, XDP_FLAGS_SKB_MODE, nullptr);
+
+  // ── 1.5. Load custom BPF if requested (xdpsock: load_xdp_program) ───
+  if (cfg.bpfProgPath && cfg.bpfProgPath[0] != '\0')
+    loadCustomBpf(cfg.bpfProgPath);
+
+  // ── 2. Allocate UMEM buffer (xdpsock: mmap) ─────────────────────────
+  std::size_t umemSize = static_cast<std::size_t>(m_frameCount) * m_frameSize;
+  m_umemBuffer = static_cast<std::uint8_t*>(
+    ::mmap(nullptr, umemSize,
+           PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (m_umemBuffer == MAP_FAILED) {
+    fmt::print(stderr, "[AFXDPSocket] mmap failed: {}\n", std::strerror(errno));
+    std::abort();
   }
 
-  // 3. Register the UMEM with the socket
-  xdp_umem_reg umem_reg{};
-  umem_reg.addr = reinterpret_cast<std::uint64_t>(m_umem);
-  umem_reg.len = m_umemSize;
-  umem_reg.chunk_size = cfg.frameSize;
-  umem_reg.headroom = 0;
-  umem_reg.flags = 0;
+  // ── 3. Create UMEM (xdpsock: xsk_configure_umem) ────────────────────
+  struct xsk_umem_config umem_cfg{};
+  umem_cfg.fill_size     = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2;  // 4096
+  umem_cfg.comp_size     = XSK_RING_CONS__DEFAULT_NUM_DESCS;       // 2048
+  umem_cfg.frame_size    = m_frameSize;
+  umem_cfg.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM;
 
-  if (::setsockopt(m_fd, SOL_XDP, XDP_UMEM_REG, &umem_reg, sizeof(umem_reg)) < 0) {
-    throw std::system_error(errno, std::generic_category(), "XDP_UMEM_REG");
+  int ret = xsk_umem__create(&m_umem, m_umemBuffer, umemSize,
+                             &m_fillRing, &m_compRing, &umem_cfg);
+  if (ret) {
+    fmt::print(stderr, "[AFXDPSocket] xsk_umem__create failed: {}\n", std::strerror(-ret));
+    std::abort();
   }
 
-  // 4. Set the ring sizes
-  // Fill ring: rxFrameCount
-  // Completion ring: txFrameCount
-  // TX ring: txFrameCount
-  // RX ring: rxFrameCount
-  std::uint32_t fillSize = m_rxFrameCount;
-  std::uint32_t compSize = m_txFrameCount;
-  std::uint32_t txSize   = m_txFrameCount;
-  std::uint32_t rxSize   = m_rxFrameCount;
+  // ── 4. Build bind flags (xdpsock: opt_xdp_bind_flags) ───────────────
+  m_bindFlags = XDP_USE_NEED_WAKEUP;
+  if (!m_needWakeup)
+    m_bindFlags &= ~static_cast<std::uint32_t>(XDP_USE_NEED_WAKEUP);
 
-  if (::setsockopt(m_fd, SOL_XDP, XDP_UMEM_FILL_RING,       &fillSize, sizeof(fillSize)) < 0)
-    throw std::system_error(errno, std::generic_category(), "XDP_UMEM_FILL_RING");
-  if (::setsockopt(m_fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &compSize, sizeof(compSize)) < 0)
-    throw std::system_error(errno, std::generic_category(), "XDP_UMEM_COMPLETION_RING");
-  if (::setsockopt(m_fd, SOL_XDP, XDP_TX_RING,              &txSize,   sizeof(txSize)) < 0)
-    throw std::system_error(errno, std::generic_category(), "XDP_TX_RING");
-  if (::setsockopt(m_fd, SOL_XDP, XDP_RX_RING,              &rxSize,   sizeof(rxSize)) < 0)
-    throw std::system_error(errno, std::generic_category(), "XDP_RX_RING");
+  // ── 5. Create socket with fallback chain (xdpsock: xsk_configure_socket)
+  struct xsk_socket_config sock_cfg{};
+  sock_cfg.rx_size      = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+  sock_cfg.tx_size      = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+  // If we loaded a custom BPF, inhibit libxdp's built-in dispatcher.
+  sock_cfg.libxdp_flags = m_customBpf ? XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD : 0;
 
-  // 5. Get ring memory layout and mmap each ring
-  // The mmap page offsets are magic constants defined in if_xdp.h:
-  //   XDP_UMEM_PGOFF_FILL_RING       = 0x100000000
-  //   XDP_UMEM_PGOFF_COMPLETION_RING = 0x180000000
-  //   XDP_PGOFF_TX_RING              = 0x80000000
-  //   XDP_PGOFF_RX_RING              = 0x00000000
-  xdp_mmap_offsets off{};
-  socklen_t optlen = sizeof(off);
-  if (::getsockopt(m_fd, SOL_XDP, XDP_MMAP_OFFSETS, &off, &optlen) < 0) {
-    throw std::system_error(errno, std::generic_category(), "XDP_MMAP_OFFSETS");
-  }
+  const char* bindMode = "generic";
 
-  // Fill ring (user → kernel: "here are empty buffers for RX")
-  m_ringMaps[0].len = off.fr.desc + fillSize * sizeof(std::uint64_t);
-  m_ringMaps[0].ptr = mapRing(m_fd, m_ringMaps[0].len, XDP_UMEM_PGOFF_FILL_RING);
-  wireAddrRing(m_ringMaps[0].ptr, off.fr, fillSize, fillRing);
+  for (auto [xdpFlags, zc, label] : {
+         std::tuple{XDP_FLAGS_DRV_MODE, XDP_ZEROCOPY, "zero-copy"},
+         std::tuple{XDP_FLAGS_DRV_MODE, XDP_COPY,    "native-copy"},
+         std::tuple{XDP_FLAGS_SKB_MODE, XDP_COPY,     "generic"}
+       }) {
+    sock_cfg.xdp_flags  = xdpFlags;
+    sock_cfg.bind_flags = static_cast<__u16>(m_bindFlags | zc);
 
-  // Completion ring (kernel → user: "these TX buffers are done, you can reuse them")
-  m_ringMaps[1].len = off.cr.desc + compSize * sizeof(std::uint64_t);
-  m_ringMaps[1].ptr = mapRing(m_fd, m_ringMaps[1].len, XDP_UMEM_PGOFF_COMPLETION_RING);
-  wireAddrRing(m_ringMaps[1].ptr, off.cr, compSize, compRing);
-
-  // TX ring (user → kernel: "send this frame")
-  m_ringMaps[2].len = off.tx.desc + txSize * sizeof(xdp_desc);
-  m_ringMaps[2].ptr = mapRing(m_fd, m_ringMaps[2].len, XDP_PGOFF_TX_RING);
-  wireDescRing(m_ringMaps[2].ptr, off.tx, txSize, txRing);
-
-  // RX ring (kernel → user: "a frame arrived")
-  m_ringMaps[3].len = off.rx.desc + rxSize * sizeof(xdp_desc);
-  m_ringMaps[3].ptr = mapRing(m_fd, m_ringMaps[3].len, XDP_PGOFF_RX_RING);
-  wireDescRing(m_ringMaps[3].ptr, off.rx, rxSize, rxRing);
-
-  // 6. Load the BPF program from embedded bytes
-  LIBBPF_OPTS(bpf_object_open_opts, open_opts, .object_name = "xdp");
-  m_bpfObj = bpf_object__open_mem(xdp_filter_bpf, xdp_filter_bpf_len, &open_opts);
-  if (!m_bpfObj) {
-    throw std::runtime_error("bpf_object__open_mem failed");
-  }
-
-  // 7. Rewrite target_ethertype before loading
-  struct bpf_map* rodata = bpf_object__find_map_by_name(m_bpfObj, "xdp.rodata");
-  if (!rodata) {
-      // Fallback: search all maps for .rodata (name may vary by libbpf version)
-      struct bpf_map *m;
-      bpf_object__for_each_map(m, m_bpfObj) {
-          if (std::strstr(bpf_map__name(m), ".rodata")) {
-              rodata = m;
-              break;
-          }
-      }
-  }
-  if (rodata) {
-      std::size_t sz = 0;
-      void* init = bpf_map__initial_value(rodata, &sz);
-      if (init && sz >= sizeof(std::uint16_t)) {
-          // .rodata layout: offset 0 = __u16 target_ethertype
-          // (only one global, so offset is always 0)
-          std::memcpy(init, &cfg.etherType, sizeof(cfg.etherType));
-      }
-  }
-
-  // 8. Load the BPF program into the kernel
-  if (bpf_object__load(m_bpfObj) < 0 ) {
-    throw std::runtime_error("bpf_object__load failed (verifier rejected?)");
-  }
-
-  // Get the program fd (handle to the loaded BPF in kernel)
-  struct bpf_program *prog = bpf_object__find_program_by_name(m_bpfObj, "xdp_filter_ethertype");
-  if (!prog)
-    throw std::runtime_error("BPF program 'xdp_filter_ethertype' not found");
-  int prog_fd = bpf_program__fd(prog);
-
-  // Get the xsks_map fd (the XSKMAP our XDP program uses for bpf_redirect_map)
-  struct bpf_map *xsks = bpf_object__find_map_by_name(m_bpfObj, "xsks_map");
-  if (!xsks)
-    throw std::runtime_error("BPF map 'xsks_map' not found");
-  int xsks_map_fd = bpf_map__fd(xsks);
-
-
-  // 9. Attach the XDP program to the network interface
-  //
-  // Auto-detect the best mode by trying from best to worst:
-  //   1. Native/DRV mode — BPF runs in driver NAPI handler (fastest)
-  //   2. Generic/SKB mode — BPF runs in kernel net stack (universal fallback)
-  m_ifindex = static_cast<int>(::if_nametoindex(cfg.interface));
-  if (m_ifindex == 0)
-    throw std::system_error(errno, std::generic_category(), "if_nametoindex");
-
-  auto tryAttach = [&](std::uint32_t flags) -> int {
-    int e = bpf_xdp_attach(m_ifindex, prog_fd, flags, nullptr);
-    if (e == -EEXIST) {
-      bpf_xdp_detach(m_ifindex, flags, nullptr);
-      e = bpf_xdp_attach(m_ifindex, prog_fd, flags, nullptr);
+    if (xsk_socket__create(&m_xsk, cfg.interface, cfg.queueId, m_umem,
+                           &m_rxRing, &m_txRing, &sock_cfg) == 0) {
+      bindMode = label;
+      m_copyMode = (zc == XDP_COPY);
+      if (zc == XDP_ZEROCOPY) m_bindFlags |= XDP_ZEROCOPY;
+      else                    m_bindFlags |= XDP_COPY;
+      break;
     }
-    return e;
-  };
-
-  // Try native XDP first, fall back to generic/SKB
-  m_xdpFlags = XDP_FLAGS_DRV_MODE;
-  if (tryAttach(m_xdpFlags) != 0) {
-    m_xdpFlags = XDP_FLAGS_SKB_MODE;
-    if (tryAttach(m_xdpFlags) != 0)
-      throw std::runtime_error("bpf_xdp_attach failed in both native and generic mode");
   }
-  m_xdpAttached = true;
-  bool nativeXdp = (m_xdpFlags == XDP_FLAGS_DRV_MODE);
 
-  // In generic/SKB mode, always bind to queue 0 — the kernel ignores
-  // hardware queue assignments and only delivers to queue-0-bound sockets.
-  // ntuple steering still provides interrupt isolation at the hardware level.
-  std::uint32_t bindQueue = nativeXdp ? cfg.queueId : 0;
+  if (!m_xsk) {
+    fmt::print(stderr, "[AFXDPSocket] all socket modes failed\n");
+    std::abort();
+  }
 
-  // 10. Register our socket in XSKMAP at the queue we will bind to.
+  fmt::print(stderr, "[AFXDPSocket] {} | fd={} queue={} frames={}\n",
+             bindMode, fd(), cfg.queueId, m_frameCount);
+
+  // ── 5.5 Enable NAPI busy-polling (xdpsock --busy-poll) ──────────────
+  // Drive RX *inline* from recvfrom() on the app core, in the app's own
+  // timeslice. Without this, the RT setup (SCHED_FIFO app pinned to the NIC's
+  // core with RT throttling disabled) starves the NAPI poll and AF_XDP RX
+  // stalls. Requires net.core.busy_poll > 0 (NicTuner sets it).
   {
-    int val = m_fd;
-    std::uint32_t key = bindQueue;
-    if (bpf_map_update_elem(xsks_map_fd, &key, &val, 0) < 0)
-      throw std::system_error(errno, std::generic_category(), "bpf_map_update_elem(xsks_map)");
+    int sfd = fd();
+    int on = 1;
+    if (::setsockopt(sfd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &on, sizeof(on)) < 0)
+      fmt::print(stderr, "[AFXDPSocket] WARN: SO_PREFER_BUSY_POLL: {}\n", std::strerror(errno));
+    int usecs = 20;
+    if (::setsockopt(sfd, SOL_SOCKET, SO_BUSY_POLL, &usecs, sizeof(usecs)) < 0)
+      fmt::print(stderr, "[AFXDPSocket] WARN: SO_BUSY_POLL: {}\n", std::strerror(errno));
+    int budget = static_cast<int>(BATCH_SIZE);
+    if (::setsockopt(sfd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget)) < 0)
+      fmt::print(stderr, "[AFXDPSocket] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
   }
 
-  // 11. Bind socket to interface & queue
-  //
-  // Auto-detect bind mode (best to worst):
-  //   1. XDP_ZEROCOPY — zero-copy DMA (requires driver ndo_xsk_wakeup, native XDP only)
-  //   2. XDP_COPY     — kernel copies to/from UMEM (universal)
-
-  sockaddr_xdp sxdp{};
-  sxdp.sxdp_family   = AF_XDP;
-  sxdp.sxdp_ifindex  = static_cast<std::uint32_t>(m_ifindex);
-  sxdp.sxdp_queue_id = bindQueue;
-
-  const char* bindMode = "copy";
-  bool bound = false;
-
-  // Only try zero-copy if we got native XDP (zero-copy requires DRV mode)
-  if (nativeXdp) {
-    sxdp.sxdp_flags = XDP_ZEROCOPY;
-    if (cfg.needWakeup) sxdp.sxdp_flags |= XDP_USE_NEED_WAKEUP;
-    if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) == 0) {
-      bindMode = "zero-copy";
-      bound = true;
+  // ── 6. If custom BPF loaded, insert socket fd into XSKMAP ────────────
+  if (m_customBpf && m_xdpProg) {
+    // xdpsock: enter_xsks_into_map
+    int xsks_map_fd = -1;
+    struct bpf_object* bpf_obj = xdp_program__bpf_obj(m_xdpProg);
+    struct bpf_map* map = bpf_object__find_map_by_name(bpf_obj, "xsks_map");
+    if (map) {
+      xsks_map_fd = bpf_map__fd(map);
+      int fd_val = xsk_socket__fd(m_xsk);
+      int key = cfg.queueId;  // use queue id as key (matches rx_queue_index in BPF)
+      if (bpf_map_update_elem(xsks_map_fd, &key, &fd_val, 0) != 0)
+        fmt::print(stderr, "[AFXDPSocket] WARN: XSKMAP insert failed: {}\n",
+                   std::strerror(errno));
+      else
+        fmt::print(stderr, "[AFXDPSocket] XSKMAP populated (fd={} key={})\n",
+                   fd_val, key);
+    } else {
+      fmt::print(stderr, "[AFXDPSocket] WARN: xsks_map not found in BPF\n");
     }
   }
 
-  // Fall back to copy mode
-  if (!bound) {
-    sxdp.sxdp_flags = XDP_COPY;
-    if (cfg.needWakeup) sxdp.sxdp_flags |= XDP_USE_NEED_WAKEUP;
-    if (::bind(m_fd, reinterpret_cast<sockaddr*>(&sxdp), sizeof(sxdp)) < 0)
-      throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
+  // ── 7. Promiscuous mode ─────────────────────────────────────────────
+  // Required for the TX-then-RX (client) pattern on i40e zero-copy: the first
+  // sendto() on a freshly-bound XSK leaves the RX queue's unicast filter in a
+  // state where frames to the port's OWN MAC are not delivered to the socket.
+  // Promisc forces the VSI re-arm that fixes it. RX-first sockets don't need
+  // it, but enabling it unconditionally is harmless (the BPF still only
+  // redirects our ethertype; everything else is XDP_PASSed to the kernel).
+  enablePromisc();
+}
+
+void AFXDPSocket::enablePromisc() {
+  // A protocol-0 AF_PACKET socket buffers no packets, but lets us add a
+  // refcounted PACKET_MR_PROMISC membership. The kernel auto-clears promisc
+  // when this fd closes (even on crash) and won't clobber other promisc users.
+  m_promiscFd = ::socket(AF_PACKET, SOCK_RAW, 0);
+  if (m_promiscFd < 0) {
+    fmt::print(stderr, "[AFXDPSocket] WARN: promisc socket: {}\n", std::strerror(errno));
+    return;
+  }
+  struct packet_mreq mreq{};
+  mreq.mr_ifindex = m_ifindex;
+  mreq.mr_type    = PACKET_MR_PROMISC;
+  if (::setsockopt(m_promiscFd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+                   &mreq, sizeof(mreq)) < 0) {
+    fmt::print(stderr, "[AFXDPSocket] WARN: PACKET_MR_PROMISC: {}\n", std::strerror(errno));
+    ::close(m_promiscFd);
+    m_promiscFd = -1;
+    return;
+  }
+  fmt::print(stderr, "[AFXDPSocket] promiscuous mode enabled (ifindex {})\n", m_ifindex);
+}
+
+void AFXDPSocket::loadCustomBpf(const char* path) {
+  // xdpsock: load_xdp_program — note: xdp_program__open_file returns a
+  // pointer that can be an error value; use libxdp_get_error to check.
+  m_xdpProg = xdp_program__open_file(path, nullptr, nullptr);
+  int err = libxdp_get_error(m_xdpProg);
+  if (err) {
+    fmt::print(stderr, "[AFXDPSocket] BPF load failed ({}): {}\n",
+               path, std::strerror(-err));
+    m_xdpProg = nullptr;
+    return;
   }
 
-  std::fprintf(stderr, "[AFXDPSocket] %s XDP, %s | fd=%d queue=%u frames=%u+%u\n",
-               nativeXdp ? "native" : "generic",
-               bindMode,
-               m_fd, bindQueue, m_txFrameCount, m_rxFrameCount);
+  err = xdp_program__attach(m_xdpProg, m_ifindex, XDP_MODE_NATIVE, 0);
+  if (err) {
+    fmt::print(stderr, "[AFXDPSocket] BPF attach failed: {}\n",
+               std::strerror(-err));
+    xdp_program__close(m_xdpProg);
+    m_xdpProg = nullptr;
+    return;
+  }
+
+  m_customBpf = true;
+  fmt::print(stderr, "[AFXDPSocket] custom BPF loaded + attached: {}\n", path);
 }
+
+void AFXDPSocket::populateFillRing() {
+  // xdpsock: xsk_populate_fill_ring — stuff ALL frames into fill ring
+  __u32 idx;
+  int ret = xsk_ring_prod__reserve(&m_fillRing,
+                                   XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
+                                   &idx);
+  if (ret != static_cast<int>(XSK_RING_PROD__DEFAULT_NUM_DESCS * 2)) {
+    fmt::print(stderr, "[AFXDPSocket] fill ring reserve failed: {} != {}\n",
+               ret, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
+    std::abort();
+  }
+
+  for (std::uint32_t i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS * 2; i++)
+    *xsk_ring_prod__fill_addr(&m_fillRing, idx++) =
+      static_cast<std::uint64_t>(i) * m_frameSize;
+
+  xsk_ring_prod__submit(&m_fillRing, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
+
+  // Wake kernel to notice the fill ring
+  if (xsk_ring_prod__needs_wakeup(&m_fillRing) || !m_needWakeup)
+    ::recvfrom(fd(), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+}
+
+// ── Move constructor / assignment ───────────────────────────────────────
 
 AFXDPSocket::AFXDPSocket(AFXDPSocket&& other) noexcept
-      : txRing{other.txRing}, compRing{other.compRing},
-        rxRing{other.rxRing}, fillRing{other.fillRing},
-        m_fd{std::exchange(other.m_fd, -1)},
-        m_umem{std::exchange(other.m_umem, nullptr)},
-        m_umemSize{std::exchange(other.m_umemSize, 0)},
-        m_frameSize{std::exchange(other.m_frameSize, 0)},
-        m_txFrameCount{std::exchange(other.m_txFrameCount, 0)},
-        m_rxFrameCount{std::exchange(other.m_rxFrameCount, 0)},
-        m_needWakeup{other.m_needWakeup},
-        m_bpfObj{std::exchange(other.m_bpfObj, nullptr)},
-        m_ifindex{std::exchange(other.m_ifindex, 0)},
-        m_xdpFlags{other.m_xdpFlags},
-        m_xdpAttached{std::exchange(other.m_xdpAttached, false)} {
-
-  std::copy(std::begin(other.m_ringMaps), std::end(other.m_ringMaps), m_ringMaps);
-  for (auto& rm : other.m_ringMaps) {
-    rm = {};
-  }
-}
+  : m_umem{std::exchange(other.m_umem, nullptr)},
+    m_xsk{std::exchange(other.m_xsk, nullptr)},
+    m_umemBuffer{std::exchange(other.m_umemBuffer, nullptr)},
+    m_xdpProg{std::exchange(other.m_xdpProg, nullptr)},
+    m_promiscFd{std::exchange(other.m_promiscFd, -1)},
+    m_txRing{other.m_txRing},
+    m_rxRing{other.m_rxRing},
+    m_fillRing{other.m_fillRing},
+    m_compRing{other.m_compRing},
+    m_frameSize{other.m_frameSize},
+    m_frameCount{other.m_frameCount},
+    m_needWakeup{other.m_needWakeup},
+    m_copyMode{other.m_copyMode},
+    m_customBpf{other.m_customBpf},
+    m_bindFlags{other.m_bindFlags},
+    m_ifindex{other.m_ifindex}
+{}
 
 AFXDPSocket& AFXDPSocket::operator=(AFXDPSocket&& other) noexcept {
   if (this != &other) {
     cleanup();
-
-    txRing   = other.txRing;   compRing = other.compRing;
-    rxRing   = other.rxRing;   fillRing = other.fillRing;
-
-    m_fd            = std::exchange(other.m_fd, -1);
-    m_umem          = std::exchange(other.m_umem, nullptr);
-    m_umemSize      = std::exchange(other.m_umemSize, 0);
-    m_frameSize     = std::exchange(other.m_frameSize, 0);
-    m_txFrameCount  = std::exchange(other.m_txFrameCount, 0);
-    m_rxFrameCount  = std::exchange(other.m_rxFrameCount, 0);
-    m_needWakeup    = other.m_needWakeup;
-    m_bpfObj        = std::exchange(other.m_bpfObj, nullptr);
-    m_ifindex       = std::exchange(other.m_ifindex, 0);
-    m_xdpFlags      = other.m_xdpFlags;
-    m_xdpAttached   = std::exchange(other.m_xdpAttached, false);
-
-    std::copy(std::begin(other.m_ringMaps), std::end(other.m_ringMaps), m_ringMaps);
-    for (auto& rm : other.m_ringMaps) {
-      rm = {};
-    }
+    m_umem        = std::exchange(other.m_umem, nullptr);
+    m_xsk         = std::exchange(other.m_xsk, nullptr);
+    m_umemBuffer  = std::exchange(other.m_umemBuffer, nullptr);
+    m_xdpProg     = std::exchange(other.m_xdpProg, nullptr);
+    m_promiscFd   = std::exchange(other.m_promiscFd, -1);
+    m_txRing      = other.m_txRing;
+    m_rxRing      = other.m_rxRing;
+    m_fillRing    = other.m_fillRing;
+    m_compRing    = other.m_compRing;
+    m_frameSize   = other.m_frameSize;
+    m_frameCount  = other.m_frameCount;
+    m_needWakeup  = other.m_needWakeup;
+    m_copyMode    = other.m_copyMode;
+    m_customBpf   = other.m_customBpf;
+    m_bindFlags   = other.m_bindFlags;
+    m_ifindex     = other.m_ifindex;
   }
   return *this;
 }
 
-AFXDPSocket::~AFXDPSocket() {
-  cleanup();
-}
+// ── Destructor / cleanup ────────────────────────────────────────────────
 
-void AFXDPSocket::detachXdp() noexcept {
-  if (m_xdpAttached && m_ifindex > 0) {
-    bpf_xdp_detach(m_ifindex, m_xdpFlags, nullptr);
-    m_xdpAttached = false;
-  }
-}
+AFXDPSocket::~AFXDPSocket() { cleanup(); }
 
 void AFXDPSocket::cleanup() noexcept {
-  if (m_xdpAttached && m_ifindex > 0)
-    bpf_xdp_detach(m_ifindex, m_xdpFlags, nullptr);
-
-  if (m_bpfObj)
-    bpf_object__close(m_bpfObj);
-
-  for (auto& rm : m_ringMaps) {
-    if (rm.ptr && rm.ptr != MAP_FAILED)
-      ::munmap(rm.ptr, rm.len);
+  if (m_promiscFd >= 0) {
+    ::close(m_promiscFd);  // drops the PACKET_MR_PROMISC membership
+    m_promiscFd = -1;
   }
-
-  if (m_umem && m_umem != MAP_FAILED)
-    ::munmap(m_umem, m_umemSize);
-
-  if (m_fd >= 0)
-    ::close(m_fd);
-}
-
-
-void* AFXDPSocket::mapRing(int fd, std::size_t size, off_t pgoff) {
-    void* ptr = ::mmap(nullptr, size,
-                       PROT_READ | PROT_WRITE,
-                       MAP_SHARED | MAP_POPULATE,
-                       fd, pgoff);
-    if (ptr == MAP_FAILED) {
-      throw std::system_error(errno, std::generic_category(), "mmap ring");
-    }
-    return ptr;
-}
-
-// Wire a XdpAddrRing (Fill / Completion) from mmap base + kernel offsets
-void AFXDPSocket::wireAddrRing(void* base, const xdp_ring_offset& off, std::uint32_t size, XdpAddrRing& ring) {
-    auto* b = static_cast<std::uint8_t*>(base);
-    ring.producer = reinterpret_cast<std::uint32_t*>(b + off.producer);
-    ring.consumer = reinterpret_cast<std::uint32_t*>(b + off.consumer);
-    ring.descs    = reinterpret_cast<std::uint64_t*>(b + off.desc);
-    ring.flags    = reinterpret_cast<std::uint32_t*>(b + off.flags);
-    ring.mask     = size - 1;
-    ring.size     = size;
-}
-
-// Wire a XdpDescRing (TX / RX) from mmap base + kernel offsets
-void AFXDPSocket::wireDescRing(void* base, const xdp_ring_offset& off, std::uint32_t size, XdpDescRing& ring) {
-    auto* b = static_cast<std::uint8_t*>(base);
-    ring.producer = reinterpret_cast<std::uint32_t*>(b + off.producer);
-    ring.consumer = reinterpret_cast<std::uint32_t*>(b + off.consumer);
-    ring.descs    = reinterpret_cast<xdp_desc*>(b + off.desc);
-    ring.flags    = reinterpret_cast<std::uint32_t*>(b + off.flags);
-    ring.mask     = size - 1;
-    ring.size     = size;
-}
-
-
-int AFXDPSocket::fd() const noexcept {
-  return m_fd;
-}
-
-std::uint8_t*  AFXDPSocket::umemArea() const noexcept {
-  return m_umem;
-}
-
-std::uint32_t  AFXDPSocket::frameSize() const noexcept {
-  return m_frameSize;
-}
-
-std::uint32_t  AFXDPSocket::txFrames() const noexcept {
-  return m_txFrameCount;
-}
-
-std::uint32_t  AFXDPSocket::rxFrames() const noexcept {
-  return m_rxFrameCount;
-}
-
-bool AFXDPSocket::needWakeup() const noexcept {
-  return m_needWakeup;
+  if (m_xsk) {
+    xsk_socket__delete(m_xsk);
+    m_xsk = nullptr;
+  }
+  if (m_umem) {
+    (void)xsk_umem__delete(m_umem);
+    m_umem = nullptr;
+  }
+  if (m_umemBuffer && m_umemBuffer != MAP_FAILED) {
+    ::munmap(m_umemBuffer,
+             static_cast<std::size_t>(m_frameCount) * m_frameSize);
+    m_umemBuffer = nullptr;
+  }
+  if (m_xdpProg) {
+    xdp_program__detach(m_xdpProg, m_ifindex, XDP_MODE_NATIVE, 0);
+    xdp_program__close(m_xdpProg);
+    m_xdpProg = nullptr;
+  }
+  if (m_ifindex > 0) {
+    bpf_xdp_detach(m_ifindex, XDP_FLAGS_DRV_MODE, nullptr);
+    bpf_xdp_detach(m_ifindex, XDP_FLAGS_SKB_MODE, nullptr);
+  }
 }

@@ -13,8 +13,6 @@ add_library(abtrda3 STATIC
 
     # AF_XDP transport
     AF_XDP/AFXDPSocket.cpp
-    AF_XDP/AFXDPTx.cpp
-    AF_XDP/AFXDPRx.cpp
 )
 
 target_include_directories(abtrda3 PUBLIC
@@ -53,3 +51,23 @@ bpf_compile(
 
 # 3. Link libbpf (transitively pulls in -lelf -lz)
 target_link_libraries(abtrda3 PRIVATE libbpf::libbpf)
+
+# 4. libxdp — system-installed (libxdp-dev)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBXDP REQUIRED IMPORTED_TARGET libxdp)
+target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBXDP)
+
+# 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style)
+#    Output to both src build dir and test build dir.
+set(BPF_KERN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP/af_xdp_kern.c")
+set(BPF_KERN_DST "${CMAKE_BINARY_DIR}/test/af_xdp_kern.o")
+add_custom_command(
+    OUTPUT "${BPF_KERN_DST}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/test"
+    COMMAND clang -O2 -target bpf -g -c "${BPF_KERN_SRC}" -o "${BPF_KERN_DST}"
+            -I${libbpf_SOURCE_DIR}/src
+    DEPENDS "${BPF_KERN_SRC}"
+    COMMENT "[BPF] af_xdp_kern.c -> af_xdp_kern.o"
+)
+add_custom_target(af_xdp_bpf DEPENDS "${BPF_KERN_DST}")
+add_dependencies(abtrda3 af_xdp_bpf)
