@@ -9,6 +9,7 @@
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
 #include "AFXDP.hpp"
+#include "DPDK.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
@@ -157,6 +158,46 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
                 AFXDP<AFXDPMode::RxTx> xsk(role.interface.c_str(), role.xdpQueueId);
                 if (!setup(xsk)) return 1;
                 dispatchMode(xsk, xsk, mode, cfg, count, stop);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    if (transport == "dpdk") {
+        // DPDK identifies the device by PCI id (Intel ports have no netdev once on
+        // vfio-pci), so role.interface holds the PCI address (e.g. "0000:01:00.1").
+        // Poll-mode = no interrupts, so no coalescing/NicTuner tuning is needed.
+        // lcore = role.cpuCore (must match RuntimeSetup's pin). Per-role mode like
+        // af_xdp: TxGen->TxOnly, RxSink->RxOnly, Server/Client->RxTx.
+        auto setup = [&](auto& nic) -> bool {
+            if (!nic.init()) {
+                fmt::println(stderr, "Error: DPDK init failed on {}", role.interface);
+                return false;
+            }
+            fmt::println("[{}] Transport: dpdk on {} (PCI, lcore {})",
+                         roleName, role.interface, role.cpuCore);
+            return true;
+        };
+
+        switch (mode) {
+            case RunMode::TxGen: {
+                DPDK<DpdkMode::TxOnly> nic(role.interface.c_str(), role.cpuCore);
+                if (!setup(nic)) return 1;
+                run_txgen(nic, cfg, count, stop);
+                return 0;
+            }
+            case RunMode::RxSink: {
+                DPDK<DpdkMode::RxOnly> nic(role.interface.c_str(), role.cpuCore);
+                if (!setup(nic)) return 1;
+                run_rxsink(nic, cfg, stop);
+                return 0;
+            }
+            case RunMode::Server:
+            case RunMode::Client: {
+                DPDK<DpdkMode::RxTx> nic(role.interface.c_str(), role.cpuCore);
+                if (!setup(nic)) return 1;
+                dispatchMode(nic, nic, mode, cfg, count, stop);
                 return 0;
             }
         }

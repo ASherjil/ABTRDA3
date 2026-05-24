@@ -21,6 +21,7 @@ target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Intel_I210>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Cadence_GEM>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/TapBridge>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -58,6 +59,17 @@ target_link_libraries(abtrda3 PUBLIC libbpf::libbpf)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBXDP REQUIRED IMPORTED_TARGET libxdp)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBXDP)
+
+# =============================================================================
+# DPDK transport — header-only DPDK.hpp over libdpdk (PMDs i40e/igc/mlx5).
+# Required dependency (like libxdp): install DPDK 25.11 LTS, plus rdma-core for
+# the Mellanox/mlx5 (ConnectX-4) PMD. PUBLIC: DPDK.hpp emits rte_* calls into
+# every consumer, so they need libdpdk's include path + symbols at link time
+# (same reason libbpf/libxdp are PUBLIC).
+# =============================================================================
+pkg_check_modules(LIBDPDK REQUIRED IMPORTED_TARGET libdpdk)
+target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBDPDK)
+message(STATUS "DPDK transport: libdpdk ${LIBDPDK_VERSION}")
 
 # 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style)
 #    Output to both src build dir and test build dir.
