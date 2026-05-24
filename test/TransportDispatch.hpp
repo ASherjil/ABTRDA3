@@ -165,37 +165,39 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
     }
 
     if (transport == "dpdk") {
-        // DPDK identifies the device by PCI id (Intel ports have no netdev once on
-        // vfio-pci), so role.interface holds the PCI address (e.g. "0000:01:00.1").
-        // Poll-mode = no interrupts, so no coalescing/NicTuner tuning is needed.
-        // lcore = role.cpuCore (must match RuntimeSetup's pin). Per-role mode like
-        // af_xdp: TxGen->TxOnly, RxSink->RxOnly, Server/Client->RxTx.
+        // Configured by interface NAME + kernel DRIVER (like the other transports).
+        // DPDK init() resolves the name -> PCI BDF, then for Intel (i40e/igc) unbinds
+        // the kernel driver onto vfio-pci, or for mlx5 (driver name contains "mlx5")
+        // leaves it on the kernel driver (bifurcated). Poll-mode = no interrupts, so
+        // no coalescing/NicTuner tuning is needed. lcore = role.cpuCore (must match
+        // RuntimeSetup's pin). Per-role mode: TxGen->TxOnly, RxSink->RxOnly,
+        // Server/Client->RxTx.
         auto setup = [&](auto& nic) -> bool {
             if (!nic.init()) {
                 fmt::println(stderr, "Error: DPDK init failed on {}", role.interface);
                 return false;
             }
-            fmt::println("[{}] Transport: dpdk on {} (PCI, lcore {})",
-                         roleName, role.interface, role.cpuCore);
+            fmt::println("[{}] Transport: dpdk on {} (driver={}, lcore {})",
+                         roleName, role.interface, role.driver, role.cpuCore);
             return true;
         };
 
         switch (mode) {
             case RunMode::TxGen: {
-                DPDK<DpdkMode::TxOnly> nic(role.interface.c_str(), role.cpuCore);
+                DPDK<DpdkMode::TxOnly> nic(role.interface, role.cpuCore, role.driver);
                 if (!setup(nic)) return 1;
                 run_txgen(nic, cfg, count, stop);
                 return 0;
             }
             case RunMode::RxSink: {
-                DPDK<DpdkMode::RxOnly> nic(role.interface.c_str(), role.cpuCore);
+                DPDK<DpdkMode::RxOnly> nic(role.interface, role.cpuCore, role.driver);
                 if (!setup(nic)) return 1;
                 run_rxsink(nic, cfg, stop);
                 return 0;
             }
             case RunMode::Server:
             case RunMode::Client: {
-                DPDK<DpdkMode::RxTx> nic(role.interface.c_str(), role.cpuCore);
+                DPDK<DpdkMode::RxTx> nic(role.interface, role.cpuCore, role.driver);
                 if (!setup(nic)) return 1;
                 dispatchMode(nic, nic, mode, cfg, count, stop);
                 return 0;

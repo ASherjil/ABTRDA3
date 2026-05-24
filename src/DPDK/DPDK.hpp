@@ -1,28 +1,28 @@
 //
 // DPDK — one DPDK transport for every supported NIC (Intel i40e XXV710, Intel
-// igc I225-V, Mellanox mlx5 ConnectX-4) through the unified rte_ethdev API.
+// igc I225-V via the e1000 PMD, Mellanox mlx5 ConnectX-4) through the unified
+// rte_ethdev API. The hot path (rte_eth_rx_burst / rte_eth_tx_burst) is identical
+// across all PMDs.
 //
-// The hot path (rte_eth_rx_burst / rte_eth_tx_burst) is identical across all
-// PMDs. The ONLY per-vendor difference is device binding, which is an ops step
-// OUTSIDE this code:
-//   * Intel i40e/igc : unbind kernel driver -> bind vfio-pci (needs IOMMU).
-//   * Mellanox mlx5  : stays on kernel mlx5_core (bifurcated); needs rdma-core.
-// The device is addressed by PCI id (e.g. "0000:01:00.1") — Intel ports lose
-// their netdev name once on vfio-pci, so a name won't do.
+// Configured by interface NAME + kernel DRIVER name (like the other transports),
+// not a raw PCI id. init() resolves the name -> PCI BDF while the netdev still
+// exists, then prepares the device per its binding model:
+//   * Intel pass-through (i40e/igc/...): unbind the kernel driver, bind vfio-pci
+//     (needs IOMMU). shutdown() rebinds the kernel driver so the netdev reappears
+//     and the next run resolves the name again — mirrors Intel_I210/Cadence_GEM.
+//   * Mellanox mlx5 (driver name contains "mlx5"): BIFURCATED — left on the kernel
+//     driver (needs rdma-core); DPDK drives it alongside the kernel.
 //
-// Satisfies the TxRing/RxRing concepts (tryReceive/release + acquire/commit/
-// send/prefillRing), so it drops into TransportDispatch as transport = "dpdk".
+// Satisfies the TxRing/RxRing concepts (tryReceive/release + acquire/commit/send/
+// prefillRing). Every knob that can be fixed at compile time is a template param —
+// only the interface name, lcore and driver are runtime (from the test config).
 //
-// Every knob that can be fixed at compile time is a template parameter — this is
-// the ultra-low-latency path, so the hot loop carries no runtime configuration.
-// Only the PCI id and the EAL lcore are runtime (they come from the test config).
-//
-// Target: DPDK 25.11 LTS. Compiled only when ABTRDA3_HAS_DPDK is defined
-// (cmake -DABTRDA3_ENABLE_DPDK=ON).
+// Target: DPDK 25.11 LTS.
 //
 #pragma once
 
 #include "RxFrame.hpp"
+#include "PciHelpers.hpp"
 
 #include <rte_eal.h>
 #include <rte_errno.h>
@@ -31,16 +31,19 @@
 #include <rte_mempool.h>
 #include <rte_ether.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 enum class DpdkMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
@@ -55,30 +58,37 @@ class DPDK {
   static_assert(BurstSize >= 1, "BurstSize must be >= 1");
   static_assert(NumMbufs > BurstSize, "NumMbufs must exceed BurstSize");
 
-  static constexpr bool          HAS_RX      = (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
-  static constexpr bool          HAS_TX      = (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
-  static constexpr std::uint32_t MBUF_CACHE  = 250;   // per-lcore mempool cache
+  static constexpr bool          HAS_RX     = (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
+  static constexpr bool          HAS_TX     = (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
+  static constexpr std::uint32_t MBUF_CACHE = 250;   // per-lcore mempool cache
 
 public:
-  // pciAddr: DPDK device id ("0000:01:00.1"). lcore: EAL main lcore — must equal
-  // the core RuntimeSetup pins this process to (role.cpuCore) so EAL keeps us put.
-  DPDK(std::string_view pciAddr, int lcore) noexcept
-    : m_pci{pciAddr}, m_lcore{lcore} {}
+  // ifname: kernel interface name ("enp1s0f1np1"). lcore: EAL main lcore — must
+  // equal the core RuntimeSetup pins this process to (role.cpuCore). driver: the
+  // kernel driver name (role.driver); "mlx5*" => bifurcated (leave on kernel),
+  // anything else => Intel pass-through (unbind -> vfio-pci).
+  DPDK(std::string_view ifname, int lcore, std::string_view driver) noexcept
+    : m_ifname{ifname}, m_driver{driver}, m_lcore{lcore} {}
 
   DPDK(const DPDK&)            = delete;
   DPDK& operator=(const DPDK&) = delete;
 
   DPDK(DPDK&& o) noexcept
-    : m_pci{std::move(o.m_pci)}, m_lcore{o.m_lcore}, m_port{o.m_port},
-      m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
+    : m_ifname{std::move(o.m_ifname)}, m_driver{std::move(o.m_driver)},
+      m_lcore{o.m_lcore}, m_pci{std::move(o.m_pci)},
+      m_boundVfio{std::exchange(o.m_boundVfio, false)},
+      m_port{o.m_port}, m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
       m_txTemplate{o.m_txTemplate}, m_txTemplateLen{o.m_txTemplateLen},
       m_started{std::exchange(o.m_started, false)} {}
 
   DPDK& operator=(DPDK&& o) noexcept {
     if (this != &o) {
       shutdown();
-      m_pci           = std::move(o.m_pci);
+      m_ifname        = std::move(o.m_ifname);
+      m_driver        = std::move(o.m_driver);
       m_lcore         = o.m_lcore;
+      m_pci           = std::move(o.m_pci);
+      m_boundVfio     = std::exchange(o.m_boundVfio, false);
       m_port          = o.m_port;
       m_pool          = std::exchange(o.m_pool, nullptr);
       m_mac           = o.m_mac;
@@ -91,13 +101,38 @@ public:
 
   ~DPDK() { shutdown(); }
 
-  // ── Cold path: EAL + port bring-up ─────────────────────────────────────────
+  // ── Cold path: resolve + bind + EAL + port bring-up ────────────────────────
   [[nodiscard]] bool init() noexcept {
+    // 1. Resolve name -> BDF while the kernel netdev still exists.
+    m_pci = pci::resolveBdf(m_ifname);
+    if (m_pci.empty()) {
+      std::fprintf(stderr, "[DPDK] %s: cannot resolve PCI BDF — no netdev (already on "
+                           "vfio-pci? rebind to the kernel driver first)\n", m_ifname.c_str());
+      return false;
+    }
+
+    // 2. Prepare the device per its binding model.
+    const bool bifurcated = (m_driver.find("mlx5") != std::string::npos);
+    if (bifurcated) {
+      std::fprintf(stderr, "[DPDK] %s (%s): mlx5 bifurcated — kept on kernel driver\n",
+                   m_ifname.c_str(), m_pci.c_str());
+    } else {
+      if (!bindToVfio(m_pci)) {
+        std::fprintf(stderr, "[DPDK] %s (%s): vfio-pci bind failed — IOMMU enabled "
+                             "(intel_iommu=on iommu=pt) and vfio-pci loaded?\n",
+                     m_ifname.c_str(), m_pci.c_str());
+        return false;
+      }
+      m_boundVfio = true;
+      std::fprintf(stderr, "[DPDK] %s (%s): unbound '%s' -> vfio-pci\n",
+                   m_ifname.c_str(), m_pci.c_str(), m_driver.empty() ? "?" : m_driver.c_str());
+    }
+
+    // 3. EAL + port.
     if (!ealInitOnce(m_pci, m_lcore)) return false;
 
     if (rte_eth_dev_get_port_by_name(m_pci.c_str(), &m_port) != 0) {
-      std::fprintf(stderr, "[DPDK] no port for %s (bound to vfio-pci / mlx5_core?)\n",
-                   m_pci.c_str());
+      std::fprintf(stderr, "[DPDK] no DPDK port for %s (%s)\n", m_ifname.c_str(), m_pci.c_str());
       return false;
     }
 
@@ -120,12 +155,12 @@ public:
     }
 
     // Single queue per direction, no RSS — all traffic on one queue (the DPDK
-    // equivalent of AF_XDP's `ethtool -L combined 1`).
+    // analog of AF_XDP's `ethtool -L combined 1`).
     rte_eth_conf conf{};
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
     conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
-    // Faster TX completion: lets the PMD bulk-free mbufs without per-mbuf checks
-    // (valid because every TX mbuf comes from one pool with refcnt 1).
+    // Faster TX completion: bulk-free mbufs without per-mbuf checks (valid because
+    // every TX mbuf comes from one pool with refcnt 1).
     if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
       conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
@@ -174,27 +209,33 @@ public:
     rte_eth_link link{};
     rte_eth_link_get_nowait(m_port, &link);
     std::fprintf(stderr,
-        "[DPDK] port %u (%s) %s %u Mbps  MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-        m_port, info.driver_name,
+        "[DPDK] %s port %u (%s) %s %u Mbps  MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+        m_ifname.c_str(), m_port, info.driver_name,
         link.link_status == RTE_ETH_LINK_UP ? "UP" : "DOWN", link.link_speed,
         m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);
     return true;
   }
 
   void shutdown() noexcept {
-    if (!m_started) return;
-    if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
-    rte_eth_dev_stop(m_port);
-    rte_eth_dev_close(m_port);
-    m_started = false;
+    if (m_started) {
+      if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
+      rte_eth_dev_stop(m_port);
+      rte_eth_dev_close(m_port);
+      m_started = false;
+    }
+    // Restore the kernel driver so the netdev reappears and the next run can
+    // resolve the interface name again (mirrors Intel_I210/Cadence_GEM teardown).
+    if (m_boundVfio) {
+      restoreKernel(m_pci);
+      m_boundVfio = false;
+    }
   }
 
   [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept { return m_mac; }
 
   // Store the header template so acquire() can stamp it into each fresh TX mbuf
   // (DPDK allocates a new mbuf per send — there is no fixed pre-stamped ring).
-  // Client/txgen call this once; the reflector overwrites the whole frame and
-  // never does.
+  // Client/txgen call this once; the reflector overwrites the whole frame.
   void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (HAS_TX) {
     m_txTemplateLen = static_cast<std::uint16_t>(std::min<std::size_t>(frameTemplate.size(), MaxFrame));
     std::memcpy(m_txTemplate.data(), frameTemplate.data(), m_txTemplateLen);
@@ -258,9 +299,9 @@ public:
   }
 
 private:
-  // EAL is process-global: init exactly once. Each process allowlists only its
-  // own device (-a) on its own lcore (-l) with a unique --file-prefix, so the
-  // server and client can run as two DPDK primaries on the same looped-DAC host.
+  // EAL is process-global: init exactly once. Each process allowlists only its own
+  // device (-a) on its own lcore (-l) with a unique --file-prefix, so the server
+  // and client can run as two DPDK primaries on the same looped-DAC host.
   static bool ealInitOnce(const std::string& pci, int lcore) noexcept {
     static bool inited = false;
     if (inited) return true;
@@ -285,13 +326,46 @@ private:
     return true;
   }
 
-  std::string                        m_pci;
+  static bool writeSysfs(const std::string& path, std::string_view val) noexcept {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const ssize_t n = ::write(fd, val.data(), val.size());
+    ::close(fd);
+    return n == static_cast<ssize_t>(val.size());
+  }
+
+  // Unbind whatever kernel driver owns the device and bind vfio-pci (driver_override
+  // + drivers_probe, as dpdk-devbind does). Idempotent if already on vfio-pci.
+  static bool bindToVfio(const std::string& bdf) noexcept {
+    if (::access("/sys/bus/pci/drivers/vfio-pci", F_OK) != 0)
+      (void)std::system("modprobe vfio-pci");
+    if (pci::currentDriver(bdf) == "vfio-pci") return true;
+    const std::string dev = "/sys/bus/pci/devices/" + bdf;
+    writeSysfs(dev + "/driver_override", "vfio-pci");
+    writeSysfs(dev + "/driver/unbind", bdf);          // best-effort if bound
+    return writeSysfs("/sys/bus/pci/drivers_probe", bdf);
+  }
+
+  // Restore the device to its kernel driver: clear the override, unbind vfio-pci,
+  // re-probe so the matching kernel driver (by PCI id) reclaims it.
+  static void restoreKernel(const std::string& bdf) noexcept {
+    const std::string dev = "/sys/bus/pci/devices/" + bdf;
+    writeSysfs(dev + "/driver_override", "\n");        // clear override
+    writeSysfs(dev + "/driver/unbind", bdf);           // unbind vfio-pci
+    writeSysfs("/sys/bus/pci/drivers_probe", bdf);
+  }
+
+  std::string                        m_ifname;
+  std::string                        m_driver;
   int                                m_lcore{};
+  std::string                        m_pci;             // resolved BDF
+  bool                               m_boundVfio{false};// we rebind on shutdown
+
   std::uint16_t                      m_port{0};
   rte_mempool*                       m_pool{nullptr};
   std::array<std::uint8_t, 6>        m_mac{};
 
-  std::array<std::uint8_t, MaxFrame> m_txTemplate{};   // header, stamped per mbuf
+  std::array<std::uint8_t, MaxFrame> m_txTemplate{};    // header, stamped per mbuf
   std::uint16_t                      m_txTemplateLen{0};
 
   rte_mbuf*                          m_rxBurst[BurstSize]{};   // RX burst cache
