@@ -51,3 +51,20 @@ need_wakeup     = true
 # sudo ./abtrda3_test --txgen  [--count N] [--config ...]
 # sudo ./abtrda3_test --rxsink [--config ...]
 # ./profile_hotpath.sh --no-perf
+
+#1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+#link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+#2: enp6s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+#link/ether f0:2f:74:b1:41:96 brd ff:ff:ff:ff:ff:ff
+#altname enxf02f74b14196
+#3: enp7s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+#link/ether f0:2f:74:b1:41:97 brd ff:ff:ff:ff:ff:ff
+#altname enxf02f74b14197
+#4: enp1s0f0np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+#link/ether 40:a6:b7:02:b3:10 brd ff:ff:ff:ff:ff:ff
+#altname enx40a6b702b310
+#5: enp1s0f1np1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+#link/ether 40:a6:b7:02:b3:11 brd ff:ff:ff:ff:ff:ff
+#altname enx40a6b702b311
+
+

@@ -97,8 +97,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         }
 
         if (!received) {
-            fmt::println(stderr,"Packet {} timed out ({}ms) - stopping client.", i, (kTimeoutNs - intervalNs)/1'000'000);
-            break;
+            fmt::println(stderr,"Packet {} timed out ({}ms), packet loss occurred!", i, (kTimeoutNs - intervalNs)/1'000'000);
         }
     }
 

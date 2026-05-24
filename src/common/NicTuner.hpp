@@ -20,7 +20,13 @@ public:
     NicTuner(const NicTuner&)            = delete;
     NicTuner& operator=(const NicTuner&) = delete;
 
+    // Disable interrupt coalescing (adaptive off, rx/tx-usecs 0).
+    // MUST be called AFTER the AF_XDP socket is bound: xsk_socket__create()
+    // reprograms the NIC and resets coalescing, so applying it during NicTuner
+    // construction (which runs before the bind) has no lasting effect. Static so
+    // the transport can call it post-bind without holding the NicTuner instance.
+    static bool setCoalescingZero(const char* interface);
+
 private:
     int m_ethtoolFd = -1;
-    int m_dmaLatencyFd = -1;
 };

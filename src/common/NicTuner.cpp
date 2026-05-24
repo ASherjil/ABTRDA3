@@ -208,15 +208,6 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
 
     char path[128];
 
-    m_dmaLatencyFd = ::open("/dev/cpu_dma_latency", O_WRONLY);
-    if (m_dmaLatencyFd >= 0) {
-        std::int32_t lat = 0;
-        if (::write(m_dmaLatencyFd, &lat, sizeof(lat)) != sizeof(lat))
-            std::fprintf(stderr, "[NicTuner] FAIL: cpu_dma_latency write\n");
-    } else {
-        std::fprintf(stderr, "[NicTuner] FAIL: open /dev/cpu_dma_latency: %s\n", std::strerror(errno));
-    }
-
     std::snprintf(path, sizeof(path),
                   "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpuCore);
     if (!writeFile(path, "performance"))
@@ -228,18 +219,11 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
     if (!writeFile("/proc/sys/vm/stat_interval", "120"))
         std::fprintf(stderr, "[NicTuner] FAIL: set vm.stat_interval\n");
 
-    // Interrupt coalescing: zero delay
+    // NOTE: interrupt coalescing is intentionally NOT set here. AF_XDP's
+    // xsk_socket__create() resets the NIC's coalescing, so any value applied
+    // pre-bind is wiped out. The transport calls NicTuner::setCoalescingZero()
+    // AFTER the socket is bound instead.
     if (m_ethtoolFd >= 0) {
-        ethtool_coalesce ec{};
-        ec.cmd = ETHTOOL_GCOALESCE;
-        if (ethtoolIoctl(m_ethtoolFd, interface, &ec)) {
-            ec.cmd = ETHTOOL_SCOALESCE;
-            ec.rx_coalesce_usecs = 0;
-            ec.tx_coalesce_usecs = 0;
-            if (!ethtoolIoctl(m_ethtoolFd, interface, &ec))
-                std::fprintf(stderr, "[NicTuner] FAIL: set interrupt coalescing to 0\n");
-        }
-
         // Disable GRO/GSO/TSO — reduces per-packet latency.
         auto disable = [&](std::uint32_t get, std::uint32_t set, const char* name) {
             ethtool_value ev{};
@@ -287,32 +271,15 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
     // Disable kernel watchdog on the app core to prevent NMI jitter
     writeInt("/proc/sys/kernel/watchdog", 0);
 
-    // ── RSS steering ────────────────────────────────────────────────────
-
-    if (m_ethtoolFd >= 0) {
-        ethtool_rxnfc rxnfc{};
-        rxnfc.cmd = ETHTOOL_GRXRINGS;
-        std::uint32_t numQueues = 0;
-        if (ethtoolIoctl(m_ethtoolFd, interface, &rxnfc))
-            numQueues = static_cast<std::uint32_t>(rxnfc.data);
-
-        if (numQueues > 0) {
-            ethtool_rxfh_indir indirHdr{};
-            indirHdr.cmd = ETHTOOL_GRXFHINDIR;
-            indirHdr.size = 0;
-            ethtoolIoctl(m_ethtoolFd, interface, &indirHdr);
-
-            if (indirHdr.size > 0) {
-                auto bytes = sizeof(ethtool_rxfh_indir) + indirHdr.size * sizeof(std::uint32_t);
-                auto* indir = static_cast<ethtool_rxfh_indir*>(std::calloc(1, bytes));
-                indir->cmd  = ETHTOOL_SRXFHINDIR;
-                indir->size = indirHdr.size;
-                if (!ethtoolIoctl(m_ethtoolFd, interface, indir))
-                    std::fprintf(stderr, "[NicTuner] FAIL: set RSS indirection table\n");
-                std::free(indir);
-            }
-        }
-    }
+    // ── Single RX queue steering MOVED to AFXDP ─────────────────────────
+    // `ethtool -L <if> combined 1` (collapse to one RX queue so all RX lands on
+    // queue 0, the XSK's queue) is now done by AFXDP::init() just before the
+    // socket bind — see AFXDP.hpp steerAllTrafficToQueue(). It belongs with the
+    // transport that owns the queue and the bind, and must run right before the
+    // bind (it reprograms the NIC's queues). NOTE: because that now runs AFTER
+    // NicTuner, the IRQ pinning below operates on the PRE-collapse IRQ set — the
+    // surviving queue-0 IRQ stays pinned, but if RX reliability ever regresses,
+    // suspect a renumbered post-collapse IRQ.
 
     // ── IRQ handling ─────────────────────────────────────────────────────
     // Pin NIC IRQs TO the app core (same core = hot cache),
@@ -373,10 +340,54 @@ NicTuner::NicTuner(const char* interface, int cpuCore, NicTunerMode mode)
 }
 
 // =============================================================================
+// Post-bind coalescing (called AFTER xsk_socket__create resets it)
+// =============================================================================
+
+bool NicTuner::setCoalescingZero(const char* interface) {
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        std::fprintf(stderr, "[NicTuner] FAIL: coalescing socket: %s\n", std::strerror(errno));
+        return false;
+    }
+    // GET first so unsupported fields keep their driver defaults; then turn
+    // adaptive ITR OFF and zero the usecs (== `ethtool -C <if> adaptive-rx off
+    // adaptive-tx off rx-usecs 0 tx-usecs 0`). The previous code never cleared
+    // use_adaptive_*_coalesce, so adaptive ITR overrode the zeros and the SET
+    // was rejected — hence the "FAIL: set interrupt coalescing to 0" log.
+    ethtool_coalesce ec{};
+    ec.cmd = ETHTOOL_GCOALESCE;
+    if (ethtoolIoctl(fd, interface, &ec)) {
+        ec.cmd = ETHTOOL_SCOALESCE;
+        ec.use_adaptive_rx_coalesce = 0;
+        ec.use_adaptive_tx_coalesce = 0;
+        ec.rx_coalesce_usecs = 0;
+        ec.tx_coalesce_usecs = 0;
+        ethtoolIoctl(fd, interface, &ec);
+    }
+
+    // Verify by read-back: adaptive ITR must be OFF and the usecs must be 0,
+    // otherwise the NIC still batches interrupts and latency stays high.
+    ethtool_coalesce rb{};
+    rb.cmd = ETHTOOL_GCOALESCE;
+    bool ok = ethtoolIoctl(fd, interface, &rb)
+              && rb.use_adaptive_rx_coalesce == 0 && rb.use_adaptive_tx_coalesce == 0
+              && rb.rx_coalesce_usecs == 0       && rb.tx_coalesce_usecs == 0;
+    ::close(fd);
+    if (ok)
+        std::fprintf(stderr, "[NicTuner] OK: %s coalescing off (adaptive off, rx/tx-usecs 0)\n", interface);
+    else
+        std::fprintf(stderr, "[NicTuner] FAIL: %s coalescing not zeroed (adaptive rx=%u tx=%u, "
+                             "rx-usecs=%u tx-usecs=%u) — run: sudo ethtool -C %s adaptive-rx off "
+                             "adaptive-tx off rx-usecs 0 tx-usecs 0\n",
+                     interface, rb.use_adaptive_rx_coalesce, rb.use_adaptive_tx_coalesce,
+                     rb.rx_coalesce_usecs, rb.tx_coalesce_usecs, interface);
+    return ok;
+}
+
+// =============================================================================
 // Destructor
 // =============================================================================
 
 NicTuner::~NicTuner() {
-    if (m_dmaLatencyFd >= 0) ::close(m_dmaLatencyFd);
     if (m_ethtoolFd >= 0) ::close(m_ethtoolFd);
 }

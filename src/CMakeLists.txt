@@ -11,8 +11,7 @@ add_library(abtrda3 STATIC
     PACKET_MMAP/PacketMmapRx.cpp
     PACKET_MMAP/PacketMmapTx.cpp
 
-    # AF_XDP transport
-    AF_XDP/AFXDPSocket.cpp
+    # AF_XDP transport is header-only (AFXDP.hpp); no .cpp here.
 )
 
 target_include_directories(abtrda3 PUBLIC
@@ -49,8 +48,11 @@ bpf_compile(
     INCLUDES   "${libbpf_SOURCE_DIR}/src"
 )
 
-# 3. Link libbpf (transitively pulls in -lelf -lz)
-target_link_libraries(abtrda3 PRIVATE libbpf::libbpf)
+# 3. Link libbpf (transitively pulls in -lelf -lz). PUBLIC: AFXDP.hpp is
+#    header-only and emits libbpf calls (bpf_xdp_detach, bpf_map_update_elem,
+#    bpf_object__*, bpf_map__fd) into every consumer's translation unit, so they
+#    need libbpf's include path and symbols at link time too.
+target_link_libraries(abtrda3 PUBLIC libbpf::libbpf)
 
 # 4. libxdp — system-installed (libxdp-dev)
 find_package(PkgConfig REQUIRED)

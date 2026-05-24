@@ -8,7 +8,6 @@
 #include "SocketOps.hpp"
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
-#include "AFXDPSocket.hpp"
 #include "AFXDP.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
@@ -119,21 +118,48 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
     }
 
     if (transport == "af_xdp") {
-        XdpConfig xdp_cfg{};
-        xdp_cfg.interface  = role.interface.c_str();
-        xdp_cfg.queueId    = role.xdpQueueId;
-        xdp_cfg.frameSize  = cfg.xdpUmemFrameSize;
-        xdp_cfg.frameCount = cfg.xdpFrameCount;
-        xdp_cfg.etherType  = cfg.etherType;
-        xdp_cfg.needWakeup  = cfg.xdpNeedWakeup;
-        xdp_cfg.bpfProgPath = "af_xdp_kern.o";  // ethertype 0x88B5 filter
+        // Direction is a compile-time template param (AFXDP.hpp). Pick the REAL
+        // mode per role so each socket is minimal (TxOnly skips FILL/XSKMAP/
+        // steering; RxOnly skips the TX ring) AND so the hot-path TX kick differs
+        // by mode: RxTx kicks unconditionally (interleaved TX+RX needs it — see
+        // kickTx), TxOnly keeps the cheaper needs_wakeup-gated kick for pure
+        // throughput. interface + queue are the only runtime params; the BPF
+        // (af_xdp_kern.o) redirects everything on the queue to userspace.
+        auto setup = [&](auto& xsk) -> bool {
+            if (!xsk.init()) {
+                fmt::println(stderr, "Error: AF_XDP init failed on {}", role.interface);
+                return false;
+            }
+            // Coalescing MUST be zeroed AFTER the bind — xsk_socket__create()
+            // resets it, so NicTuner can't do it during pre-bind construction.
+            if (cfg.nicTunerMode != NicTunerMode::Off)
+                NicTuner::setCoalescingZero(role.interface.c_str());
+            fmt::println("[{}] Transport: af_xdp on {} (queue {})",
+                         roleName, role.interface, role.xdpQueueId);
+            return true;
+        };
 
-        AFXDPSocket sock(xdp_cfg);
-        AFXDP<AFXDPMode::RxTx> af_xdp(sock);
-
-        fmt::println("[{}] Transport: af_xdp on {} (queue {})",
-                     roleName, role.interface, role.xdpQueueId);
-        dispatchMode(af_xdp, af_xdp, mode, cfg, count, stop);
+        switch (mode) {
+            case RunMode::TxGen: {
+                AFXDP<AFXDPMode::TxOnly> xsk(role.interface.c_str(), role.xdpQueueId);
+                if (!setup(xsk)) return 1;
+                run_txgen(xsk, cfg, count, stop);
+                return 0;
+            }
+            case RunMode::RxSink: {
+                AFXDP<AFXDPMode::RxOnly> xsk(role.interface.c_str(), role.xdpQueueId);
+                if (!setup(xsk)) return 1;
+                run_rxsink(xsk, cfg, stop);
+                return 0;
+            }
+            case RunMode::Server:
+            case RunMode::Client: {
+                AFXDP<AFXDPMode::RxTx> xsk(role.interface.c_str(), role.xdpQueueId);
+                if (!setup(xsk)) return 1;
+                dispatchMode(xsk, xsk, mode, cfg, count, stop);
+                return 0;
+            }
+        }
         return 0;
     }
 
