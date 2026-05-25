@@ -76,7 +76,6 @@ public:
   DPDK(DPDK&& o) noexcept
     : m_ifname{std::move(o.m_ifname)}, m_driver{std::move(o.m_driver)},
       m_lcore{o.m_lcore}, m_pci{std::move(o.m_pci)},
-      m_boundVfio{std::exchange(o.m_boundVfio, false)},
       m_port{o.m_port}, m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
       m_txTemplate{o.m_txTemplate}, m_txTemplateLen{o.m_txTemplateLen},
       m_started{std::exchange(o.m_started, false)} {}
@@ -88,7 +87,6 @@ public:
       m_driver        = std::move(o.m_driver);
       m_lcore         = o.m_lcore;
       m_pci           = std::move(o.m_pci);
-      m_boundVfio     = std::exchange(o.m_boundVfio, false);
       m_port          = o.m_port;
       m_pool          = std::exchange(o.m_pool, nullptr);
       m_mac           = o.m_mac;
@@ -103,11 +101,14 @@ public:
 
   // ── Cold path: resolve + bind + EAL + port bring-up ────────────────────────
   [[nodiscard]] bool init() noexcept {
-    // 1. Resolve name -> BDF while the kernel netdev still exists.
+    // 1. Resolve name -> BDF. First via the netdev (when still on the kernel
+    //    driver); if that's gone (already on vfio-pci from a previous run), derive
+    //    it from the firmware/BIOS-assigned predictable name (enp<bus>s<dev>f<func>).
     m_pci = pci::resolveBdf(m_ifname);
+    if (m_pci.empty()) m_pci = pci::bdfFromName(m_ifname);
     if (m_pci.empty()) {
-      std::fprintf(stderr, "[DPDK] %s: cannot resolve PCI BDF — no netdev (already on "
-                           "vfio-pci? rebind to the kernel driver first)\n", m_ifname.c_str());
+      std::fprintf(stderr, "[DPDK] %s: cannot resolve PCI BDF (no netdev, and name is "
+                           "not an enp<bus>s<dev>f<func> form)\n", m_ifname.c_str());
       return false;
     }
 
@@ -123,7 +124,6 @@ public:
                      m_ifname.c_str(), m_pci.c_str());
         return false;
       }
-      m_boundVfio = true;
       std::fprintf(stderr, "[DPDK] %s (%s): unbound '%s' -> vfio-pci\n",
                    m_ifname.c_str(), m_pci.c_str(), m_driver.empty() ? "?" : m_driver.c_str());
     }
@@ -217,18 +217,17 @@ public:
   }
 
   void shutdown() noexcept {
-    if (m_started) {
-      if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
-      rte_eth_dev_stop(m_port);
-      rte_eth_dev_close(m_port);
-      m_started = false;
-    }
-    // Restore the kernel driver so the netdev reappears and the next run can
-    // resolve the interface name again (mirrors Intel_I210/Cadence_GEM teardown).
-    if (m_boundVfio) {
-      restoreKernel(m_pci);
-      m_boundVfio = false;
-    }
+    if (!m_started) return;
+    if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
+    rte_eth_dev_stop(m_port);
+    rte_eth_dev_close(m_port);
+    m_started = false;
+    // Deliberately LEAVE the device on vfio-pci (standard DPDK "bind once" model).
+    // Rebinding the kernel driver here HANGS the destructor: the sysfs driver/unbind
+    // blocks until vfio releases the device, but EAL still holds it open (we don't
+    // call rte_eal_cleanup), so the write never returns. Re-runs resolve the BDF from
+    // the predictable name (pci::bdfFromName) since the netdev is gone. Restore the
+    // kernel driver manually if needed:  sudo dpdk-devbind.py --bind=i40e <bdf>  (or reboot).
   }
 
   [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept { return m_mac; }
@@ -346,20 +345,10 @@ private:
     return writeSysfs("/sys/bus/pci/drivers_probe", bdf);
   }
 
-  // Restore the device to its kernel driver: clear the override, unbind vfio-pci,
-  // re-probe so the matching kernel driver (by PCI id) reclaims it.
-  static void restoreKernel(const std::string& bdf) noexcept {
-    const std::string dev = "/sys/bus/pci/devices/" + bdf;
-    writeSysfs(dev + "/driver_override", "\n");        // clear override
-    writeSysfs(dev + "/driver/unbind", bdf);           // unbind vfio-pci
-    writeSysfs("/sys/bus/pci/drivers_probe", bdf);
-  }
-
   std::string                        m_ifname;
   std::string                        m_driver;
   int                                m_lcore{};
   std::string                        m_pci;             // resolved BDF
-  bool                               m_boundVfio{false};// we rebind on shutdown
 
   std::uint16_t                      m_port{0};
   rte_mempool*                       m_pool{nullptr};
