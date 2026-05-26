@@ -237,7 +237,10 @@ public:
       }
     }
 
-    rte_eth_promiscuous_enable(m_port);   // defensive on a dedicated test link
+    // Promiscuous mode is NOT enabled: both ends of the test know the peer MAC
+    // (toml carries client.mac + server.mac), so the NIC's MAC unicast filter does
+    // the work. Promisc forces every received unicast through the full RX pipeline
+    // regardless of dst MAC — a small but measurable NIC-internal cost we don't need.
 
     rte_ether_addr mac{};
     rte_eth_macaddr_get(m_port, &mac);
@@ -346,9 +349,18 @@ private:
     for (char& c : prefix) if (c == ':' || c == '.') c = '_';
     std::string lcoreStr = std::to_string(lcore);
 
-    std::array<std::string, 11> args = {
+    // --force-max-simd-bitwidth=512 raises DPDK's runtime SIMD cap
+    // (RTE_VECT_DEFAULT_SIMD_BITWIDTH = 256 by default, i.e. AVX2). With this set,
+    // i40e PMD's ci_get_x86_max_simd_bitwidth() picks the AVX-512 RX/TX path when
+    // the CPU supports it. CAVEAT: Rocket Lake (i7-11700F) has a small AVX-512
+    // frequency penalty — under sustained AVX-512 use, the core may steady-state
+    // 100-400 MHz below the AVX2 turbo bin. For our busy-poll workload that runs
+    // AVX-512 continuously there's no transition jitter; whether the per-burst
+    // SIMD win outweighs the clock loss is workload-specific. Measure both.
+    std::array<std::string, 12> args = {
       "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
-      "-n", "4", "-a", pci, "--file-prefix", prefix
+      "-n", "4", "-a", pci, "--file-prefix", prefix,
+      "--force-max-simd-bitwidth=512"
     };
     std::array<char*, args.size() + 1> argv{};
     for (std::size_t i = 0; i < args.size(); ++i) argv[i] = args[i].data();
