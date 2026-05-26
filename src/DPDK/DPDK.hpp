@@ -23,6 +23,7 @@
 
 #include "RxFrame.hpp"
 #include "PciHelpers.hpp"
+#include "BackendBase.hpp"   // ABTEdge — sysfs-resource0 MMIO (for i40e ITR fix)
 
 #include <rte_eal.h>
 #include <rte_errno.h>
@@ -199,6 +200,42 @@ public:
       return false;
     }
     m_started = true;
+
+    // ── i40e: kill NIC-internal RX-writeback throttling ───────────────────────
+    // The i40e silicon honors the per-vector Interrupt Throttle Rate even in
+    // pure polling mode — ITR governs when completed RX descriptors are DMA'd
+    // to host RAM. In DPDK 25.11 the PMD leaves ITR at I40E_QUEUE_ITR_INTERVAL_DEFAULT
+    // (32us) and exposes no public API to change it (no rte_eth_dev_set_reg,
+    // no devarg, nothing in rte_pmd_i40e.h). The kernel i40e driver hides this
+    // via adaptive coalescing; we have to write the register ourselves.
+    //
+    // Proof this is the lever (2026-05-26, packet_mmap A/B with ethtool -C):
+    //   adaptive off, rx-usecs 50 -> median 49.81us
+    //   adaptive off, rx-usecs 0  -> median 11.88us
+    //
+    // Access: a second mmap of /sys/bus/pci/devices/<bdf>/resource0 via
+    // ABTEdge's BackendBase. DPDK's vfio mapping is untouched; we get a
+    // separate VMA pointing at the same physical BAR0.
+    if (m_driver == "i40e") {
+      const std::size_t bar0Size = pci::barSize(m_pci, 0);
+      const std::string resPath  = "/sys/bus/pci/devices/" + m_pci + "/resource0";
+      BackendBase bar0;
+      if (bar0Size > 0 && bar0.open(resPath.c_str(), 0, bar0Size)) {
+        // Register offsets from drivers/net/intel/i40e/base/i40e_register.h:
+        //   I40E_PFINT_ITR0(_i)         = 0x00038000 + (_i) * 128
+        //   I40E_PFINT_ITRN(_i, _INTPF) = 0x00030000 + (_i) * 2048 + (_INTPF) * 4
+        // _i = ITR index (0 is the default RX index). Write 0 to both the misc-
+        // vector ITR and the per-RX-vector ITR — either could be tied to our
+        // queue depending on whether the PMD allocated an MSI-X for it.
+        *bar0.registerPtr<std::uint32_t>(0x00038000) = 0;   // I40E_PFINT_ITR0(0)
+        *bar0.registerPtr<std::uint32_t>(0x00030000) = 0;   // I40E_PFINT_ITRN(0, 0)
+        std::fprintf(stderr, "[DPDK] %s: i40e ITR cleared (RX writeback throttling off)\n",
+                     m_ifname.c_str());
+      } else {
+        std::fprintf(stderr, "[DPDK] %s: WARN: %s mmap failed — ITR not cleared, "
+                             "expect ~30us median RTT\n", m_ifname.c_str(), resPath.c_str());
+      }
+    }
 
     rte_eth_promiscuous_enable(m_port);   // defensive on a dedicated test link
 

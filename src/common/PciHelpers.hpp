@@ -46,6 +46,25 @@ namespace pci {
   return readlinkBasename("/sys/bus/pci/devices/" + std::string(bdf) + "/driver");
 }
 
+// Size of a PCI BAR (in bytes) for the given device, read from
+// /sys/bus/pci/devices/<bdf>/resource. The file has one line per BAR:
+//   0xSTART 0xEND 0xFLAGS
+// Size = END - START + 1, or 0 if the BAR is unused. Returns 0 on any error.
+[[nodiscard]] inline std::size_t barSize(std::string_view bdf, int barIndex) noexcept {
+  std::string path = "/sys/bus/pci/devices/" + std::string(bdf) + "/resource";
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) return 0;
+  char line[160]{};
+  for (int i = 0; i <= barIndex; ++i) {
+    if (!std::fgets(line, sizeof(line), f)) { std::fclose(f); return 0; }
+  }
+  std::fclose(f);
+  unsigned long long start = 0, end = 0;
+  if (std::sscanf(line, "%llx %llx", &start, &end) == 2 && end >= start && start != 0)
+    return static_cast<std::size_t>(end - start + 1ULL);
+  return 0;
+}
+
 // Derive a PCI BDF from a systemd "predictable" interface name
 // (enp<bus>s<dev>[f<func>]), which is itself assigned from the firmware/BIOS PCI
 // location. This resolves the BDF even AFTER the kernel driver is unbound (the
