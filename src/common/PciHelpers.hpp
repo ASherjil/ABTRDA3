@@ -12,10 +12,15 @@
 //
 #pragma once
 
+#include "BackendBase.hpp"   // ABTEdge — sysfs-resource0 MMIO (for the i40e ITR read)
+
+#include <fmt/core.h>
+
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -96,6 +101,70 @@ namespace pci {
   if (::access((std::string("/sys/bus/pci/devices/") + bdf).c_str(), F_OK) != 0)
     return {};
   return bdf;
+}
+
+// ── i40e Interrupt Throttle Rate verification ────────────────────────────────
+//
+// The XXV710/i40e honors the per-vector ITR even in pure polling mode: ITR
+// governs when completed RX descriptors are DMA'd back to host RAM, so a nonzero
+// ITR adds latency no matter how hard userspace busy-polls. The DPDK transport
+// zeroes it with a BAR0 write; `ethtool -C rx-usecs 0` (the AF_XDP / packet_mmap
+// path) is supposed to do the same but was NEVER verified in-register. reportItr()
+// READS the two ITR registers via a second sysfs-resource0 mmap (BackendBase) so
+// we can confirm, mid-run, that the throttle is genuinely off — on EITHER stack:
+// kernel-driver (AF_XDP/packet_mmap, netdev present -> resolveBdf) OR vfio-pci
+// (DPDK, netdev gone -> bdfFromName). Read-only (opens O_RDWR because resource0
+// offers no RO mode, but only LOADS). Root required (resource0 is 0600 root).
+
+// Register offsets (drivers/net/intel/i40e/base/i40e_register.h), the same two
+// the DPDK transport writes:
+//   I40E_PFINT_ITR0(_i)         = 0x00038000 + (_i)*128       -> ITR0(0)
+//   I40E_PFINT_ITRN(_i, _INTPF) = 0x00030000 + (_i)*2048 + (_INTPF)*4 -> ITRN(0,0)
+// The INTERVAL field is bits [11:0] in 2us units; 0 == no throttling. Other bits
+// are reserved/zero, so a raw register read of 0 also means interval 0.
+inline constexpr std::size_t   I40E_PFINT_ITR0_0     = 0x00038000;
+inline constexpr std::size_t   I40E_PFINT_ITRN_0_0   = 0x00030000;
+inline constexpr std::uint32_t I40E_ITR_INTERVAL_MASK = 0xFFF;
+
+// True if the device backing `ifname` is currently bound to the kernel i40e
+// driver (the AF_XDP / packet_mmap path). False for vfio-pci (DPDK) or non-i40e.
+[[nodiscard]] inline bool boundToI40e(std::string_view ifname) noexcept {
+  const std::string bdf = resolveBdf(ifname);
+  return !bdf.empty() && currentDriver(bdf) == "i40e";
+}
+
+// Read and print the live ITR registers for the NIC backing `ifname`. `tag`
+// labels the log line (e.g. "DPDK-ITR" / "AFXDP-ITR"). Returns true iff both ITR
+// interval fields read as 0 (throttling off). Best-effort: logs and returns false
+// on any resolve/mmap failure (never throws, never aborts).
+inline bool reportItr(std::string_view ifname, const char* tag) {
+  std::string bdf = resolveBdf(ifname);     // kernel driver: netdev present
+  if (bdf.empty()) bdf = bdfFromName(ifname); // vfio-pci (DPDK): netdev gone
+  if (bdf.empty()) {
+    fmt::print(stderr, "[{}] {}: cannot resolve PCI BDF\n", tag, ifname);
+    return false;
+  }
+
+  const std::size_t bar0Size = barSize(bdf, 0);
+  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+  BackendBase bar0;
+  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+    fmt::print(stderr, "[{}] {} ({}): resource0 mmap failed (need root?)\n",
+               tag, ifname, bdf);
+    return false;
+  }
+
+  const std::uint32_t itr0 = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
+  const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
+  const std::uint32_t itr0Int = itr0 & I40E_ITR_INTERVAL_MASK;
+  const std::uint32_t itrnInt = itrn & I40E_ITR_INTERVAL_MASK;
+  const bool cleared = (itr0Int == 0 && itrnInt == 0);
+
+  fmt::print(stderr,
+    "[{}] {} ({}): PFINT_ITR0=0x{:08x} ({}us) PFINT_ITRN=0x{:08x} ({}us) => {}\n",
+    tag, ifname, bdf, itr0, itr0Int * 2u, itrn, itrnInt * 2u,
+    cleared ? "CLEARED (throttle off)" : "NONZERO (throttle ACTIVE)");
+  return cleared;
 }
 
 }  // namespace pci

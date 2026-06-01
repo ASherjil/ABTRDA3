@@ -10,6 +10,7 @@
 #include "PacketMmapTx.hpp"
 #include "AFXDP.hpp"
 #include "DPDK.hpp"
+#include "PciHelpers.hpp"   // pci::reportItr / boundToI40e (i40e ITR check)
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
@@ -135,6 +136,13 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
             // resets it, so NicTuner can't do it during pre-bind construction.
             if (cfg.nicTunerMode != NicTunerMode::Off)
                 NicTuner::setCoalescingZero(role.interface.c_str());
+            // STEP 1 verification: does the ethtool/coalescing path ACTUALLY leave
+            // i40e ITR=0 in silicon? (DPDK needed a BAR0 write; ethtool may not.)
+            // A NONZERO read here means the old AF_XDP "17us wall" is the same
+            // RX-writeback throttle that capped DPDK at 30us — not a NAPI-cadence
+            // limit. Read-only; i40e only.
+            if (pci::boundToI40e(role.interface))
+                pci::reportItr(role.interface, "AFXDP-ITR");
             fmt::println("[{}] Transport: af_xdp on {} (queue {})",
                          roleName, role.interface, role.xdpQueueId);
             return true;
@@ -177,6 +185,11 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
                 fmt::println(stderr, "Error: DPDK init failed on {}", role.interface);
                 return false;
             }
+            // STEP 1 verification: confirm DPDK init()'s BAR0 ITR write actually
+            // landed (device is on vfio-pci now -> bdfFromName resolves it). Read-
+            // only; i40e only. Expect CLEARED here; if NONZERO the write missed.
+            if (role.driver == "i40e")
+                pci::reportItr(role.interface, "DPDK-ITR");
             fmt::println("[{}] Transport: dpdk on {} (driver={}, lcore {})",
                          roleName, role.interface, role.driver, role.cpuCore);
             return true;
