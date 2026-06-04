@@ -49,6 +49,7 @@ struct CliArgs {
         else if (arg == "--client")  { a.runMode = RunMode::Client; a.useServerRole = false; haveMode = true; }
         else if (arg == "--txgen")   { a.runMode = RunMode::TxGen;  a.useServerRole = false; haveMode = true; }
         else if (arg == "--rxsink")  { a.runMode = RunMode::RxSink; a.useServerRole = true;  haveMode = true; }
+        else if (arg == "--single")  { a.runMode = RunMode::SingleRecorder; a.useServerRole = false; haveMode = true; }
         else if (arg == "--count" && i + 1 < argc) {
             a.countOverride = std::atoll(argv[++i]);
         }
@@ -63,7 +64,8 @@ void printUsage(const char* argv0) {
                  "  {0} --server  [--config <file>]\n"
                  "  {0} --client  [--count <N>] [--config <file>]\n"
                  "  {0} --txgen   [--count <N>] [--config <file>]\n"
-                 "  {0} --rxsink  [--config <file>]",
+                 "  {0} --rxsink  [--config <file>]\n"
+                 "  {0} --single  [--config <file>]   (single-process one-way Tx->Rx latency)",
                  argv0);
 }
 
@@ -77,7 +79,7 @@ int main(int argc, char* argv[]) {
 
     const CliArgs args = parseCli(argc, argv);
     if (!args.valid) {
-        fmt::println(stderr, "Error: specify --server, --client, --txgen, or --rxsink");
+        fmt::println(stderr, "Error: specify --server, --client, --txgen, --rxsink, or --single");
         return 1;
     }
 
@@ -87,6 +89,25 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& e) {
         fmt::println(stderr, "Config error: {}", e.what());
         return 1;
+    }
+
+    // ── Single-process one-way recorder: needs BOTH ports + its own core layout.
+    // Tx=client port, Rx=server port; the hot path runs on recHotPathCore (pinned
+    // + SCHED_FIFO here), the recorder self-pins to recRecorderCore inside the
+    // dispatch. NicTuner is applied to both ports inside runSingleRecorder.
+    if (args.runMode == RunMode::SingleRecorder) {
+        fmt::println("[Config] Loaded from {} — mode=SingleRecorder tx={} rx={}",
+                     args.configPath, cfg.client.interface, cfg.server.interface);
+        std::optional<NicTuner> txTuner, rxTuner;
+        if (cfg.nicTunerMode != NicTunerMode::Off) {
+            txTuner.emplace(cfg.client.interface.c_str(), cfg.recHotPathCore, cfg.nicTunerMode);
+            rxTuner.emplace(cfg.server.interface.c_str(), cfg.recRecorderCore, cfg.nicTunerMode);
+        } else {
+            fmt::println(stderr, "[NicTuner] Off");
+        }
+        // Watchdog disabled (0): the hot loop self-terminates on duration_sec.
+        RuntimeSetup rt(cfg.recHotPathCore, 0, "SingleRecorder");
+        return runSingleRecorder(cfg, rt.stopToken());
     }
 
     const RoleConfig& role = args.useServerRole ? cfg.server : cfg.client;

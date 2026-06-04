@@ -41,11 +41,17 @@ public:
         fmt::println(stderr, "[RT] step 2/6 SIGINT handler OK");
 
         // Step 3 — watchdog thread. Spawned BEFORE SCHED_FIFO so it inherits
-        // SCHED_OTHER and will be scheduled on core 0.
-        fmt::println(stderr, "[{}] Watchdog: auto-shutdown in {} seconds", roleName, watchdogSec);
-        fmt::println(stderr, "[RT] step 3/6 spawning watchdog thread…");
-        spawnWatchdog(watchdogSec);
-        fmt::println(stderr, "[RT] step 3/6 watchdog thread detached OK");
+        // SCHED_OTHER and will be scheduled on core 0. watchdogSec <= 0 DISABLES
+        // it (used by --single, whose hot loop self-terminates on duration and
+        // must not be cut short by a watchdog).
+        if (watchdogSec > 0) {
+            fmt::println(stderr, "[{}] Watchdog: auto-shutdown in {} seconds", roleName, watchdogSec);
+            fmt::println(stderr, "[RT] step 3/6 spawning watchdog thread…");
+            spawnWatchdog(watchdogSec);
+            fmt::println(stderr, "[RT] step 3/6 watchdog thread detached OK");
+        } else {
+            fmt::println(stderr, "[{}] Watchdog: DISABLED (run self-terminates)", roleName);
+        }
 
         // Step 4 — yield briefly so watchdog actually runs and settles on core 0
         // before we hog core cpuCore with SCHED_FIFO.

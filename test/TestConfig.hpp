@@ -41,6 +41,17 @@ struct TestConfig {
     std::uint32_t xdpUmemFrameSize = 4096;
     std::uint32_t xdpFrameCount    = 64;
     bool          xdpNeedWakeup    = true;
+
+    // [single_recorder] — single-process one-way Tx->Rx latency benchmark.
+    // hotPathCore runs the timed loop; recorderCore drains the SPSC queue into
+    // the HdrHistogram (must be a DIFFERENT core so it never steals hot cycles).
+    // durationSec bounds the run (time-based, not sample-count) — e.g. 60 for a
+    // smoke test, 86400 for a 24 h determinism soak. Output CSV path = general
+    // `output`. Tx reuses [client], Rx reuses [server].
+    int           recHotPathCore  = 2;
+    int           recRecorderCore = 4;
+    std::uint64_t recDurationSec  = 60;
+    std::size_t   recQueueCapacity = 1u << 20;   // 1,048,576 cycle-delta slots
 };
 
 inline std::array<std::uint8_t, 6> parseMac(const std::string& s) {
@@ -94,6 +105,11 @@ inline TestConfig loadConfig(const char* path) {
     cfg.xdpUmemFrameSize = static_cast<std::uint32_t>(tbl["af_xdp"]["umem_frame_size"].value_or(4096));
     cfg.xdpFrameCount    = static_cast<std::uint32_t>(tbl["af_xdp"]["frame_count"].value_or(64));
     cfg.xdpNeedWakeup    = tbl["af_xdp"]["need_wakeup"].value_or(true);
+
+    cfg.recHotPathCore   = tbl["single_recorder"]["hot_path_core"].value_or(2);
+    cfg.recRecorderCore  = tbl["single_recorder"]["benchmark_recorder_core"].value_or(4);
+    cfg.recDurationSec   = static_cast<std::uint64_t>(tbl["single_recorder"]["duration_sec"].value_or(60));
+    cfg.recQueueCapacity = static_cast<std::size_t>(tbl["single_recorder"]["queue_capacity"].value_or(1u << 20));
 
     return cfg;
 }

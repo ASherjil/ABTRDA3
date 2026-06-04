@@ -11,6 +11,8 @@
 #include "AFXDP.hpp"
 #include "DPDK.hpp"
 #include "PciHelpers.hpp"   // pci::reportItr / boundToI40e (i40e ITR check)
+#include "SingleRecorder.hpp"
+#include "RuntimeSetup.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
@@ -30,14 +32,15 @@
 // Transport dispatch — creates the transport and runs the selected mode
 // =============================================================================
 
-enum class RunMode { Server, Client, TxGen, RxSink };
+enum class RunMode { Server, Client, TxGen, RxSink, SingleRecorder };
 
 inline const char* runModeName(RunMode m) {
     switch (m) {
-        case RunMode::Server: return "Server";
-        case RunMode::Client: return "Client";
-        case RunMode::TxGen:  return "TxGen";
-        case RunMode::RxSink: return "RxSink";
+        case RunMode::Server:         return "Server";
+        case RunMode::Client:         return "Client";
+        case RunMode::TxGen:          return "TxGen";
+        case RunMode::RxSink:         return "RxSink";
+        case RunMode::SingleRecorder: return "SingleRecorder";
     }
     return "Unknown";
 }
@@ -141,6 +144,10 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
             // A NONZERO read here means the old AF_XDP "17us wall" is the same
             // RX-writeback throttle that capped DPDK at 30us — not a NAPI-cadence
             // limit. Read-only; i40e only.
+            // Read-only guard: confirm in silicon that the data-queue RX ITR
+            // (PFINT_ITRN) is actually 0 after NicTuner/ethtool. (A/B 2026-06-01
+            // proved the misc-vector PFINT_ITR0=122us is irrelevant to RX — it
+            // does not gate our path; ITRN is the one that matters.)
             if (pci::boundToI40e(role.interface))
                 pci::reportItr(role.interface, "AFXDP-ITR");
             fmt::println("[{}] Transport: af_xdp on {} (queue {})",
@@ -278,5 +285,118 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
     }
 
     fmt::println(stderr, "Error: unknown transport '{}'", transport);
+    return 1;
+}
+
+// ── Single-process one-way latency recorder ─────────────────────────────────
+//
+// Builds a Tx transport (on the client port) and an Rx transport (on the server
+// port) in ONE process, runs HotPath on the calling thread (already pinned to
+// hot_path_core + SCHED_FIFO by the RuntimeSetup in main) and Recorder on a
+// second thread self-pinned to benchmark_recorder_core. One host TSC brackets
+// every packet, so there is no clock-sync problem (see SingleRecorder.hpp).
+//
+// Transport-generic: HotPath/Recorder are templated on TxRing/RxRing, so this
+// helper just constructs the right Tx+Rx pair and runs them. Both ports must use
+// the same transport (client.transport == server.transport).
+
+// Run the recorder once the Tx and Rx transports are constructed + init'd.
+template<TxRing Tx, RxRing Rx>
+inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg,
+                                std::stop_token stop) {
+    RecorderChannel ch(cfg.recQueueCapacity);
+
+    // Recorder on its own core (SCHED_OTHER — slow path, must not contend with
+    // the hot core or the NIC IRQ core). Pin via affinity directly (the hot path
+    // keeps the SCHED_FIFO main thread; the recorder stays default-policy).
+    std::jthread recThread([&](std::stop_token st) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cfg.recRecorderCore, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        Recorder rec(ch, cfg.outputPath);
+        rec(st);
+    });
+
+    // Hot path on THIS thread (already pinned to hot_path_core + SCHED_FIFO).
+    HotPath<Tx, Rx> hot(tx, rx, cfg, ch, cfg.recDurationSec);
+    hot(stop);
+    // hot() set ch.done; recThread drains + reports, then joins at scope exit.
+}
+
+[[nodiscard]]
+inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
+    const std::string& transport = cfg.client.transport;
+    if (cfg.server.transport != transport) {
+        fmt::println(stderr, "Error: single_recorder needs client.transport == "
+                             "server.transport (Tx=client port, Rx=server port); "
+                             "got tx='{}' rx='{}'",
+                     transport, cfg.server.transport);
+        return 1;
+    }
+
+    fmt::println("[SingleRecorder] {} | Tx={} (hot core {}) Rx={} (rec core {}) duration={}s",
+                 transport, cfg.client.interface, cfg.recHotPathCore,
+                 cfg.server.interface, cfg.recRecorderCore, cfg.recDurationSec);
+
+    if (transport == "packet_mmap") {
+        RingConfig txc{};
+        txc.interface = cfg.client.interface.c_str();
+        txc.direction = RingDirection::TX;
+        txc.blockSize = cfg.mmapBlockSize; txc.blockNumber = cfg.mmapBlockNumber;
+        txc.protocol  = cfg.etherType;     txc.packetVersion = TPACKET_V2;
+        txc.qdiscBypass = true;
+
+        RingConfig rxc{};
+        rxc.interface = cfg.server.interface.c_str();
+        rxc.direction = RingDirection::RX;
+        rxc.blockSize = cfg.mmapBlockSize; rxc.blockNumber = cfg.mmapBlockNumber;
+        rxc.protocol  = cfg.etherType;     rxc.hwTimeStamp = false;
+
+        PacketMmapTx tx(txc);
+        PacketMmapRx rx(rxc);
+        driveSingleRecorder(tx, rx, cfg, stop);
+        return 0;
+    }
+
+    if (transport == "af_xdp") {
+        // Tx-only on the client port, Rx-only on the server port. Distinct ports
+        // => distinct NAPIs. CRITICAL: AlwaysKick=true on the TxOnly socket — this
+        // is a ONE-IN-FLIGHT latency loop (send, wait for RX, repeat), NOT a
+        // continuous stream, so the needs_wakeup-gated kick can skip the sendto on
+        // a freshly-armed ring and wedge TX on packet 0 (observed: tx_packets=0,
+        // process spinning). Forcing the kick guarantees every packet goes out.
+        AFXDP<AFXDPMode::TxOnly, 2048, 2048, 4096, /*NeedWakeup=*/true, /*AlwaysKick=*/true>
+            tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
+        AFXDP<AFXDPMode::RxOnly> rx(cfg.server.interface.c_str(), cfg.server.xdpQueueId);
+        if (!tx.init()) { fmt::println(stderr, "Error: Tx AF_XDP init failed on {}", cfg.client.interface); return 1; }
+        if (!rx.init()) { fmt::println(stderr, "Error: Rx AF_XDP init failed on {}", cfg.server.interface); return 1; }
+        if (cfg.nicTunerMode != NicTunerMode::Off) {
+            NicTuner::setCoalescingZero(cfg.client.interface.c_str());
+            NicTuner::setCoalescingZero(cfg.server.interface.c_str());
+        }
+        if (pci::boundToI40e(cfg.server.interface)) pci::reportItr(cfg.server.interface, "RX-ITR");
+        driveSingleRecorder(tx, rx, cfg, stop);
+        return 0;
+    }
+
+    if (transport == "dpdk") {
+        // EAL is process-global: bind BOTH ports to vfio + register BOTH BDFs
+        // (prepare) BEFORE either init() triggers the single EAL init, so the
+        // -a allowlist covers both. lcore = the hot-path core for both objects
+        // (the one thread that polls both ports).
+        DPDK<DpdkMode::TxOnly> tx(cfg.client.interface, cfg.recHotPathCore, cfg.client.driver);
+        DPDK<DpdkMode::RxOnly> rx(cfg.server.interface, cfg.recHotPathCore, cfg.server.driver);
+        if (!tx.prepare() || !rx.prepare()) {
+            fmt::println(stderr, "Error: DPDK prepare (vfio bind) failed");
+            return 1;
+        }
+        if (!tx.init()) { fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface); return 1; }
+        if (!rx.init()) { fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface); return 1; }
+        driveSingleRecorder(tx, rx, cfg, stop);
+        return 0;
+    }
+
+    fmt::println(stderr, "Error: single_recorder: unsupported transport '{}'", transport);
     return 1;
 }

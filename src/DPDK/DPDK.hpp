@@ -45,6 +45,67 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
+
+// ── Process-global EAL init ─────────────────────────────────────────────────
+// DPDK's EAL is initialised ONCE per process, and its -a allowlist fixes which
+// PCI devices exist for the WHOLE process. A single-port run allowlists one BDF;
+// the single-recorder (Tx port + Rx port in one process) needs BOTH allowlisted
+// on that one init. So the guard + BDF set live at namespace scope (NOT as a
+// template-class static, which would give each DPDK<Mode> its own copy and
+// double-init EAL). Register every port's BDF up front, then ealInit() emits one
+// -a per BDF. Idempotent: the first ealInit() call wins; later calls are no-ops.
+namespace dpdk {
+
+inline std::vector<std::string>& allowedBdfs() {
+  static std::vector<std::string> v;
+  return v;
+}
+
+// Register a BDF to be allowlisted at EAL init. Must be called BEFORE ealInit()
+// (i.e. before any port's DPDK::init() triggers it). Deduplicates.
+inline void addAllowedBdf(const std::string& bdf) {
+  auto& v = allowedBdfs();
+  if (std::find(v.begin(), v.end(), bdf) == v.end()) v.push_back(bdf);
+}
+
+// Initialise EAL once, allowlisting every registered BDF (plus `bdf` if not yet
+// registered — covers the single-port path that calls ealInit directly). lcore
+// is the EAL main lcore (must equal the process's pinned core). Thread-unsafe by
+// design: all registration + the first init happen on the main thread at startup.
+inline bool ealInit(const std::string& bdf, int lcore) noexcept {
+  static bool inited = false;
+  if (inited) return true;
+
+  addAllowedBdf(bdf);
+  const auto& bdfs = allowedBdfs();
+
+  // file-prefix derived from the first BDF (unique per process).
+  std::string prefix = "abtrda3_" + bdfs.front();
+  for (char& c : prefix) if (c == ':' || c == '.') c = '_';
+  std::string lcoreStr = std::to_string(lcore);
+
+  // Fixed args + two ("-a", <bdf>) tokens per allowlisted device.
+  std::vector<std::string> args = {
+    "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
+    "-n", "4", "--file-prefix", prefix, "--force-max-simd-bitwidth=512"
+  };
+  for (const auto& b : bdfs) { args.emplace_back("-a"); args.emplace_back(b); }
+
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (auto& a : args) argv.push_back(a.data());
+  argv.push_back(nullptr);
+
+  if (rte_eal_init(static_cast<int>(args.size()), argv.data()) < 0) {
+    std::fprintf(stderr, "[DPDK] rte_eal_init failed: %s\n", rte_strerror(rte_errno));
+    return false;
+  }
+  inited = true;
+  return true;
+}
+
+}  // namespace dpdk
 
 enum class DpdkMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
@@ -79,7 +140,7 @@ public:
       m_lcore{o.m_lcore}, m_pci{std::move(o.m_pci)},
       m_port{o.m_port}, m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
       m_txTemplate{o.m_txTemplate}, m_txTemplateLen{o.m_txTemplateLen},
-      m_started{std::exchange(o.m_started, false)} {}
+      m_prepared{o.m_prepared}, m_started{std::exchange(o.m_started, false)} {}
 
   DPDK& operator=(DPDK&& o) noexcept {
     if (this != &o) {
@@ -93,6 +154,7 @@ public:
       m_mac           = o.m_mac;
       m_txTemplate    = o.m_txTemplate;
       m_txTemplateLen = o.m_txTemplateLen;
+      m_prepared      = o.m_prepared;
       m_started       = std::exchange(o.m_started, false);
     }
     return *this;
@@ -100,11 +162,19 @@ public:
 
   ~DPDK() { shutdown(); }
 
-  // ── Cold path: resolve + bind + EAL + port bring-up ────────────────────────
-  [[nodiscard]] bool init() noexcept {
-    // 1. Resolve name -> BDF. First via the netdev (when still on the kernel
-    //    driver); if that's gone (already on vfio-pci from a previous run), derive
-    //    it from the firmware/BIOS-assigned predictable name (enp<bus>s<dev>f<func>).
+  // ── Cold path phase 1: resolve BDF + bind to vfio + register for EAL ────────
+  // Split out of init() so a multi-port single process (the latency recorder)
+  // can bind BOTH ports and register BOTH BDFs BEFORE the one EAL init runs —
+  // EAL's -a allowlist probes vfio devices at init time, so every port must be
+  // bound and registered first. Idempotent: safe to call once here and again
+  // (no-op) from init(). For the single-port path init() calls this itself, so
+  // behaviour is unchanged (`-a <one bdf>`).
+  [[nodiscard]] bool prepare() noexcept {
+    if (m_prepared) return true;
+
+    // Resolve name -> BDF. First via the netdev (when still on the kernel
+    // driver); if that's gone (already on vfio-pci from a previous run), derive
+    // it from the firmware/BIOS-assigned predictable name (enp<bus>s<dev>f<func>).
     m_pci = pci::resolveBdf(m_ifname);
     if (m_pci.empty()) m_pci = pci::bdfFromName(m_ifname);
     if (m_pci.empty()) {
@@ -113,7 +183,7 @@ public:
       return false;
     }
 
-    // 2. Prepare the device per its binding model.
+    // Prepare the device per its binding model.
     const bool bifurcated = (m_driver.find("mlx5") != std::string::npos);
     if (bifurcated) {
       std::fprintf(stderr, "[DPDK] %s (%s): mlx5 bifurcated — kept on kernel driver\n",
@@ -129,7 +199,19 @@ public:
                    m_ifname.c_str(), m_pci.c_str(), m_driver.empty() ? "?" : m_driver.c_str());
     }
 
-    // 3. EAL + port.
+    // Register this BDF so the one process-wide EAL init allowlists it (and any
+    // sibling port that also registered before EAL came up).
+    dpdk::addAllowedBdf(m_pci);
+    m_prepared = true;
+    return true;
+  }
+
+  // ── Cold path phase 2: EAL + port bring-up ─────────────────────────────────
+  [[nodiscard]] bool init() noexcept {
+    if (!prepare()) return false;   // no-op if the recorder already prepared us
+
+    // EAL + port. ealInitOnce allowlists every BDF registered by prepare() so
+    // far, so a multi-port process sees all its ports after the single init.
     if (!ealInitOnce(m_pci, m_lcore)) return false;
 
     if (rte_eth_dev_get_port_by_name(m_pci.c_str(), &m_port) != 0) {
@@ -341,37 +423,15 @@ private:
   // EAL is process-global: init exactly once. Each process allowlists only its own
   // device (-a) on its own lcore (-l) with a unique --file-prefix, so the server
   // and client can run as two DPDK primaries on the same looped-DAC host.
+  // Delegates to the process-global dpdk::ealInit (see top of file). The single-
+  // port path calls this with its own BDF and gets `-a <bdf>` exactly as before;
+  // the single-recorder pre-registers both ports' BDFs via dpdk::addAllowedBdf()
+  // so the one EAL init allowlists both. --force-max-simd-bitwidth=512 (set in
+  // ealInit) raises DPDK's runtime SIMD cap so the i40e PMD picks the AVX-512
+  // RX/TX path; on Rocket Lake there is a small sustained-AVX-512 clock penalty
+  // but no transition jitter for a continuous busy-poll workload.
   static bool ealInitOnce(const std::string& pci, int lcore) noexcept {
-    static bool inited = false;
-    if (inited) return true;
-
-    std::string prefix = "abtrda3_" + pci;
-    for (char& c : prefix) if (c == ':' || c == '.') c = '_';
-    std::string lcoreStr = std::to_string(lcore);
-
-    // --force-max-simd-bitwidth=512 raises DPDK's runtime SIMD cap
-    // (RTE_VECT_DEFAULT_SIMD_BITWIDTH = 256 by default, i.e. AVX2). With this set,
-    // i40e PMD's ci_get_x86_max_simd_bitwidth() picks the AVX-512 RX/TX path when
-    // the CPU supports it. CAVEAT: Rocket Lake (i7-11700F) has a small AVX-512
-    // frequency penalty — under sustained AVX-512 use, the core may steady-state
-    // 100-400 MHz below the AVX2 turbo bin. For our busy-poll workload that runs
-    // AVX-512 continuously there's no transition jitter; whether the per-burst
-    // SIMD win outweighs the clock loss is workload-specific. Measure both.
-    std::array<std::string, 12> args = {
-      "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
-      "-n", "4", "-a", pci, "--file-prefix", prefix,
-      "--force-max-simd-bitwidth=512"
-    };
-    std::array<char*, args.size() + 1> argv{};
-    for (std::size_t i = 0; i < args.size(); ++i) argv[i] = args[i].data();
-    argv[args.size()] = nullptr;
-
-    if (rte_eal_init(static_cast<int>(args.size()), argv.data()) < 0) {
-      std::fprintf(stderr, "[DPDK] rte_eal_init failed: %s\n", rte_strerror(rte_errno));
-      return false;
-    }
-    inited = true;
-    return true;
+    return dpdk::ealInit(pci, lcore);
   }
 
   static bool writeSysfs(const std::string& path, std::string_view val) noexcept {
@@ -412,5 +472,6 @@ private:
   rte_mbuf*                          m_pendingRx{nullptr};
   rte_mbuf*                          m_pendingTx{nullptr};
 
+  bool                               m_prepared{false};
   bool                               m_started{false};
 };

@@ -20,6 +20,7 @@
 #define ABTRDA3_AFXDP_HPP
 
 #include "../common/RxFrame.hpp"
+#include "../common/NapiConfig.hpp"   // per-NAPI irq-suspend-timeout busy-poll knobs
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -60,6 +61,9 @@
 #ifndef SO_BUSY_POLL_BUDGET
 #define SO_BUSY_POLL_BUDGET 70
 #endif
+#ifndef SO_INCOMING_NAPI_ID
+#define SO_INCOMING_NAPI_ID 56
+#endif
 #ifndef SOL_XDP
 #define SOL_XDP 283
 #endif
@@ -85,11 +89,20 @@ struct xsk_socket_info {
   std::uint32_t outstanding_tx{0};
 };
 
+// AlwaysKick: force an unconditional sendto on every commit, even for TxOnly.
+// Default false keeps the cheaper needs_wakeup-gated kick for the continuous
+// throughput generator (txgen), where back-to-back sends keep the TX NAPI hot so
+// the hint is safe and saves a syscall/packet. Set TRUE for a ONE-IN-FLIGHT
+// latency pattern (the single-process recorder): there each send waits for the
+// RX before the next, so there is no continuous stream to keep the NAPI draining
+// — the gated kick can skip the sendto on a freshly-armed ring and the lone
+// descriptor never goes out (TX wedges on packet 0). See kickTx().
 template<AFXDPMode     M,
          std::uint32_t NumRxFrames = 2048,
          std::uint32_t NumTxFrames = 2048,
          std::uint32_t FrameSize   = 4096,
-         bool          NeedWakeup  = true>
+         bool          NeedWakeup  = true,
+         bool          AlwaysKick  = false>
 class AFXDP {
   static_assert(M == AFXDPMode::TxOnly ||
                 (NumRxFrames >= 8 && (NumRxFrames & (NumRxFrames - 1)) == 0),
@@ -125,6 +138,16 @@ class AFXDP {
   static constexpr std::uint32_t TX_SIZE   = NumTxFrames;
 
   static constexpr std::uint32_t BATCH_SIZE = 64;
+
+  // Per-NAPI busy-poll tuning (applied post-bind via netlink, see init() step 7.5).
+  // irq-suspend-timeout (kernel 6.13+) keeps device IRQs SUSPENDED while we busy-
+  // poll, so the poll syscall drives NAPI inline with NO gro_flush per-packet floor
+  // — the lever for getting below the ~17us cadence wall. Must be > gro-flush.
+  // gro-flush is then only the idle-transition fallback (NOT a per-packet floor in
+  // the suspended regime). Tunable here without touching the template signature.
+  static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = 100;
+  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 200'000;      // 200us
+  static constexpr std::uint64_t NAPI_IRQ_SUSPEND_NS  = 20'000'000;   // 20ms
 
 public:
   explicit AFXDP(const char*   interface,
@@ -173,9 +196,15 @@ public:
     if constexpr (HAS_RX)
       steerAllTrafficToQueue();
 
-    // 2. Load our custom redirect-all BPF (xdpsock: load_xdp_program).
-    if (m_bpfProgPath && m_bpfProgPath[0] != '\0')
-      loadCustomBpf(m_bpfProgPath);
+    // 2. Load our custom redirect-all BPF (xdpsock: load_xdp_program). RX modes
+    //    ONLY — the program's sole job is to redirect inbound frames into the
+    //    XSKMAP, which a TxOnly socket never uses (it has no RX ring and is not
+    //    inserted into the map). Attaching a redirect prog on a TX-only port is
+    //    pointless and steals inbound frames into a dead map, so skip it.
+    if constexpr (HAS_RX) {
+      if (m_bpfProgPath && m_bpfProgPath[0] != '\0')
+        loadCustomBpf(m_bpfProgPath);
+    }
 
     // 3. Allocate the UMEM packet area (xdpsock: mmap).
     const std::size_t umemSize = static_cast<std::size_t>(NUM_FRAMES) * FrameSize;
@@ -284,7 +313,13 @@ public:
     // cure it on igc. The CORRECT-but-slower regime is to gate this back to
     // `if constexpr (!(HAS_RX && HAS_TX))` so RxTx omits busy-poll and TX is driven
     // by ksoftirqd. See [[project-afxdp-pingpong]] for the full A/B.
-    {
+    // Busy-poll is an RX mechanism (it busy-loops the NAPI to drain RX inline);
+    // it is meaningless on a TX-only socket. WORSE on igc: SO_PREFER_BUSY_POLL on
+    // a TX-only socket makes igc_xsk_wakeup(XDP_WAKEUP_TX) a NOP when the shared
+    // queue-pair NAPI is "already running", so the TX kick is swallowed and TX
+    // stalls after a few packets (observed: tx frozen at ~4, hot thread camped in
+    // the RX recvfrom). So apply busy-poll for RX modes ONLY.
+    if constexpr (HAS_RX) {
       int on = 1;
       if (::setsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &on, sizeof(on)) < 0)
         fmt::print(stderr, "[AFXDP] WARN: SO_PREFER_BUSY_POLL: {}\n", std::strerror(errno));
@@ -294,6 +329,31 @@ public:
       int budget = static_cast<int>(BATCH_SIZE);
       if (::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget)) < 0)
         fmt::print(stderr, "[AFXDP] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
+    }
+
+    // 7.5 IRQ-suspension busy-poll regime (RX modes only). Ask the kernel which
+    // NAPI backs THIS socket — xsk_bind marks sk_napi_id at bind, before any
+    // traffic, so SO_INCOMING_NAPI_ID is valid here — then set defer-hard-irqs +
+    // gro-flush-timeout + irq-suspend-timeout on exactly that NAPI (no ephemeral-
+    // id race, no guessing among the PF's NAPIs). irq-suspend keeps device IRQs
+    // masked while we busy-poll so the poll syscall drives NAPI inline with no
+    // gro_flush per-packet floor — the lever to push below the ~17us cadence wall.
+    // Best-effort: WARN, never fatal (matches the ITR/setsockopt blocks).
+    if constexpr (HAS_RX) {
+      std::uint32_t napiId  = 0;
+      socklen_t     idLen   = sizeof(napiId);
+      if (::getsockopt(m_fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napiId, &idLen) == 0
+          && napiId != 0) {
+        const bool ok = napi::setBusyPoll(napiId, NAPI_DEFER_HARD_IRQS,
+                                          NAPI_GRO_FLUSH_NS, NAPI_IRQ_SUSPEND_NS);
+        fmt::print(stderr,
+          "[AFXDP] NAPI {}: defer-hard-irqs={} gro-flush={}ns irq-suspend={}ns => {}\n",
+          napiId, NAPI_DEFER_HARD_IRQS, NAPI_GRO_FLUSH_NS, NAPI_IRQ_SUSPEND_NS,
+          ok ? "applied" : "FAILED (running without IRQ-suspension)");
+      } else {
+        fmt::print(stderr, "[AFXDP] WARN: SO_INCOMING_NAPI_ID unavailable "
+                           "(napi_id={}) — IRQ-suspension not applied\n", napiId);
+      }
     }
 
     // 8. Insert the socket fd into the XSKMAP so the BPF can redirect to us
@@ -583,12 +643,12 @@ private:
   // hangs the kernel) — we just choose when to use its hint.
   [[gnu::always_inline, gnu::hot]]
   inline void kickTx() noexcept requires (HAS_TX) {
-    if constexpr (HAS_RX) {                       // RxTx: must always kick
+    if constexpr (HAS_RX || AlwaysKick) {         // RxTx, or one-in-flight TxOnly
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-    } else if constexpr (NeedWakeup) {            // TxOnly + need_wakeup: gated
+    } else if constexpr (NeedWakeup) {            // TxOnly streaming + need_wakeup: gated
       if (xsk_ring_prod__needs_wakeup(&m_xsk.tx))
         ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-    } else {                                       // TxOnly, no need_wakeup
+    } else {                                       // TxOnly streaming, no need_wakeup
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
     }
   }

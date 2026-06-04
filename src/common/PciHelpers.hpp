@@ -116,12 +116,22 @@ namespace pci {
 // (DPDK, netdev gone -> bdfFromName). Read-only (opens O_RDWR because resource0
 // offers no RO mode, but only LOADS). Root required (resource0 is 0600 root).
 
-// Register offsets (drivers/net/intel/i40e/base/i40e_register.h), the same two
-// the DPDK transport writes:
+// Register offsets (drivers/net/intel/i40e/base/i40e_register.h):
 //   I40E_PFINT_ITR0(_i)         = 0x00038000 + (_i)*128       -> ITR0(0)
 //   I40E_PFINT_ITRN(_i, _INTPF) = 0x00030000 + (_i)*2048 + (_INTPF)*4 -> ITRN(0,0)
-// The INTERVAL field is bits [11:0] in 2us units; 0 == no throttling. Other bits
-// are reserved/zero, so a raw register read of 0 also means interval 0.
+// _i = ITR index (0 = RX). The INTERVAL field is bits [11:0] in 2us units; 0 ==
+// no throttling. Other bits reserved/zero, so a raw read of 0 also means 0us.
+//
+// WHICH register governs OUR queue-0 RX depends on the stack, because the two
+// drivers wire queue 0 to different MSI-X vectors (confirmed via /proc/interrupts:
+// vector 0 = "...:misc" admin/link, vector 1 = "...-TxRx-0" = our data queue):
+//   * KERNEL i40e (AF_XDP / packet_mmap): queue 0 -> data vector 1 -> ITRN(0,0).
+//     ITR0(0) is the MISC vector's RX ITR and does NOT touch packet RX, so it is
+//     routinely left at the driver default (~122us) — harmless. Watch ITRN.
+//   * DPDK poll-mode PMD: queue 0 -> the "zero" vector -> ITR0(0). (DPDK.hpp
+//     writes BOTH to be safe; the 30->9us win came from ITR0.)
+// So the verdict below keys on ITRN for the kernel path and reports ITR0 as
+// informational. A NONZERO ITRN is the real "RX throttle still active" signal.
 inline constexpr std::size_t   I40E_PFINT_ITR0_0     = 0x00038000;
 inline constexpr std::size_t   I40E_PFINT_ITRN_0_0   = 0x00030000;
 inline constexpr std::uint32_t I40E_ITR_INTERVAL_MASK = 0xFFF;
@@ -134,9 +144,11 @@ inline constexpr std::uint32_t I40E_ITR_INTERVAL_MASK = 0xFFF;
 }
 
 // Read and print the live ITR registers for the NIC backing `ifname`. `tag`
-// labels the log line (e.g. "DPDK-ITR" / "AFXDP-ITR"). Returns true iff both ITR
-// interval fields read as 0 (throttling off). Best-effort: logs and returns false
-// on any resolve/mmap failure (never throws, never aborts).
+// labels the log line (e.g. "DPDK-ITR" / "AFXDP-ITR"). Returns true iff the
+// data-queue RX throttle (ITRN(0,0)) is 0 — the one that actually gates our RX
+// on the kernel path. ITR0(0) is printed for context (misc vector on the kernel
+// path; the data vector under DPDK). Best-effort: logs + returns false on any
+// resolve/mmap failure (never throws, never aborts).
 inline bool reportItr(std::string_view ifname, const char* tag) {
   std::string bdf = resolveBdf(ifname);     // kernel driver: netdev present
   if (bdf.empty()) bdf = bdfFromName(ifname); // vfio-pci (DPDK): netdev gone
@@ -158,13 +170,14 @@ inline bool reportItr(std::string_view ifname, const char* tag) {
   const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
   const std::uint32_t itr0Int = itr0 & I40E_ITR_INTERVAL_MASK;
   const std::uint32_t itrnInt = itrn & I40E_ITR_INTERVAL_MASK;
-  const bool cleared = (itr0Int == 0 && itrnInt == 0);
+  const bool rxThrottleOff = (itrnInt == 0);   // ITRN = our data-queue RX ITR
 
   fmt::print(stderr,
-    "[{}] {} ({}): PFINT_ITR0=0x{:08x} ({}us) PFINT_ITRN=0x{:08x} ({}us) => {}\n",
-    tag, ifname, bdf, itr0, itr0Int * 2u, itrn, itrnInt * 2u,
-    cleared ? "CLEARED (throttle off)" : "NONZERO (throttle ACTIVE)");
-  return cleared;
+    "[{}] {} ({}): PFINT_ITRN(data-RX)=0x{:08x} ({}us) PFINT_ITR0(misc)=0x{:08x} ({}us) "
+    "=> RX path {}\n",
+    tag, ifname, bdf, itrn, itrnInt * 2u, itr0, itr0Int * 2u,
+    rxThrottleOff ? "UNTHROTTLED (ITRN=0)" : "THROTTLED (ITRN nonzero!)");
+  return rxThrottleOff;
 }
 
 }  // namespace pci
