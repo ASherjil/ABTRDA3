@@ -306,10 +306,17 @@ inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg,
                                 std::stop_token stop) {
     RecorderChannel ch(cfg.recQueueCapacity);
 
-    // Recorder on its own core (SCHED_OTHER — slow path, must not contend with
-    // the hot core or the NIC IRQ core). Pin via affinity directly (the hot path
-    // keeps the SCHED_FIFO main thread; the recorder stays default-policy).
+    // Recorder on its own core. CRITICAL: it MUST be demoted to SCHED_OTHER. The
+    // jthread is spawned AFTER RuntimeSetup promoted the main thread to
+    // SCHED_FIFO:49, so it INHERITS FIFO:49. If left at FIFO:49 on a core that
+    // also handles the RX NIC IRQ, it starves ksoftirqd there — which silently
+    // kills packet_mmap RX (the kernel softirq can never fill the mmap ring, so
+    // tryReceive() spins forever: observed sent=1 recv=0). AF_XDP busy-polls RX
+    // inline so it survived this, but the kernel-softirq transports do not.
+    // Setting affinity alone does NOT change policy — demote explicitly.
     std::jthread recThread([&](std::stop_token st) {
+        sched_param sp{};                       // priority 0
+        pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(cfg.recRecorderCore, &set);

@@ -139,15 +139,24 @@ class AFXDP {
 
   static constexpr std::uint32_t BATCH_SIZE = 64;
 
-  // Per-NAPI busy-poll tuning (applied post-bind via netlink, see init() step 7.5).
-  // irq-suspend-timeout (kernel 6.13+) keeps device IRQs SUSPENDED while we busy-
-  // poll, so the poll syscall drives NAPI inline with NO gro_flush per-packet floor
-  // — the lever for getting below the ~17us cadence wall. Must be > gro-flush.
-  // gro-flush is then only the idle-transition fallback (NOT a per-packet floor in
-  // the suspended regime). Tunable here without touching the template signature.
-  static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = 100;
-  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 200'000;      // 200us
-  static constexpr std::uint64_t NAPI_IRQ_SUSPEND_NS  = 20'000'000;   // 20ms
+  // Busy-poll regime. CRITICAL kernel fact (net/core/dev.c busy_poll_stop): the
+  // kernel only RE-ARMS NAPI deferral if (defer_hard_irqs_count && gro_flush_timeout)
+  // are BOTH nonzero. If both are 0, after each busy-poll the HARDWARE IRQ fires
+  // immediately -> NAPI runs in softirq from the IRQ, NOT inline from our recvfrom
+  // -> we fall back to the INTERRUPT path (measured: 79us on igc). So busy-poll
+  // REQUIRES nonzero defer + gro-flush. Two working regimes:
+  //  * CLASSIC BUSY-POLL (default): small defer + small gro-flush, NO irq-suspend.
+  //    Keeps busy-poll owning the NAPI but WITHOUT the kernel-6.13 irq-suspend
+  //    hrtimer/APIC machinery that perf showed wastes ~12% of the hot loop
+  //    (native_write_msr 4.25%, lapic_next_deadline, hrtimer_start) on this
+  //    always-hot one-in-flight workload (no idle phase for irq-suspend to exploit).
+  //  * IRQ-SUSPEND (kernel 6.13+): USE_IRQ_SUSPEND=true -> add irq-suspend-timeout
+  //    (good for bursty/idle-cycling server loads; not a saturated ping-pong).
+  // We do NOT care about CPU on this 8-core box; busy-poll burns 100% by design.
+  static constexpr bool          USE_IRQ_SUSPEND      = false;
+  static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = 2;            // must be >0 for busy-poll
+  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 2'000;        // 2us: small timer, NOT a floor while busy-polling
+  static constexpr std::uint64_t NAPI_IRQ_SUSPEND_NS  = 20'000'000;   // 20ms (only used if USE_IRQ_SUSPEND)
 
 public:
   explicit AFXDP(const char*   interface,
@@ -331,28 +340,32 @@ public:
         fmt::print(stderr, "[AFXDP] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
     }
 
-    // 7.5 IRQ-suspension busy-poll regime (RX modes only). Ask the kernel which
-    // NAPI backs THIS socket — xsk_bind marks sk_napi_id at bind, before any
-    // traffic, so SO_INCOMING_NAPI_ID is valid here — then set defer-hard-irqs +
-    // gro-flush-timeout + irq-suspend-timeout on exactly that NAPI (no ephemeral-
-    // id race, no guessing among the PF's NAPIs). irq-suspend keeps device IRQs
-    // masked while we busy-poll so the poll syscall drives NAPI inline with no
-    // gro_flush per-packet floor — the lever to push below the ~17us cadence wall.
-    // Best-effort: WARN, never fatal (matches the ITR/setsockopt blocks).
+    // 7.5 NAPI per-vector busy-poll config (RX modes only). Find THIS socket's
+    // NAPI (xsk_bind marks sk_napi_id at bind, so SO_INCOMING_NAPI_ID is valid).
+    //   USE_IRQ_SUSPEND=true : set defer-hard-irqs + gro-flush + irq-suspend (the
+    //     kernel-6.13 regime; good for bursty/idle server loads).
+    //   USE_IRQ_SUSPEND=false (default, classic busy-poll): set defer + gro-flush
+    //     (BOTH must be nonzero or busy-poll falls back to the IRQ path -> 79us!)
+    //     but irq-suspend=0 -> removes the kernel-6.13 hrtimer/APIC storm (~12% of
+    //     the hot loop here) while keeping busy-poll owning the NAPI.
+    // Best-effort: WARN, never fatal.
     if constexpr (HAS_RX) {
       std::uint32_t napiId  = 0;
       socklen_t     idLen   = sizeof(napiId);
       if (::getsockopt(m_fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napiId, &idLen) == 0
           && napiId != 0) {
-        const bool ok = napi::setBusyPoll(napiId, NAPI_DEFER_HARD_IRQS,
-                                          NAPI_GRO_FLUSH_NS, NAPI_IRQ_SUSPEND_NS);
+        const std::uint32_t defer = NAPI_DEFER_HARD_IRQS;             // nonzero either regime
+        const std::uint64_t gro   = NAPI_GRO_FLUSH_NS;                // nonzero either regime
+        const std::uint64_t susp  = USE_IRQ_SUSPEND ? NAPI_IRQ_SUSPEND_NS : 0;
+        const bool ok = napi::setBusyPoll(napiId, defer, gro, susp);
         fmt::print(stderr,
-          "[AFXDP] NAPI {}: defer-hard-irqs={} gro-flush={}ns irq-suspend={}ns => {}\n",
-          napiId, NAPI_DEFER_HARD_IRQS, NAPI_GRO_FLUSH_NS, NAPI_IRQ_SUSPEND_NS,
-          ok ? "applied" : "FAILED (running without IRQ-suspension)");
+          "[AFXDP] NAPI {}: defer-hard-irqs={} gro-flush={}ns irq-suspend={}ns ({}) => {}\n",
+          napiId, defer, gro, susp,
+          USE_IRQ_SUSPEND ? "irq-suspend regime" : "brute-force busy-poll",
+          ok ? "applied" : "FAILED");
       } else {
         fmt::print(stderr, "[AFXDP] WARN: SO_INCOMING_NAPI_ID unavailable "
-                           "(napi_id={}) — IRQ-suspension not applied\n", napiId);
+                           "(napi_id={}) — NAPI config not applied\n", napiId);
       }
     }
 

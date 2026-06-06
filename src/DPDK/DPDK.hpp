@@ -26,6 +26,7 @@
 #include "BackendBase.hpp"   // ABTEdge — sysfs-resource0 MMIO (for i40e ITR fix)
 
 #include <rte_eal.h>
+#include <rte_cycles.h>   // rte_delay_us_block (link-up wait)
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -328,13 +329,26 @@ public:
     rte_eth_macaddr_get(m_port, &mac);
     std::memcpy(m_mac.data(), mac.addr_bytes, 6);
 
+    // Wait for the link to come UP before returning. Unbinding the kernel driver
+    // onto vfio-pci resets the PHY, and link renegotiation takes ~2-3 s (igc; the
+    // mlx5 bifurcated path is usually already up). The first read right after
+    // dev_start sees DOWN — if the hot loop then transmits immediately (e.g. the
+    // single-recorder), packet 0 goes into a dead wire and nothing returns (seen:
+    // sent=1 recv=0). Poll up to ~9 s; proceed with a WARN if it never comes up.
     rte_eth_link link{};
-    rte_eth_link_get_nowait(m_port, &link);
+    for (int i = 0; i < 90; ++i) {                 // ~9 s, 100 ms steps
+      rte_eth_link_get_nowait(m_port, &link);
+      if (link.link_status == RTE_ETH_LINK_UP) break;
+      rte_delay_us_block(100'000);
+    }
     std::fprintf(stderr,
         "[DPDK] %s port %u (%s) %s %u Mbps  MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
         m_ifname.c_str(), m_port, info.driver_name,
         link.link_status == RTE_ETH_LINK_UP ? "UP" : "DOWN", link.link_speed,
         m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);
+    if (link.link_status != RTE_ETH_LINK_UP)
+      std::fprintf(stderr, "[DPDK] %s: WARN link still DOWN after ~9s — "
+                           "initial packets may be lost\n", m_ifname.c_str());
     return true;
   }
 
