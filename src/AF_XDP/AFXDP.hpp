@@ -89,20 +89,11 @@ struct xsk_socket_info {
   std::uint32_t outstanding_tx{0};
 };
 
-// AlwaysKick: force an unconditional sendto on every commit, even for TxOnly.
-// Default false keeps the cheaper needs_wakeup-gated kick for the continuous
-// throughput generator (txgen), where back-to-back sends keep the TX NAPI hot so
-// the hint is safe and saves a syscall/packet. Set TRUE for a ONE-IN-FLIGHT
-// latency pattern (the single-process recorder): there each send waits for the
-// RX before the next, so there is no continuous stream to keep the NAPI draining
-// — the gated kick can skip the sendto on a freshly-armed ring and the lone
-// descriptor never goes out (TX wedges on packet 0). See kickTx().
 template<AFXDPMode     M,
          std::uint32_t NumRxFrames = 2048,
          std::uint32_t NumTxFrames = 2048,
          std::uint32_t FrameSize   = 4096,
-         bool          NeedWakeup  = true,
-         bool          AlwaysKick  = false>
+         bool          NeedWakeup  = true>
 class AFXDP {
   static_assert(M == AFXDPMode::TxOnly ||
                 (NumRxFrames >= 8 && (NumRxFrames & (NumRxFrames - 1)) == 0),
@@ -445,11 +436,20 @@ public:
   inline RxFrame tryReceive() noexcept requires (HAS_RX) {
     __u32 idx;
     if (xsk_ring_cons__peek(&m_xsk.rx, 1, &idx) == 0) [[likely]] {
-      // Empty: one wakeup to drive a NAPI poll, then re-check so a frame that
-      // poll just delivered is returned in THIS call, not the next spin.
-      ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
-      if (xsk_ring_cons__peek(&m_xsk.rx, 1, &idx) == 0)
-        return {};
+      // Empty peek. The recvfrom that drives the NAPI poll is needed ONLY when
+      // bound with XDP_USE_NEED_WAKEUP (NeedWakeup=true). When NeedWakeup=false
+      // (the arxiv "Cluster 0" lowest-latency config), the kernel never gates the
+      // rings on a wakeup, so busy-poll drives the NAPI WITHOUT any syscall — we
+      // just spin on the ring. Then RE-PEEK so a frame the poll just delivered is
+      // returned in THIS call (A/B-proven tail win on igc: skipping the re-peek
+      // worsened P99.99 25->48us, P99.999 40->94us, Max ~4x).
+      if constexpr (NeedWakeup) {
+        ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+        if (xsk_ring_cons__peek(&m_xsk.rx, 1, &idx) == 0)
+          return {};
+      } else {
+        return {};   // no syscall: next spin re-peeks the ring
+      }
     }
     const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&m_xsk.rx, idx);
     m_pendingRxAddr = desc->addr;
@@ -637,7 +637,8 @@ private:
     }
   }
 
-  // Kick the kernel to start TX (one sendto -> ndo_xsk_wakeup(TX)).
+  // Kick the kernel to start TX (one sendto -> ndo_xsk_wakeup(TX)). Mirrors
+  // xdpsock complete_tx_only: `if (!need_wakeup || needs_wakeup(tx)) kick`.
   //
   // RxTx (interleaved TX+RX, e.g. client/server): kick UNCONDITIONALLY. The
   // XDP_USE_NEED_WAKEUP skip-the-syscall hint is UNSAFE here — after a busy-poll
@@ -645,23 +646,24 @@ private:
   // and the just-submitted descriptor is NEVER transmitted (the recvfrom-driven
   // NAPI services RX but does not pull the ZC TX ring on igc/i40e). PROVEN by
   // cross-transport A/B: AF_XDP client/server TX delivered 0 packets while a
-  // packet_mmap peer's TX delivered fine. One sendto/RTT is the cost of a correct
-  // ping-pong (it IS the trigger that puts the request on the wire).
+  // packet_mmap peer's TX delivered fine.
   //
-  // TxOnly (pure throughput, e.g. txgen): keep the cheaper needs_wakeup-gated
-  // kick — continuous sends keep the TX NAPI draining, so honoring the hint saves
-  // a syscall/packet and the standalone path already runs at line rate.
+  // TxOnly (txgen, AND the single-recorder's split-port Tx): needs_wakeup-gated
+  // kick (xdpsock-faithful). Verified on igc that the gated kick drives the
+  // single-recorder Tx cleanly (separate Tx/Rx ports = separate NAPIs, so the
+  // shared-NAPI igc_xsk_wakeup TX-NOP that bit RxTx does not apply here). The
+  // earlier AlwaysKick override was removed once this was proven (same latency).
   //
-  // XDP_USE_NEED_WAKEUP stays set at bind regardless (required on i40e ZC; false
+  // XDP_USE_NEED_WAKEUP stays set at bind for RxTx (required on i40e ZC; false
   // hangs the kernel) — we just choose when to use its hint.
   [[gnu::always_inline, gnu::hot]]
   inline void kickTx() noexcept requires (HAS_TX) {
-    if constexpr (HAS_RX || AlwaysKick) {         // RxTx, or one-in-flight TxOnly
+    if constexpr (HAS_RX) {                       // RxTx: must always kick
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-    } else if constexpr (NeedWakeup) {            // TxOnly streaming + need_wakeup: gated
+    } else if constexpr (NeedWakeup) {            // TxOnly + need_wakeup: gated (xdpsock)
       if (xsk_ring_prod__needs_wakeup(&m_xsk.tx))
         ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-    } else {                                       // TxOnly streaming, no need_wakeup
+    } else {                                       // TxOnly, no need_wakeup: always kick
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
     }
   }

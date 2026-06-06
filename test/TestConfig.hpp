@@ -38,9 +38,9 @@ struct TestConfig {
     std::uint32_t mmapBlockSize   = 4096;
     std::uint32_t mmapBlockNumber = 512;
 
-    std::uint32_t xdpUmemFrameSize = 4096;
-    std::uint32_t xdpFrameCount    = 64;
-    bool          xdpNeedWakeup    = true;
+    // NOTE: AF_XDP frame size / frame count / need_wakeup are COMPILE-TIME template
+    // params on AFXDP<> (FrameSize, NumRxFrames/NumTxFrames, NeedWakeup), NOT runtime
+    // config — so there is deliberately no [af_xdp] TOML section to read here.
 
     // [single_recorder] — single-process one-way Tx->Rx latency benchmark.
     // hotPathCore runs the timed loop; recorderCore drains the SPSC queue into
@@ -102,9 +102,8 @@ inline TestConfig loadConfig(const char* path) {
     cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096));
     cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));
 
-    cfg.xdpUmemFrameSize = static_cast<std::uint32_t>(tbl["af_xdp"]["umem_frame_size"].value_or(4096));
-    cfg.xdpFrameCount    = static_cast<std::uint32_t>(tbl["af_xdp"]["frame_count"].value_or(64));
-    cfg.xdpNeedWakeup    = tbl["af_xdp"]["need_wakeup"].value_or(true);
+    // [af_xdp] frame size/count/need_wakeup are compile-time template params on
+    // AFXDP<> — intentionally NOT read from TOML (see struct note above).
 
     cfg.recHotPathCore   = tbl["single_recorder"]["hot_path_core"].value_or(2);
     cfg.recRecorderCore  = tbl["single_recorder"]["benchmark_recorder_core"].value_or(4);

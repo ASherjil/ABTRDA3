@@ -367,14 +367,15 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
     }
 
     if (transport == "af_xdp") {
-        // Tx-only on the client port, Rx-only on the server port. Distinct ports
-        // => distinct NAPIs. CRITICAL: AlwaysKick=true on the TxOnly socket — this
-        // is a ONE-IN-FLIGHT latency loop (send, wait for RX, repeat), NOT a
-        // continuous stream, so the needs_wakeup-gated kick can skip the sendto on
-        // a freshly-armed ring and wedge TX on packet 0 (observed: tx_packets=0,
-        // process spinning). Forcing the kick guarantees every packet goes out.
-        AFXDP<AFXDPMode::TxOnly, 2048, 2048, 4096, /*NeedWakeup=*/true, /*AlwaysKick=*/true>
-            tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
+        // Tx on the client port, Rx on the server port — DISTINCT ports => distinct
+        // NAPIs, so the gated TX kick (xdpsock-faithful) drives TX cleanly and the
+        // shared-NAPI igc_xsk_wakeup TX-NOP (which bit the RxTx-same-socket path)
+        // does not apply. NeedWakeup=true on both:
+        //  - Rx: the per-empty-poll recvfrom is TAIL INSURANCE — A/B proved removing
+        //    it (need_wakeup=false / gating) buys ~1.3us median but costs ~7-8us at
+        //    P99/P99.9. For WR-style timing the tail is the spec, so keep it.
+        //  - Tx: TxOnly + NeedWakeup=true => kickTx uses the needs_wakeup-gated kick.
+        AFXDP<AFXDPMode::TxOnly> tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
         AFXDP<AFXDPMode::RxOnly> rx(cfg.server.interface.c_str(), cfg.server.xdpQueueId);
         if (!tx.init()) { fmt::println(stderr, "Error: Tx AF_XDP init failed on {}", cfg.client.interface); return 1; }
         if (!rx.init()) { fmt::println(stderr, "Error: Rx AF_XDP init failed on {}", cfg.server.interface); return 1; }
