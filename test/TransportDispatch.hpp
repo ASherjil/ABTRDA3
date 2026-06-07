@@ -399,8 +399,13 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
             fmt::println(stderr, "Error: DPDK prepare (vfio bind) failed");
             return 1;
         }
-        if (!tx.init()) { fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface); return 1; }
-        if (!rx.init()) { fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface); return 1; }
+        // Loopback pair (port0 TX <-> port1 RX on one card): START BOTH ports
+        // (init(false) = no link wait) BEFORE waiting EITHER link, because a
+        // loopback link only comes up once both PHYs are up. Then wait both.
+        if (!tx.init(false)) { fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface); return 1; }
+        if (!rx.init(false)) { fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface); return 1; }
+        if (!tx.waitLink()) { fmt::println(stderr, "Error: Tx DPDK link down on {}", cfg.client.interface); return 1; }
+        if (!rx.waitLink()) { fmt::println(stderr, "Error: Rx DPDK link down on {}", cfg.server.interface); return 1; }
         driveSingleRecorder(tx, rx, cfg, stop);
         return 0;
     }

@@ -208,7 +208,13 @@ public:
   }
 
   // ── Cold path phase 2: EAL + port bring-up ─────────────────────────────────
-  [[nodiscard]] bool init() noexcept {
+  // doWaitLink=true (default): start the port AND block until link is up — used by
+  // single-port-per-process modes (client/server, txgen). doWaitLink=false: start
+  // only, do NOT wait — used by the single-recorder, which owns BOTH ports of a
+  // loopback pair in one process and must start BOTH before waiting EITHER (a
+  // loopback link only comes up once both PHYs are up). It then calls waitLink()
+  // on each. See waitLink().
+  [[nodiscard]] bool init(bool doWaitLink = true) noexcept {
     if (!prepare()) return false;   // no-op if the recorder already prepared us
 
     // EAL + port. ealInitOnce allowlists every BDF registered by prepare() so
@@ -329,41 +335,62 @@ public:
     rte_eth_macaddr_get(m_port, &mac);
     std::memcpy(m_mac.data(), mac.addr_bytes, 6);
 
-    // Wait for the link to come UP before returning. Unbinding the kernel driver
-    // onto vfio-pci resets the PHY, and link renegotiation takes ~2-3 s (igc; the
-    // mlx5 bifurcated path is usually already up). The first read right after
-    // dev_start sees DOWN — if the hot loop then transmits immediately (e.g. the
-    // single-recorder), packet 0 goes into a dead wire and nothing returns (seen:
-    // sent=1 recv=0). Poll up to ~9 s; proceed with a WARN if it never comes up.
+    if (doWaitLink) return waitLink();
+    return true;
+  }
+
+  // Wait for link UP. SEPARATED from init() so a two-port loopback pair (the
+  // single-recorder: port0 TX <-> port1 RX on ONE card via the DAC) can START
+  // BOTH ports before waiting EITHER. A loopback link only comes up once BOTH
+  // PHYs are up, so the old per-port "init+wait in sequence" left the first port
+  // waiting for a peer that wasn't started yet (it would time out, then the second
+  // port's start brought the pair up). Dispatch now calls init(false) on both,
+  // then waitLink() on both.
+  //
+  // Re-run robustness: a prior run's dev_close parks the PHY DOWN. We give passive
+  // autoneg a 2 s grace (don't tear down a link that's mid-negotiation), then
+  // actively restart autoneg via rte_eth_dev_set_link_up() and re-kick every ~3 s
+  // to recover the cold PHY — so re-runs come up without a manual driver rebind.
+  // -ENOTSUP (bifurcated PMDs like mlx5, link already up) is expected/harmless.
+  [[nodiscard]] bool waitLink() noexcept {
     rte_eth_link link{};
-    for (int i = 0; i < 90; ++i) {                 // ~9 s, 100 ms steps
+    for (int i = 0; i < 200; ++i) {                // up to ~20 s, 100 ms steps
       rte_eth_link_get_nowait(m_port, &link);
       if (link.link_status == RTE_ETH_LINK_UP) break;
+      if (i == 20 || (i > 20 && (i % 30) == 0)) {  // after 2 s grace, then every ~3 s
+        int e = rte_eth_dev_set_link_up(m_port);
+        if (e != 0 && e != -ENOTSUP)
+          std::fprintf(stderr, "[DPDK] %s: set_link_up returned %d\n", m_ifname.c_str(), e);
+      }
       rte_delay_us_block(100'000);
     }
     std::fprintf(stderr,
-        "[DPDK] %s port %u (%s) %s %u Mbps  MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-        m_ifname.c_str(), m_port, info.driver_name,
+        "[DPDK] %s port %u %s %u Mbps  MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+        m_ifname.c_str(), m_port,
         link.link_status == RTE_ETH_LINK_UP ? "UP" : "DOWN", link.link_speed,
         m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);
     if (link.link_status != RTE_ETH_LINK_UP)
-      std::fprintf(stderr, "[DPDK] %s: WARN link still DOWN after ~9s — "
+      std::fprintf(stderr, "[DPDK] %s: WARN link still DOWN after ~20s — "
                            "initial packets may be lost\n", m_ifname.c_str());
-    return true;
+    return true;   // non-fatal: the recorder's warmup retries tolerate a slow link
   }
 
   void shutdown() noexcept {
     if (!m_started) return;
     if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
+    // Clean stop ONLY. rte_eth_dev_stop() disables the queues/DMA/MSI-X and cancels
+    // the periodic alarm, so the device CANNOT run unattended on vfio and contend on
+    // PCIe with the next run's NIC. (An earlier no-dev_stop version left the igc
+    // DMA-ing during a subsequent XXV710 run -> fat tail; this prevents that.)
+    // We deliberately do NOT set_link_up here and do NOT dev_close: dev_stop parks
+    // the PHY (i40e_dev_stop -> i40e_dev_set_link_down), so the next run's dev_start
+    // brings the link up FROM PARKED = a one-time ~4.7ms autoneg re-sync ~85ms in —
+    // which the recorder's 500k-packet (~2.5s) warmup ABSORBS before timing starts.
+    // Device stays on vfio-pci (bind-once); the next process re-probes and
+    // i40e_pf_reset() cleans the stopped state. Restore the kernel driver if ever
+    // needed: sudo dpdk-devbind.py --bind=i40e <bdf> (or reboot).
     rte_eth_dev_stop(m_port);
-    rte_eth_dev_close(m_port);
     m_started = false;
-    // Deliberately LEAVE the device on vfio-pci (standard DPDK "bind once" model).
-    // Rebinding the kernel driver here HANGS the destructor: the sysfs driver/unbind
-    // blocks until vfio releases the device, but EAL still holds it open (we don't
-    // call rte_eal_cleanup), so the write never returns. Re-runs resolve the BDF from
-    // the predictable name (pci::bdfFromName) since the netdev is gone. Restore the
-    // kernel driver manually if needed:  sudo dpdk-devbind.py --bind=i40e <bdf>  (or reboot).
   }
 
   [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept { return m_mac; }

@@ -92,10 +92,17 @@ public:
         while (!m_ch.ready.load(std::memory_order_acquire) && !stop.stop_requested())
             ;
 
-        const std::uint64_t runStart    = tsc::now();
-
         std::uint32_t seq = 0;
         std::uint64_t sent = 0, recv = 0;
+
+        // Warm the NIC datapath BEFORE timing starts — kick the "diesel engine".
+        // Sends/receives a burst that is NOT timed and discarded, so the cold
+        // first-packet cost (TX path bring-up, i40e GLQF register init, descriptor
+        // rings, CPU caches) AND the documented XXV710 cold-start frame loss
+        // (first ~0-63 frames) never enter the measurement. Transport-generic.
+        primeDatapath(seq, stop);
+
+        const std::uint64_t runStart    = tsc::now();   // timing starts AFTER warmup
 
         while (true) {
             const std::uint64_t t0 = tsc::now();
@@ -159,6 +166,46 @@ public:
     }
 
 private:
+    // Warm the TX->RX datapath before timing — kick the NIC "diesel engine". A
+    // LONG fixed burst (500k packets ~= 2.5s at ~5us/round-trip), each waited
+    // UNBOUNDED (no per-packet deadline). The length is deliberate: the clean
+    // dev_stop shutdown parks the PHY, so THIS run's dev_start brings the link up
+    // FROM PARKED -> a cold settle plus a one-time ~4.7ms link re-sync ~85ms in.
+    // A 2.5s window comfortably covers that, and the unbounded per-packet wait lets
+    // the settling round-trip complete and be ABSORBED here instead of leaking into
+    // the timed loop. Advances `seq` so timing starts past the cold packets. NOT
+    // timed, results discarded. Transport-generic (acquire/commit + tryReceive/
+    // release). Only SIGINT (stop_token) can break it.
+    [[gnu::cold]]
+    void primeDatapath(std::uint32_t& seq, std::stop_token& stop) {
+        constexpr std::uint32_t kWarmupPackets = 500'000;   // ~2.5s; covers the ~85ms re-sync
+        for (std::uint32_t w = 0; w < kWarmupPackets && !stop.stop_requested(); ++w, ++seq) {
+            std::uint8_t* dst = m_tx.acquire(m_cfg.frameSize);
+            if (!dst) continue;
+            const std::uint32_t seqNet = htonl(seq);
+            std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
+            m_tx.commit();
+            // Spin until OUR echo returns — NO deadline, NO timer. A cold-start
+            // packet may take several ms to settle (observed ~4.7 ms); we simply
+            // wait it out so that one-time settle is ABSORBED here instead of
+            // leaking into the timed loop. Mirrors the timed loop's unbounded spin.
+            // Only SIGINT (stop_token, checked every 64K empty polls) can break it,
+            // so a genuinely dead link is still escapable with Ctrl-C.
+            std::uint32_t spins = 0;
+            while (true) {
+                RxFrame f = m_rx.tryReceive();
+                if (!f.data.empty()) {
+                    const bool mine = std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0;
+                    std::uint32_t rxSeq = 0;
+                    if (mine) std::memcpy(&rxSeq, f.data.data() + 14, sizeof(rxSeq));
+                    m_rx.release();
+                    if (mine && rxSeq == seqNet) break;   // our echo -> next warmup packet
+                }
+                if ((++spins & 0xFFFF) == 0 && stop.stop_requested()) break;
+            }
+        }
+    }
+
     // ── Tail diagnostics (compile-time gated; flip to false for the pristine
     //    production path). Splits each round into send / spin / release segments
     //    and captures the rare slow rounds so we can see WHICH segment balloons
@@ -170,7 +217,8 @@ private:
     //    (~20ns/packet, symmetric, preserves the tail shape) + one integer compare.
     //    Periodicity is read off the CSV's seq_gap column offline — no map/sort. ─
     static constexpr bool        INSTRUMENT_SLOW   = true;
-    static constexpr double      SLOW_THRESHOLD_US = 10.0;      // body ~5us; tail >=15us
+    static constexpr double      SLOW_THRESHOLD_US = 6.0;       // ~just above P99.999 (~5.7us)
+                                                               // so the 6-10us tail is captured
     static constexpr std::size_t SLOW_CAP          = 1'000'000; // ~16 MB, one alloc
 
     struct SlowEvent {
