@@ -31,6 +31,7 @@ function(bpf_compile)
     # -g          : emit BTF debug info (required by libbpf for global var rewrite)
     add_custom_command(
         OUTPUT  "${bpf_obj}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${BPF_OUTPUT_DIR}"
         COMMAND ${CLANG_BPF}
                 -target bpf
                 -O2 -g

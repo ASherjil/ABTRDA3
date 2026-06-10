@@ -30,6 +30,16 @@
 
 namespace napi {
 
+// netdev-genl uAPI constants (linux/netdev.h, kernel >= 6.13). Carried locally
+// with their ABI-frozen values so the header builds against OLDER kernel
+// headers too (e.g. a workstation on a pre-6.13 toolchain) — uAPI enum values
+// never change once released, and enums can't be probed with #ifdef.
+inline constexpr std::uint8_t  kCmdNapiSet              = 14;  // NETDEV_CMD_NAPI_SET
+inline constexpr std::uint16_t kAttrNapiId              = 2;   // NETDEV_A_NAPI_ID
+inline constexpr std::uint16_t kAttrNapiDeferHardIrqs   = 5;   // NETDEV_A_NAPI_DEFER_HARD_IRQS
+inline constexpr std::uint16_t kAttrNapiGroFlushTimeout = 6;   // NETDEV_A_NAPI_GRO_FLUSH_TIMEOUT
+inline constexpr std::uint16_t kAttrNapiIrqSuspend      = 7;   // NETDEV_A_NAPI_IRQ_SUSPEND_TIMEOUT
+
 namespace detail {
 
 // Append one netlink attribute (header + value, NLA_ALIGN-padded) to buf at off.
@@ -131,14 +141,14 @@ inline bool setBusyPoll(std::uint32_t napiId,
   nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
   nlh->nlmsg_seq   = 2;
   auto* gnlh = reinterpret_cast<genlmsghdr*>(NLMSG_DATA(nlh));
-  gnlh->cmd     = NETDEV_CMD_NAPI_SET;
+  gnlh->cmd     = kCmdNapiSet;
   gnlh->version = 1;
 
   std::size_t off = NLMSG_ALIGN(nlh->nlmsg_len);
-  off = detail::putAttr<std::uint32_t>(buf, off, NETDEV_A_NAPI_ID, napiId);
-  off = detail::putAttr<std::uint32_t>(buf, off, NETDEV_A_NAPI_DEFER_HARD_IRQS, deferHardIrqs);
-  off = detail::putAttr<std::uint64_t>(buf, off, NETDEV_A_NAPI_GRO_FLUSH_TIMEOUT, groFlushNs);
-  off = detail::putAttr<std::uint64_t>(buf, off, NETDEV_A_NAPI_IRQ_SUSPEND_TIMEOUT, irqSuspendNs);
+  off = detail::putAttr<std::uint32_t>(buf, off, kAttrNapiId, napiId);
+  off = detail::putAttr<std::uint32_t>(buf, off, kAttrNapiDeferHardIrqs, deferHardIrqs);
+  off = detail::putAttr<std::uint64_t>(buf, off, kAttrNapiGroFlushTimeout, groFlushNs);
+  off = detail::putAttr<std::uint64_t>(buf, off, kAttrNapiIrqSuspend, irqSuspendNs);
   nlh->nlmsg_len = static_cast<std::uint32_t>(off);
 
   if (::send(fd, buf, nlh->nlmsg_len, 0) < 0) {

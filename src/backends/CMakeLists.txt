@@ -7,19 +7,19 @@ add_library(abtrda3 STATIC
     common/NicTuner.cpp
 
     # PACKET_MMAP transport
-    PACKET_MMAP/SocketOps.cpp
-    PACKET_MMAP/PacketMmapRx.cpp
-    PACKET_MMAP/PacketMmapTx.cpp
+        PacketMmap/SocketOps.cpp
+        PacketMmap/PacketMmapRx.cpp
+        PacketMmap/PacketMmapTx.cpp
 
     # AF_XDP transport is header-only (AFXDP.hpp); no .cpp here.
 )
 
 target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/common>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/PACKET_MMAP>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/PacketMmap>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Intel_I210>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Cadence_GEM>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/IGBCustomPMD>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/MacbCustomPMD>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/TapBridge>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>
@@ -39,10 +39,10 @@ target_link_libraries(abtrda3
 # =============================================================================
 
 # 1. Fetch + build libbpf (provides libbpf::libbpf IMPORTED target)
-include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Libbpf.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/Libbpf.cmake)
 
 # 2. Compile XDP filter program and embed as C header
-include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/BpfCompile.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/BpfCompile.cmake)
 bpf_compile(
     TARGET     abtrda3
     SOURCE     "${CMAKE_CURRENT_SOURCE_DIR}/bpf/xdp_filter.bpf.c"
@@ -84,13 +84,14 @@ pkg_check_modules(LIBMLX5 REQUIRED IMPORTED_TARGET libmlx5)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBMLX5)
 message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE poll)")
 
-# 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style)
-#    Output to both src build dir and test build dir.
+# 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style).
+#    Output lands NEXT TO the abtrda3_test executable (build/src/app) — the
+#    transport loads "af_xdp_kern.o" relative to the run directory.
 set(BPF_KERN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP/af_xdp_kern.c")
-set(BPF_KERN_DST "${CMAKE_BINARY_DIR}/test/af_xdp_kern.o")
+set(BPF_KERN_DST "${CMAKE_BINARY_DIR}/src/app/af_xdp_kern.o")
 add_custom_command(
     OUTPUT "${BPF_KERN_DST}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/test"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/src/app"
     COMMAND clang -O2 -target bpf -g -c "${BPF_KERN_SRC}" -o "${BPF_KERN_DST}"
             -I${libbpf_SOURCE_DIR}/src
     DEPENDS "${BPF_KERN_SRC}"

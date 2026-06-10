@@ -4,7 +4,14 @@
 
 # Build artifacts
 build/
+build-*/
 cmake-build-*/
+
+# Server-side tooling (deployed by hand, not part of the library)
+scripts/
+
+# Reference copy of the kernel xdpsock sample (kept on disk, not versioned)
+xdpsock.c
 
 # Latency analysis — track plots and scripts, not raw data
 test/latency_analysis/*.txt

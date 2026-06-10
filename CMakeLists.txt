@@ -103,16 +103,16 @@ FetchContent_MakeAvailable(fmt)
 # Library
 # =============================================================================
 
-add_subdirectory(src)
+add_subdirectory(src/backends)
 
 # =============================================================================
-# Tests
+# Application layer + test executables
 # =============================================================================
 
 option(ABTRDA3_BUILD_TESTS "Build test executables" ON)
 
 if(ABTRDA3_BUILD_TESTS)
-    add_subdirectory(test)
+    add_subdirectory(src/app)
 endif()
 
 # =============================================================================
