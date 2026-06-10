@@ -80,6 +80,9 @@ message(STATUS "DPDK transport: libdpdk ${LIBDPDK_VERSION}")
 pkg_check_modules(LIBIBVERBS REQUIRED IMPORTED_TARGET libibverbs)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBIBVERBS)
 message(STATUS "Verbs transport: libibverbs ${LIBIBVERBS_VERSION}")
+pkg_check_modules(LIBMLX5 REQUIRED IMPORTED_TARGET libmlx5)
+target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBMLX5)
+message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE poll)")
 
 # 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style)
 #    Output to both src build dir and test build dir.
