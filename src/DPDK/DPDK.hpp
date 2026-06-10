@@ -64,10 +64,15 @@ inline std::vector<std::string>& allowedBdfs() {
 }
 
 // Register a BDF to be allowlisted at EAL init. Must be called BEFORE ealInit()
-// (i.e. before any port's DPDK::init() triggers it). Deduplicates.
+// (i.e. before any port's DPDK::init() triggers it). The entry may carry devargs
+// ("<bdf>,key=val"); dedup compares the BDF part only, first registration wins —
+// so prepare()'s devargs-bearing entry isn't shadowed by ealInit's bare fallback.
 inline void addAllowedBdf(const std::string& bdf) {
   auto& v = allowedBdfs();
-  if (std::find(v.begin(), v.end(), bdf) == v.end()) v.push_back(bdf);
+  const auto key = bdf.substr(0, bdf.find(','));
+  for (const auto& e : v)
+    if (e.substr(0, e.find(',')) == key) return;
+  v.push_back(bdf);
 }
 
 // Initialise EAL once, allowlisting every registered BDF (plus `bdf` if not yet
@@ -81,8 +86,8 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
   addAllowedBdf(bdf);
   const auto& bdfs = allowedBdfs();
 
-  // file-prefix derived from the first BDF (unique per process).
-  std::string prefix = "abtrda3_" + bdfs.front();
+  // file-prefix derived from the first BDF (unique per process; strip any devargs).
+  std::string prefix = "abtrda3_" + bdfs.front().substr(0, bdfs.front().find(','));
   for (char& c : prefix) if (c == ':' || c == '.') c = '_';
   std::string lcoreStr = std::to_string(lcore);
 
@@ -110,10 +115,14 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
 
 enum class DpdkMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
+// NbRx/TxDesc 256 (was 1024): with one packet in flight the rings are pure cache
+// footprint — 1024 RX CQEs alone is 64KB cycling through L2; 256 keeps CQ+SQ hot
+// in L1/L2. PMD minimums (mlx5, i40e: 64) are far below; adjust_nb_rx_tx_desc
+// still rounds up if a PMD ever needs more.
 template<DpdkMode M,
          std::uint16_t QueueId   = 0,
-         std::uint16_t NbRxDesc  = 1024,
-         std::uint16_t NbTxDesc  = 1024,
+         std::uint16_t NbRxDesc  = 256,
+         std::uint16_t NbTxDesc  = 256,
          std::uint16_t BurstSize = 32,
          std::uint32_t NumMbufs  = 8191,
          std::uint16_t MaxFrame  = RTE_MBUF_DEFAULT_DATAROOM>
@@ -124,6 +133,15 @@ class DPDK {
   static constexpr bool          HAS_RX     = (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
   static constexpr bool          HAS_TX     = (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
   static constexpr std::uint32_t MBUF_CACHE = 250;   // per-lcore mempool cache
+
+  // mlx5 reusable-TX-mbuf path (see acquire()): only frames guaranteed to be
+  // fully inlined into the WQE may reuse the buffer (default inlen_send = 290B,
+  // txq_inline_max unset; 128 keeps a wide margin). The PMD's completion-time
+  // refcnt decrements lag sends by at most NbTxDesc, so topping up whenever the
+  // count dips below REFCNT_LOW (>> NbTxDesc) guarantees it never reaches zero.
+  static constexpr std::uint32_t INLINE_SAFE_LEN = 128;
+  static constexpr std::uint16_t REFCNT_LOW      = 0x2000;
+  static constexpr std::uint16_t REFCNT_TOPUP    = 0x4000;
 
 public:
   // ifname: kernel interface name ("enp1s0f1np1"). lcore: EAL main lcore — must
@@ -141,7 +159,9 @@ public:
       m_lcore{o.m_lcore}, m_pci{std::move(o.m_pci)},
       m_port{o.m_port}, m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
       m_txTemplate{o.m_txTemplate}, m_txTemplateLen{o.m_txTemplateLen},
-      m_prepared{o.m_prepared}, m_started{std::exchange(o.m_started, false)} {}
+      m_prepared{o.m_prepared}, m_started{std::exchange(o.m_started, false)},
+      m_txReuse{std::exchange(o.m_txReuse, nullptr)},
+      m_txReuseInline{o.m_txReuseInline} {}
 
   DPDK& operator=(DPDK&& o) noexcept {
     if (this != &o) {
@@ -157,6 +177,8 @@ public:
       m_txTemplateLen = o.m_txTemplateLen;
       m_prepared      = o.m_prepared;
       m_started       = std::exchange(o.m_started, false);
+      m_txReuse       = std::exchange(o.m_txReuse, nullptr);
+      m_txReuseInline = o.m_txReuseInline;
     }
     return *this;
   }
@@ -201,8 +223,32 @@ public:
     }
 
     // Register this BDF so the one process-wide EAL init allowlists it (and any
-    // sibling port that also registered before EAL came up).
-    dpdk::addAllowedBdf(m_pci);
+    // sibling port that also registered before EAL came up). mlx5 devargs:
+    //  txq_mem_algn=0    — disable the consecutive-TxQ-umem feature (DPDK >= 25.x,
+    //    a cache-alignment optimisation for MANY-queue workloads) — with two
+    //    single-queue ports in one process its chunk allocation fails on the
+    //    second port ("Failed to allocate consecutive memory for TxQs");
+    //    0 = legacy per-queue allocation + own MRs.
+    //  txqs_min_inline=0 — enable FULL Tx data inlining at 1 queue. By default
+    //    inlining needs >= 8 Tx queues (mlx5_txq.c txq_set_params: "If there are
+    //    few Tx queues it is prioritized to save CPU cycles and disable data
+    //    inlining at all"); below that, ConnectX-4 Lx inlines only the forced
+    //    18B L2 minimum and the NIC gather-DMAs the rest of the frame from host
+    //    memory on EVERY send. With 0 the whole 64B frame rides inside the WQE —
+    //    no payload DMA read. Verify via the tx burst mode print ("INLINE").
+    //    A/B 2026-06-10: -520ns UNIFORM shift (median 2.325 -> 1.806us).
+    //  rxq_cqe_comp_en=0 — disable CQE compression: completions arrive as plain
+    //    64B CQEs, no decompression step in the RX poll path (compression saves
+    //    PCIe bandwidth under load — pointless at one packet in flight).
+    //    A/B 2026-06-10: neutral (median identical) — kept, zero cost.
+    //  sq_db_nc=1 REJECTED (A/B 2026-06-10): non-cached doorbell made the whole
+    //    band +10-20ns worse (NC serializes every store of the ~3-WQEBB BlueFlame
+    //    write; the default WC mapping batches it). Default (0, WC) is optimal here.
+    dpdk::addAllowedBdf(bifurcated
+        ? m_pci + ",txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0"
+        : m_pci);
+    // Full-inline TX => the reusable-mbuf fast path is safe (see acquire()).
+    m_txReuseInline = bifurcated;
     m_prepared = true;
     return true;
   }
@@ -326,6 +372,17 @@ public:
       }
     }
 
+    // Report the PMD-selected burst modes — the cheap way to VERIFY a devarg took
+    // effect (e.g. mlx5 Tx must report "INLINE" once txqs_min_inline=0 applies;
+    // i40e reports its AVX512 vector paths here too).
+    rte_eth_burst_mode bm{};
+    if constexpr (M != DpdkMode::RxOnly)
+      if (rte_eth_tx_burst_mode_get(m_port, QueueId, &bm) == 0)
+        std::fprintf(stderr, "[DPDK] %s: tx burst mode: %s\n", m_ifname.c_str(), bm.info);
+    if constexpr (M != DpdkMode::TxOnly)
+      if (rte_eth_rx_burst_mode_get(m_port, QueueId, &bm) == 0)
+        std::fprintf(stderr, "[DPDK] %s: rx burst mode: %s\n", m_ifname.c_str(), bm.info);
+
     // Promiscuous mode is NOT enabled: both ends of the test know the peer MAC
     // (toml carries client.mac + server.mac), so the NIC's MAC unicast filter does
     // the work. Promisc forces every received unicast through the full RX pipeline
@@ -390,6 +447,16 @@ public:
     // i40e_pf_reset() cleans the stopped state. Restore the kernel driver if ever
     // needed: sudo dpdk-devbind.py --bind=i40e <bdf> (or reboot).
     rte_eth_dev_stop(m_port);
+    // After dev_stop the PMD has flushed the TX ring (its refcnt decrements are
+    // done) — reset our topped-up count to 1 so the free actually reaches zero
+    // and the mbuf returns to the pool.
+    if constexpr (HAS_TX) {
+      if (m_txReuse) {
+        rte_mbuf_refcnt_set(m_txReuse, 1);
+        rte_pktmbuf_free(m_txReuse);
+        m_txReuse = nullptr;
+      }
+    }
     m_started = false;
   }
 
@@ -432,8 +499,34 @@ public:
   // acquire() returns a fresh mbuf's data pointer (header pre-stamped from
   // prefillRing); caller writes payload; commit() bursts it. On success the PMD
   // owns and later frees the mbuf.
+  //
+  // mlx5 full-inline fast path (m_txReuseInline): with txqs_min_inline=0 the PMD
+  // COPIES the whole small frame into the WQE inside the tx_burst call itself, so
+  // the buffer is reusable the moment commit() returns — ONE mbuf re-sent forever,
+  // no per-round alloc/free, no mempool cache traffic. The PMD still decrements
+  // refcnt once per send when it processes completions (which happens inside our
+  // own tx_burst calls — single-threaded, so the plain refcnt read is race-free);
+  // we top the 16-bit refcnt back up before it can drain (decrements lag sends by
+  // at most the TX ring depth, far less than REFCNT_LOW). Gated to frames small
+  // enough to be guaranteed inlined (default inlen_send = 290B; we stay well under).
   [[nodiscard, gnu::always_inline, gnu::hot]]
   inline std::uint8_t* acquire(std::uint32_t frameLen) noexcept requires (HAS_TX) {
+    if (m_txReuseInline && frameLen <= INLINE_SAFE_LEN) {
+      if (!m_txReuse) [[unlikely]] {
+        m_txReuse = rte_pktmbuf_alloc(m_pool);
+        if (!m_txReuse) return nullptr;
+        rte_mbuf_refcnt_set(m_txReuse, REFCNT_TOPUP);
+        if (m_txTemplateLen)
+          std::memcpy(rte_pktmbuf_mtod(m_txReuse, std::uint8_t*),
+                      m_txTemplate.data(), m_txTemplateLen);
+      }
+      if (rte_mbuf_refcnt_read(m_txReuse) < REFCNT_LOW) [[unlikely]]
+        rte_mbuf_refcnt_update(m_txReuse, REFCNT_TOPUP);
+      m_pendingTx = m_txReuse;
+      m_pendingTx->data_len = static_cast<std::uint16_t>(frameLen);
+      m_pendingTx->pkt_len  = frameLen;
+      return rte_pktmbuf_mtod(m_pendingTx, std::uint8_t*);
+    }
     m_pendingTx = rte_pktmbuf_alloc(m_pool);
     if (!m_pendingTx) [[unlikely]] return nullptr;
     m_pendingTx->data_len = static_cast<std::uint16_t>(frameLen);
@@ -515,4 +608,7 @@ private:
 
   bool                               m_prepared{false};
   bool                               m_started{false};
+
+  rte_mbuf*                          m_txReuse{nullptr};       // mlx5 full-inline: the one reusable TX mbuf
+  bool                               m_txReuseInline{false};   // set in prepare(): mlx5/bifurcated only
 };
