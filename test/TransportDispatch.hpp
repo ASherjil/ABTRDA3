@@ -292,12 +292,12 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
 // ── Single-process one-way latency recorder ─────────────────────────────────
 //
 // Builds a Tx transport (on the client port) and an Rx transport (on the server
-// port) in ONE process, runs HotPath on the calling thread (already pinned to
+// port) in ONE process, runs LoopBack on the calling thread (already pinned to
 // hot_path_core + SCHED_FIFO by the RuntimeSetup in main) and Recorder on a
 // second thread self-pinned to benchmark_recorder_core. One host TSC brackets
 // every packet, so there is no clock-sync problem (see SingleRecorder.hpp).
 //
-// Transport-generic: HotPath/Recorder are templated on TxRing/RxRing, so this
+// Transport-generic: LoopBack/Recorder are templated on TxRing/RxRing, so this
 // helper just constructs the right Tx+Rx pair and runs them. Both ports must use
 // the same transport (client.transport == server.transport).
 
@@ -327,7 +327,7 @@ inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg,
     });
 
     // Hot path on THIS thread (already pinned to hot_path_core + SCHED_FIFO).
-    HotPath<Tx, Rx> hot(tx, rx, cfg, ch, cfg.recDurationSec);
+    LoopBack<Tx, Rx> hot(tx, rx, cfg, ch, cfg.recDurationSec);
     hot(stop);
     // hot() set ch.done; recThread drains + reports, then joins at scope exit.
 }

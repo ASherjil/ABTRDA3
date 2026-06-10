@@ -9,7 +9,7 @@
 // busy-poll RX delivery) that an RTT bundles together with peer turnaround.
 //
 // Two threads, each a functor (operator()), connected by a lock-free SPSC queue:
-//   * HotPath  (producer): time-bounded loop. acquire->commit->send->spin-receive
+//   * LoopBack (producer): time-bounded loop. acquire->commit->send->spin-receive
 //     ->verify(MAC+seq)->release, brackets with rdtscp, pushes the raw cycle
 //     delta. NOTHING else touches the hot core — no allocation, no syscalls
 //     beyond the transport's own, no histogram, no I/O.
@@ -52,14 +52,14 @@ struct RecorderChannel {
     explicit RecorderChannel(std::size_t capacity) : queue(capacity) {}
 };
 
-// ── Producer: the hot path ──────────────────────────────────────────────────
+// ── Producer: the loopback hot path ─────────────────────────────────────────
 // Owns the Tx and Rx transports (different ports). One packet in flight: send,
 // then spin until the matching echo (own MAC + seq) returns, timing the round.
 template<TxRing Tx, RxRing Rx>
-class HotPath {
+class LoopBack {
 public:
-    HotPath(Tx& tx, Rx& rx, const TestConfig& cfg, RecorderChannel& ch,
-            std::uint64_t durationSec)
+    LoopBack(Tx& tx, Rx& rx, const TestConfig& cfg, RecorderChannel& ch,
+             std::uint64_t durationSec)
         : m_tx(tx), m_rx(rx), m_cfg(cfg), m_ch(ch), m_durationSec(durationSec) {}
 
     void operator()(std::stop_token stop) {
@@ -79,14 +79,6 @@ public:
         const std::uint64_t durationCyc = static_cast<std::uint64_t>(tscHz)
                                         * m_durationSec;
 
-        // Tail-diagnostic setup: allocate the fixed slow-round buffer ONCE here
-        // (the single allocation, before the timing loop — never in the hot path)
-        // and precompute the threshold in TSC cycles.
-        const std::uint64_t slowThreshCyc =
-            static_cast<std::uint64_t>(tscHz * SLOW_THRESHOLD_US / 1e6);
-        if constexpr (INSTRUMENT_SLOW)
-            m_slow = std::make_unique<SlowEvent[]>(SLOW_CAP);   // ~16 MB, one alloc
-
         // Recorder starts first: wait until it is draining before we produce, so
         // no samples are generated before the consumer is ready.
         while (!m_ch.ready.load(std::memory_order_acquire) && !stop.stop_requested())
@@ -94,6 +86,14 @@ public:
 
         std::uint32_t seq = 0;
         std::uint64_t sent = 0, recv = 0;
+
+        // Per-round match pattern for bytes 12..17 of the frame: ethertype (2B,
+        // constant) + seq (4B, rewritten each round). Together with the dst-MAC
+        // compare this verifies dst MAC + ethertype + seq on every counted
+        // sample — one contiguous 6-byte compare on an already-loaded cacheline.
+        std::uint8_t expect[6] = {
+            static_cast<std::uint8_t>(m_cfg.etherType >> 8),
+            static_cast<std::uint8_t>(m_cfg.etherType & 0xFF), 0, 0, 0, 0 };
 
         // Warm the NIC datapath BEFORE timing starts — kick the "diesel engine".
         // Sends/receives a burst that is NOT timed and discarded, so the cold
@@ -112,57 +112,36 @@ public:
             if (!dst) [[unlikely]] { continue; }
             const std::uint32_t seqNet = htonl(seq);
             std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
+            std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
             m_tx.commit();
-            std::uint64_t tSend = 0;
-            if constexpr (INSTRUMENT_SLOW) tSend = tsc::now();
             ++sent;
 
             // Spin until the Rx port delivers THIS frame (one-way, no reflection):
-            // match dst MAC (the Rx port) + the seq we just wrote. The MAC+seq
-            // check guarantees we time our own packet, not stray/background traffic.
-            // No timeout: on a direct link the frame always returns. stop_token is
-            // checked periodically so SIGINT can still break a wedged receive.
-            std::uint32_t spins = 0;
+            // match dst MAC (the Rx port) + ethertype + the seq we just wrote, so
+            // every counted sample is provably our own packet — never stray or
+            // stale traffic. No timeout, no stop check — the purest possible spin.
+            // On a direct link the frame always returns; if it ever doesn't,
+            // kill -9 the run.
             while (true) {
                 if (RxFrame f = m_rx.tryReceive(); !f.data.empty()) [[unlikely]] {
-                    if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0) [[likely]] {
-                        std::uint32_t rxSeq;
-                        std::memcpy(&rxSeq, f.data.data() + 14, sizeof(rxSeq));
-                        if (rxSeq == seqNet) [[likely]] {
-                            std::uint64_t tMatch = 0;
-                            if constexpr (INSTRUMENT_SLOW) tMatch = tsc::now();
-                            m_rx.release();
-                            const std::uint64_t t1 = tsc::now();
-                            if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]]
-                                m_ch.pushFailures.fetch_add(1, std::memory_order_relaxed);
-                            if constexpr (INSTRUMENT_SLOW) {
-                                m_totalSpins += spins;   // baseline for normal rounds
-                                if ((t1 - t0) > slowThreshCyc &&
-                                    m_slowCount < SLOW_CAP) [[unlikely]] {
-                                    m_slow[m_slowCount++] = {
-                                        seq,
-                                        static_cast<std::uint32_t>(tSend  - t0),
-                                        static_cast<std::uint32_t>(tMatch - tSend),
-                                        static_cast<std::uint32_t>(t1     - tMatch),
-                                        spins};
-                                }
-                            }
-                            ++recv;
-                            break;
-                        }
+                    if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
+                        std::memcmp(f.data.data() + 12, expect, 6) == 0) [[likely]] {
+                        m_rx.release();
+                        const std::uint64_t t1 = tsc::now();
+                        if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]]
+                            m_ch.pushFailures.fetch_add(1, std::memory_order_relaxed);
+                        ++recv;
+                        break;
                     }
                     m_rx.release();   // stale / not-ours — drop, keep spinning
                 }
-                if ((++spins & 0xFFFF) == 0 && stop.stop_requested()) break;
             }
             ++seq;
         }
 
         m_ch.done.store(true, std::memory_order_release);
-        fmt::print(stderr, "[HotPath] sent={} recv={} push_fail={}\n",
+        fmt::print(stderr, "[LoopBack] sent={} recv={} push_fail={}\n",
                    sent, recv, m_ch.pushFailures.load(std::memory_order_relaxed));
-
-        if constexpr (INSTRUMENT_SLOW) dumpSlow(tscHz, recv);
     }
 
 private:
@@ -179,122 +158,26 @@ private:
     [[gnu::cold]]
     void primeDatapath(std::uint32_t& seq, std::stop_token& stop) {
         constexpr std::uint32_t kWarmupPackets = 500'000;   // ~2.5s; covers the ~85ms re-sync
+        std::uint8_t expect[6] = {
+            static_cast<std::uint8_t>(m_cfg.etherType >> 8),
+            static_cast<std::uint8_t>(m_cfg.etherType & 0xFF), 0, 0, 0, 0 };
         for (std::uint32_t w = 0; w < kWarmupPackets && !stop.stop_requested(); ++w, ++seq) {
             std::uint8_t* dst = m_tx.acquire(m_cfg.frameSize);
             if (!dst) continue;
             const std::uint32_t seqNet = htonl(seq);
             std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
+            std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
             m_tx.commit();
-            // Spin until OUR echo returns — NO deadline, NO timer. A cold-start
-            // packet may take several ms to settle (observed ~4.7 ms); we simply
-            // wait it out so that one-time settle is ABSORBED here instead of
-            // leaking into the timed loop. Mirrors the timed loop's unbounded spin.
-            // Only SIGINT (stop_token, checked every 64K empty polls) can break it,
-            // so a genuinely dead link is still escapable with Ctrl-C.
-            std::uint32_t spins = 0;
             while (true) {
                 RxFrame f = m_rx.tryReceive();
                 if (!f.data.empty()) {
-                    const bool mine = std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0;
-                    std::uint32_t rxSeq = 0;
-                    if (mine) std::memcpy(&rxSeq, f.data.data() + 14, sizeof(rxSeq));
-                    // Warmup-only bring-up diagnostics (cold path): show what the
-                    // first frames actually look like — catches steering/format
-                    // surprises on a new driver (mlx5) without touching the hot loop.
-                    if (w < 3 && m_dbgFrames < 8) {
-                        ++m_dbgFrames;
-                        const auto* d = f.data.data();
-                        fmt::println(stderr,
-                            "[warmup] frame len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} "
-                            "src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x} "
-                            "rxSeq={} want={} mine={}",
-                            f.data.size(), d[0],d[1],d[2],d[3],d[4],d[5],
-                            d[6],d[7],d[8],d[9],d[10],d[11], d[12],d[13],
-                            ntohl(rxSeq), seq, mine);
-                    }
+                    const bool ours =
+                        std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
+                        std::memcmp(f.data.data() + 12, expect, 6) == 0;
                     m_rx.release();
-                    if (mine && rxSeq == seqNet) break;   // our echo -> next warmup packet
-                }
-                if ((++spins & 0xFFFF) == 0) {
-                    if (stop.stop_requested()) break;
-                    // Bring-up diagnostic: periodic sign of life while waiting.
-                    if (w < 3 && (spins >> 16) % 64 == 0)
-                        fmt::println(stderr, "[warmup] w={} seq={} still waiting ({} empty polls)",
-                                     w, seq, spins);
+                    if (ours) break;   // our echo -> next warmup packet
                 }
             }
-        }
-    }
-
-    // ── Tail diagnostics (compile-time gated; flip to false for the pristine
-    //    production path). Splits each round into send / spin / release segments
-    //    and captures the rare slow rounds so we can see WHICH segment balloons
-    //    and whether the slow rounds are PERIODIC in the sequence number (a fixed
-    //    gap => a per-N-packet event, e.g. DPDK mbuf-pool cache refill).
-    //    ZERO hot-path allocation: ONE fixed buffer is allocated before the loop
-    //    (unique_ptr<[]>, not a vector), then only plain index writes occur, and
-    //    only on the rare slow branch. The fast path adds just two rdtscp reads
-    //    (~20ns/packet, symmetric, preserves the tail shape) + one integer compare.
-    //    Periodicity is read off the CSV's seq_gap column offline — no map/sort. ─
-    static constexpr bool        INSTRUMENT_SLOW   = true;
-    static constexpr double      SLOW_THRESHOLD_US = 6.0;       // ~just above P99.999 (~5.7us)
-                                                               // so the 6-10us tail is captured
-    static constexpr std::size_t SLOW_CAP          = 1'000'000; // ~16 MB, one alloc
-
-    struct SlowEvent {
-        std::uint32_t seq;
-        std::uint32_t sendCyc;     // acquire + commit (TX submit, mbuf alloc)
-        std::uint32_t spinCyc;     // flight + rx-poll until our frame matches
-        std::uint32_t relCyc;      // rx release (mbuf free)
-        std::uint32_t spins;       // # rx-poll iterations during spin: HIGH => NIC
-                                   // was slow (kept polling empty ring); ~NORMAL
-                                   // with high spinCyc => CPU descheduled mid-spin
-    };
-
-    void dumpSlow(double tscHz, std::uint64_t recv) {
-        fmt::print(stderr, "[Slow] {} rounds > {}us threshold\n",
-                   m_slowCount, SLOW_THRESHOLD_US);
-        if (recv > 0)
-            fmt::print(stderr, "[Slow] baseline: mean rx-poll spins over ALL {} rounds = {:.1f}\n",
-                       recv, static_cast<double>(m_totalSpins) / static_cast<double>(recv));
-        if (m_slowCount == 0) return;
-
-        // Which segment balloons on slow rounds? (single pass, fixed scalars)
-        // Also mean spins: HIGH => NIC was genuinely slow (we polled the empty ring
-        // many times); ~NORMAL => CPU was descheduled mid-spin (few polls, long wall).
-        std::uint64_t sumS = 0, sumSp = 0, sumR = 0, sumSpins = 0, minSpins = ~0ULL, maxSpins = 0;
-        for (std::size_t i = 0; i < m_slowCount; ++i) {
-            sumS += m_slow[i].sendCyc; sumSp += m_slow[i].spinCyc; sumR += m_slow[i].relCyc;
-            sumSpins += m_slow[i].spins;
-            if (m_slow[i].spins < minSpins) minSpins = m_slow[i].spins;
-            if (m_slow[i].spins > maxSpins) maxSpins = m_slow[i].spins;
-        }
-        const double n = static_cast<double>(m_slowCount);
-        fmt::print(stderr, "[Slow] mean segment on slow rounds (us): "
-                   "send={:.2f} spin={:.2f} release={:.2f}\n",
-                   tsc::cyclesToNs(static_cast<double>(sumS)  / n, tscHz) / 1000.0,
-                   tsc::cyclesToNs(static_cast<double>(sumSp) / n, tscHz) / 1000.0,
-                   tsc::cyclesToNs(static_cast<double>(sumR)  / n, tscHz) / 1000.0);
-        fmt::print(stderr, "[Slow] rx-poll spins on slow rounds: mean={:.0f} min={} max={}"
-                   " (HIGH=NIC slow / ~NORMAL=CPU descheduled mid-spin)\n",
-                   static_cast<double>(sumSpins) / n, minSpins, maxSpins);
-
-        // Full dump for offline analysis — the seq_gap column reveals periodicity
-        // (a dominant fixed gap = a per-N-packet event like an mbuf-pool refill).
-        if (std::FILE* f = std::fopen("slow_events.csv", "w")) {
-            fmt::print(f, "seq,seq_gap,send_us,spin_us,release_us,total_us,spins\n");
-            std::uint32_t prev = m_slow[0].seq;
-            for (std::size_t i = 0; i < m_slowCount; ++i) {
-                const SlowEvent& e = m_slow[i];
-                const double s  = tsc::cyclesToNs(e.sendCyc, tscHz) / 1000.0;
-                const double sp = tsc::cyclesToNs(e.spinCyc, tscHz) / 1000.0;
-                const double r  = tsc::cyclesToNs(e.relCyc,  tscHz) / 1000.0;
-                fmt::print(f, "{},{},{:.3f},{:.3f},{:.3f},{:.3f},{}\n",
-                           e.seq, e.seq - prev, s, sp, r, s + sp + r, e.spins);
-                prev = e.seq;
-            }
-            std::fclose(f);
-            fmt::print(stderr, "[Slow] wrote slow_events.csv ({} rows)\n", m_slowCount);
         }
     }
 
@@ -303,10 +186,6 @@ private:
     const TestConfig& m_cfg;
     RecorderChannel&  m_ch;
     std::uint64_t     m_durationSec;
-    std::unique_ptr<SlowEvent[]> m_slow;       // fixed buffer, allocated once
-    std::size_t                  m_slowCount = 0;
-    std::uint64_t                m_totalSpins = 0;   // baseline: spins over all rounds
-    std::uint32_t                m_dbgFrames = 0;    // warmup bring-up prints (cold path)
 };
 
 // ── Consumer: the recorder ──────────────────────────────────────────────────
