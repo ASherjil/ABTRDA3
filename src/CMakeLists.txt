@@ -22,6 +22,7 @@ target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Cadence_GEM>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/TapBridge>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -70,6 +71,15 @@ target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBXDP)
 pkg_check_modules(LIBDPDK REQUIRED IMPORTED_TARGET libdpdk)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBDPDK)
 message(STATUS "DPDK transport: libdpdk ${LIBDPDK_VERSION}")
+
+# =============================================================================
+# Verbs transport — header-only Verbs.hpp over libibverbs (RAW_PACKET QP,
+# mlx5/RDMA-capable NICs only; rdma-core/libibverbs-dev). PUBLIC for the same
+# reason as libdpdk: the header emits ibv_* calls into its consumers.
+# =============================================================================
+pkg_check_modules(LIBIBVERBS REQUIRED IMPORTED_TARGET libibverbs)
+target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBIBVERBS)
+message(STATUS "Verbs transport: libibverbs ${LIBIBVERBS_VERSION}")
 
 # 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style)
 #    Output to both src build dir and test build dir.

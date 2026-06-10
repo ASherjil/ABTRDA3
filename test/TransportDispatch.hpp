@@ -10,6 +10,7 @@
 #include "PacketMmapTx.hpp"
 #include "AFXDP.hpp"
 #include "DPDK.hpp"
+#include "Verbs.hpp"
 #include "PciHelpers.hpp"   // pci::reportItr / boundToI40e (i40e ITR check)
 #include "SingleRecorder.hpp"
 #include "RuntimeSetup.hpp"
@@ -406,6 +407,19 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
         if (!rx.init(false)) { fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface); return 1; }
         if (!tx.waitLink()) { fmt::println(stderr, "Error: Tx DPDK link down on {}", cfg.client.interface); return 1; }
         if (!rx.waitLink()) { fmt::println(stderr, "Error: Rx DPDK link down on {}", cfg.server.interface); return 1; }
+        driveSingleRecorder(tx, rx, cfg, stop);
+        return 0;
+    }
+
+    if (transport == "verbs") {
+        // Raw-verbs RAW_PACKET QPs on the SAME mlx5 silicon as the DPDK path,
+        // minus the ethdev/mbuf layers. Kernel driver keeps the port (bifurcated
+        // like DPDK/mlx5); ports must be admin-UP. mlx5-only — Intel NICs have
+        // no verbs provider and keep the dpdk transport.
+        Verbs<VerbsMode::TxOnly> tx(cfg.client.interface);
+        Verbs<VerbsMode::RxOnly> rx(cfg.server.interface);
+        if (!tx.init()) { fmt::println(stderr, "Error: Tx verbs init failed on {}", cfg.client.interface); return 1; }
+        if (!rx.init()) { fmt::println(stderr, "Error: Rx verbs init failed on {}", cfg.server.interface); return 1; }
         driveSingleRecorder(tx, rx, cfg, stop);
         return 0;
     }
