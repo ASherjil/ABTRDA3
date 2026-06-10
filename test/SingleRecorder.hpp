@@ -85,7 +85,7 @@ public:
             ;
 
         std::uint32_t seq = 0;
-        std::uint64_t sent = 0, recv = 0;
+        std::uint64_t sent = 0, recv = 0, lost = 0;
 
         // Per-round match pattern for bytes 12..17 of the frame: ethertype (2B,
         // constant) + seq (4B, rewritten each round). Together with the dst-MAC
@@ -119,9 +119,16 @@ public:
             // Spin until the Rx port delivers THIS frame (one-way, no reflection):
             // match dst MAC (the Rx port) + ethertype + the seq we just wrote, so
             // every counted sample is provably our own packet — never stray or
-            // stale traffic. No timeout, no stop check — the purest possible spin.
-            // On a direct link the frame always returns; if it ever doesn't,
-            // kill -9 the run.
+            // stale traffic. The spin is BOUNDED at kLostSpins (~seconds, five
+            // orders of magnitude beyond any real frame) — a frame killed by a
+            // line bit-error (25G BER 1e-15 => ~2% odds of one per 24h soak) is
+            // declared LOST: tallied, NOT recorded, and the loop moves on with
+            // the next seq (the late original then fails the seq match and is
+            // dropped). Without the bound, one lost frame = infinite spin =
+            // a dead 24h run. The same rare branch checks stop_requested so
+            // SIGINT always salvages the histogram collected so far.
+            std::uint32_t spins = 0;
+            bool gotIt = true;
             while (true) {
                 if (RxFrame f = m_rx.tryReceive(); !f.data.empty()) [[unlikely]] {
                     if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
@@ -135,13 +142,18 @@ public:
                     }
                     m_rx.release();   // stale / not-ours — drop, keep spinning
                 }
+                if ((++spins & 0xFFFF) == 0) [[unlikely]] {
+                    if (spins >= kLostSpins) { ++lost; gotIt = false; break; }
+                    if (stop.stop_requested()) { gotIt = false; break; }
+                }
             }
+            (void)gotIt;
             ++seq;
         }
 
         m_ch.done.store(true, std::memory_order_release);
-        fmt::print(stderr, "[LoopBack] sent={} recv={} push_fail={}\n",
-                   sent, recv, m_ch.pushFailures.load(std::memory_order_relaxed));
+        fmt::print(stderr, "[LoopBack] sent={} recv={} lost={} push_fail={}\n",
+                   sent, recv, lost, m_ch.pushFailures.load(std::memory_order_relaxed));
     }
 
 private:
@@ -168,6 +180,7 @@ private:
             std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
             std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
             m_tx.commit();
+            std::uint32_t spins = 0;
             while (true) {
                 RxFrame f = m_rx.tryReceive();
                 if (!f.data.empty()) {
@@ -177,9 +190,14 @@ private:
                     m_rx.release();
                     if (ours) break;   // our echo -> next warmup packet
                 }
+                if ((++spins & 0xFFFF) == 0) [[unlikely]] {
+                    if (spins >= kLostSpins || stop.stop_requested()) break;
+                }
             }
         }
     }
+
+    static constexpr std::uint32_t kLostSpins = 1u << 26;   // ~0.2-3s of empty polls
 
     Tx&               m_tx;
     Rx&               m_rx;
