@@ -198,10 +198,30 @@ private:
                     const bool mine = std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0;
                     std::uint32_t rxSeq = 0;
                     if (mine) std::memcpy(&rxSeq, f.data.data() + 14, sizeof(rxSeq));
+                    // Warmup-only bring-up diagnostics (cold path): show what the
+                    // first frames actually look like — catches steering/format
+                    // surprises on a new driver (mlx5) without touching the hot loop.
+                    if (w < 3 && m_dbgFrames < 8) {
+                        ++m_dbgFrames;
+                        const auto* d = f.data.data();
+                        fmt::println(stderr,
+                            "[warmup] frame len={} dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} "
+                            "src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x} "
+                            "rxSeq={} want={} mine={}",
+                            f.data.size(), d[0],d[1],d[2],d[3],d[4],d[5],
+                            d[6],d[7],d[8],d[9],d[10],d[11], d[12],d[13],
+                            ntohl(rxSeq), seq, mine);
+                    }
                     m_rx.release();
                     if (mine && rxSeq == seqNet) break;   // our echo -> next warmup packet
                 }
-                if ((++spins & 0xFFFF) == 0 && stop.stop_requested()) break;
+                if ((++spins & 0xFFFF) == 0) {
+                    if (stop.stop_requested()) break;
+                    // Bring-up diagnostic: periodic sign of life while waiting.
+                    if (w < 3 && (spins >> 16) % 64 == 0)
+                        fmt::println(stderr, "[warmup] w={} seq={} still waiting ({} empty polls)",
+                                     w, seq, spins);
+                }
             }
         }
     }
@@ -286,6 +306,7 @@ private:
     std::unique_ptr<SlowEvent[]> m_slow;       // fixed buffer, allocated once
     std::size_t                  m_slowCount = 0;
     std::uint64_t                m_totalSpins = 0;   // baseline: spins over all rounds
+    std::uint32_t                m_dbgFrames = 0;    // warmup bring-up prints (cold path)
 };
 
 // ── Consumer: the recorder ──────────────────────────────────────────────────

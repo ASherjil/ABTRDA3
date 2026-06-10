@@ -185,6 +185,28 @@ public:
       return false;
     }
 
+    // Driver sniff for the TX-kick policy (see kickTx). mlx5's needs_wakeup flag
+    // dynamics differ from igc/i40e: ~100 rounds in (when its NAPI busy window
+    // first expires) a TxOnly gated kick races the NAPI-idle transition — the
+    // submit lands after the driver's final ring check but the flag read still
+    // said "no kick needed" -> that descriptor is never transmitted -> permanent
+    // hang (proven 2026-06-10 on cx4: two runs froze at ~85/~103 rounds with
+    // tx_xsk_xmit == tx_xsk_cqes == app-posted-minus-one). Unconditional kick is
+    // the same remedy the RxTx mode already needs on igc/i40e.
+    if constexpr (HAS_TX) {
+      char lnk[256]{};
+      const std::string drvPath =
+          std::string("/sys/class/net/") + m_interface + "/device/driver";
+      const ssize_t n = ::readlink(drvPath.c_str(), lnk, sizeof(lnk) - 1);
+      if (n > 0) {
+        const char* base = std::strrchr(lnk, '/');
+        m_txKickAlways = base && std::strstr(base, "mlx5");
+        if (m_txKickAlways)
+          fmt::print(stderr, "[AFXDP] {}: mlx5 — TX kick policy: ALWAYS "
+                             "(gated kick races NAPI-idle on this driver)\n", m_interface);
+      }
+    }
+
     // 1. Clean any stale XDP programs from a previous run.
     bpf_xdp_detach(m_ifindex, XDP_FLAGS_DRV_MODE, nullptr);
     bpf_xdp_detach(m_ifindex, XDP_FLAGS_SKB_MODE, nullptr);
@@ -661,7 +683,11 @@ private:
     if constexpr (HAS_RX) {                       // RxTx: must always kick
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
     } else if constexpr (NeedWakeup) {            // TxOnly + need_wakeup: gated (xdpsock)
-      if (xsk_ring_prod__needs_wakeup(&m_xsk.tx))
+      // mlx5 exception (m_txKickAlways, set by the init() driver sniff): the
+      // gated kick races mlx5's NAPI-idle transition and strands a descriptor
+      // ~100 rounds in — kick unconditionally there. igc/i40e keep the gated
+      // path (verified clean on igc; same latency, fewer syscalls).
+      if (m_txKickAlways || xsk_ring_prod__needs_wakeup(&m_xsk.tx))
         ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
     } else {                                       // TxOnly, no need_wakeup: always kick
       ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
@@ -702,6 +728,7 @@ private:
     m_fd            = std::exchange(o.m_fd, -1);
     m_copyMode      = o.m_copyMode;
     m_customBpf     = o.m_customBpf;
+    m_txKickAlways  = o.m_txKickAlways;
     m_pendingRxAddr = o.m_pendingRxAddr;
     m_pendingTxAddr = o.m_pendingTxAddr;
     m_pendingTxLen  = o.m_pendingTxLen;
@@ -729,6 +756,7 @@ private:
   // Cold-path flags
   bool            m_copyMode{false};
   bool            m_customBpf{false};
+  bool            m_txKickAlways{false};  // mlx5: gated TX kick races NAPI-idle (see init/kickTx)
 
   // Hot-path cursors
   std::uint64_t   m_pendingRxAddr{0};
