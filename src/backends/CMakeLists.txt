@@ -89,11 +89,17 @@ message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE p
 #    transport loads "af_xdp_kern.o" relative to the run directory.
 set(BPF_KERN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP/af_xdp_kern.c")
 set(BPF_KERN_DST "${CMAKE_BINARY_DIR}/src/app/af_xdp_kern.o")
+# Same multiarch include as BpfCompile.cmake: clang -target bpf drops the host
+# default paths where <asm/types.h> lives on Debian-family systems.
+set(BPF_KERN_INCLUDES "-I${libbpf_SOURCE_DIR}/src")
+if(EXISTS "/usr/include/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux-gnu")
+    list(APPEND BPF_KERN_INCLUDES "-I/usr/include/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux-gnu")
+endif()
 add_custom_command(
     OUTPUT "${BPF_KERN_DST}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/src/app"
     COMMAND clang -O2 -target bpf -g -c "${BPF_KERN_SRC}" -o "${BPF_KERN_DST}"
-            -I${libbpf_SOURCE_DIR}/src
+            ${BPF_KERN_INCLUDES}
     DEPENDS "${BPF_KERN_SRC}"
     COMMENT "[BPF] af_xdp_kern.c -> af_xdp_kern.o"
 )

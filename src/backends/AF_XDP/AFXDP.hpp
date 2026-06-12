@@ -512,23 +512,22 @@ init() {
       fmt::print(stderr, "[AFXDP] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
 
     // READBACK: a clean setsockopt only means the kernel parsed the option;
-    // ask what values the socket is actually holding.
-    int rPrefer = -1, rUsecs = -1, rBudget = -1;
+    // ask what values the socket is actually holding. SO_BUSY_POLL_BUDGET is
+    // SET-ONLY in the kernel (no getsockopt case) — it cannot be read back.
+    int rPrefer = -1, rUsecs = -1;
     socklen_t rl = sizeof(rPrefer);
     (void)::getsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &rPrefer, &rl);
     rl = sizeof(rUsecs);
     (void)::getsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &rUsecs, &rl);
-    rl = sizeof(rBudget);
-    (void)::getsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &rBudget, &rl);
-    if (rPrefer == on && rUsecs == usecs && rBudget == budget)
+    if (rPrefer == on && rUsecs == usecs)
       fmt::print(stderr, "[AFXDP] kernel confirms: busy-poll ACTIVE "
-                         "(prefer={} usecs={} budget={})\n",
-                 rPrefer, rUsecs, rBudget);
+                         "(prefer={} usecs={}; budget={} write-only, "
+                         "set call returned clean)\n",
+                 rPrefer, rUsecs, budget);
     else
       fmt::print(stderr, "[AFXDP] WARN: busy-poll readback MISMATCH — wrote "
-                         "prefer={} usecs={} budget={}, kernel holds "
-                         "prefer={} usecs={} budget={}\n",
-                 on, usecs, budget, rPrefer, rUsecs, rBudget);
+                         "prefer={} usecs={}, kernel holds prefer={} usecs={}\n",
+                 on, usecs, rPrefer, rUsecs);
   }
 
   if constexpr (HAS_RX) {

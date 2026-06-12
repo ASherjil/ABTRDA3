@@ -24,6 +24,15 @@ function(bpf_compile)
         list(APPEND inc_flags "-I${dir}")
     endforeach()
 
+    # clang -target bpf drops the host's default include search paths, but the
+    # kernel uAPI headers it needs (<linux/bpf.h> -> <asm/types.h>) live in the
+    # multiarch dir on Debian-family systems. Feed it back explicitly; no-op
+    # where the directory doesn't exist.
+    set(multiarch_inc "/usr/include/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux-gnu")
+    if(EXISTS "${multiarch_inc}")
+        list(APPEND inc_flags "-I${multiarch_inc}")
+    endif()
+
     # Step 1: .bpf.c  ->  .bpf.o  (BPF bytecode in ELF container)
     #
     # -target bpf : emit BPF bytecode, not x86 (only clang has this backend)

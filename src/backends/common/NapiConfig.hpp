@@ -250,15 +250,25 @@ inline NapiParams getBusyPoll(std::uint32_t napiId, const char* tag = "AFXDP") {
          attr = reinterpret_cast<nlattr*>(reinterpret_cast<char*>(attr) +
                                           NLA_ALIGN(attr->nla_len))) {
       const char* payload = reinterpret_cast<char*>(attr) + NLA_HDRLEN;
+      // netdev-genl encodes these as NLA_UINT: 4-byte payload when the value
+      // fits in u32, 8-byte otherwise. Read exactly what the kernel sent —
+      // assuming a fixed u64 runs into the NEXT attribute's header.
+      const std::size_t plen =
+          static_cast<std::size_t>(attr->nla_len) - NLA_HDRLEN;
+      const auto readUint = [&]() -> std::uint64_t {
+        if (plen >= 8) { std::uint64_t v; std::memcpy(&v, payload, 8); return v; }
+        if (plen >= 4) { std::uint32_t v; std::memcpy(&v, payload, 4); return v; }
+        return 0;
+      };
       switch (attr->nla_type & NLA_TYPE_MASK) {
         case kAttrNapiDeferHardIrqs:
-          std::memcpy(&out.deferHardIrqs, payload, sizeof(out.deferHardIrqs));
+          out.deferHardIrqs = static_cast<std::uint32_t>(readUint());
           break;
         case kAttrNapiGroFlushTimeout:
-          std::memcpy(&out.groFlushNs, payload, sizeof(out.groFlushNs));
+          out.groFlushNs = readUint();
           break;
         case kAttrNapiIrqSuspend:
-          std::memcpy(&out.irqSuspendNs, payload, sizeof(out.irqSuspendNs));
+          out.irqSuspendNs = readUint();
           break;
         default: break;
       }
