@@ -119,6 +119,10 @@
 //          not a saturated ping-pong.
 //   8. Insert the socket fd into the XSKMAP (key = queue id, matching
 //      rx_queue_index), RX modes with our custom BPF only.
+//   EVERY applied mode is READ BACK like a register write (XDP_OPTIONS,
+//   bpf_xdp_query, XDP_MMAP_OFFSETS, getsockopt busy-poll trio, NAPI_GET) —
+//   the bind ladder keeps the transport generic, the readback prints what the
+//   kernel ACTUALLY granted ("kernel confirms:" lines; grep before a soak).
 //
 // RX HOT PATH: peek EXACTLY one descriptor (peeking more than release() frees
 // would desync cached_cons and silently drop frames 2..N). On an empty peek
@@ -429,16 +433,71 @@ init() {
   fmt::print(stderr, "[AFXDP] {} | fd={} queue={} frames={} (tx={} rx={})\n",
              bindMode, m_fd, m_queueId, NUM_FRAMES, TX_POOL_FRAMES, RX_POOL_FRAMES);
 
+  // ---- VERIFY (write-then-read-back): the bind ladder records what the
+  // kernel ACCEPTED; only a query says what is ACTUALLY in force. Three
+  // readbacks, all informational — the ladder keeps this transport generic
+  // (office-desktop NICs without ZC or native XDP still run), the readback
+  // makes the mode it landed in 100% explicit:
+  //   1. XDP_OPTIONS      — zero-copy grant (authoritative; sets m_copyMode)
+  //   2. bpf_xdp_query    — XDP program attach mode: native (DRV) vs SKB
+  //   3. XDP_MMAP_OFFSETS — NEED_WAKEUP: the flags-bearing ring layout is only
+  //      returned by kernels where ring need-wakeup flags are live (bind would
+  //      have EINVAL'd on an unknown flag; this confirms positively).
   {
+    const bool ladderZc = (std::strcmp(bindMode, "zero-copy") == 0);
+    bool zc = !m_copyMode;
     xdp_options xopts{};
-    socklen_t   olen = sizeof(xopts);
-    if (::getsockopt(m_fd, SOL_XDP, XDP_OPTIONS, &xopts, &olen) == 0)
-      fmt::print(stderr, "[AFXDP] kernel reports: {} (XDP_OPTIONS=0x{:x})\n",
-                 (xopts.flags & XDP_OPTIONS_ZEROCOPY) ? "ZERO-COPY" : "COPY-mode",
-                 xopts.flags);
-    else
-      fmt::print(stderr, "[AFXDP] WARN: getsockopt(XDP_OPTIONS): {}\n",
-                 std::strerror(errno));
+    socklen_t olen = sizeof(xopts);
+    if (::getsockopt(m_fd, SOL_XDP, XDP_OPTIONS, &xopts, &olen) == 0) {
+      zc         = (xopts.flags & XDP_OPTIONS_ZEROCOPY) != 0;
+      m_copyMode = !zc;   // the kernel's answer overrides the ladder's label
+    } else {
+      fmt::print(stderr, "[AFXDP] WARN: getsockopt(XDP_OPTIONS): {} — cannot "
+                         "verify zero-copy, trusting bind label '{}'\n",
+                 std::strerror(errno), bindMode);
+    }
+    if (zc != ladderZc)
+      fmt::print(stderr, "[AFXDP] WARN: bind accepted '{}' but kernel grant "
+                         "says {} — readback wins\n",
+                 bindMode, zc ? "ZERO-COPY" : "COPY");
+
+    const char* attach = "no XDP prog (TxOnly)";
+    if constexpr (HAS_RX) {
+      LIBBPF_OPTS(bpf_xdp_query_opts, qopts);
+      if (bpf_xdp_query(m_ifindex, 0, &qopts) == 0) {
+        switch (qopts.attach_mode) {
+          case XDP_ATTACHED_DRV:   attach = "native (DRV)";     break;
+          case XDP_ATTACHED_SKB:   attach = "generic (SKB)";    break;
+          case XDP_ATTACHED_HW:    attach = "hw-offload";       break;
+          case XDP_ATTACHED_MULTI: attach = "multi";            break;
+          case XDP_ATTACHED_NONE:  attach = "NONE (no prog?!)"; break;
+          default:                 attach = "unknown";          break;
+        }
+      } else {
+        attach = "query FAILED";
+      }
+    }
+    fmt::print(stderr, "[AFXDP] kernel confirms: {} | XDP attach: {} "
+                       "(XDP_OPTIONS=0x{:x})\n",
+               zc ? "ZERO-COPY" : "COPY-mode", attach, xopts.flags);
+
+    if constexpr (NeedWakeup) {
+      xdp_mmap_offsets moff{};
+      socklen_t mlen = sizeof(moff);
+      if (::getsockopt(m_fd, SOL_XDP, XDP_MMAP_OFFSETS, &moff, &mlen) == 0
+          && mlen == sizeof(moff)) {
+        bool fillNw = false, txNw = false;
+        if constexpr (HAS_RX) fillNw = xsk_ring_prod__needs_wakeup(&m_umem.fq) != 0;
+        if constexpr (HAS_TX) txNw   = xsk_ring_prod__needs_wakeup(&m_xsk.tx) != 0;
+        fmt::print(stderr, "[AFXDP] kernel confirms: NEED_WAKEUP live "
+                           "(ring flags now: fill={} tx={})\n", fillNw, txNw);
+      } else {
+        fmt::print(stderr, "[AFXDP] WARN: NEED_WAKEUP NOT confirmed — kernel "
+                           "returned {}B of {}B xdp_mmap_offsets (pre-5.4 ring "
+                           "layout, no flags words)\n",
+                   static_cast<std::size_t>(mlen), sizeof(moff));
+      }
+    }
   }
 
   if constexpr (HAS_RX) {
@@ -451,6 +510,25 @@ init() {
     int budget = static_cast<int>(BATCH_SIZE);
     if (::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget)) < 0)
       fmt::print(stderr, "[AFXDP] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
+
+    // READBACK: a clean setsockopt only means the kernel parsed the option;
+    // ask what values the socket is actually holding.
+    int rPrefer = -1, rUsecs = -1, rBudget = -1;
+    socklen_t rl = sizeof(rPrefer);
+    (void)::getsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &rPrefer, &rl);
+    rl = sizeof(rUsecs);
+    (void)::getsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &rUsecs, &rl);
+    rl = sizeof(rBudget);
+    (void)::getsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &rBudget, &rl);
+    if (rPrefer == on && rUsecs == usecs && rBudget == budget)
+      fmt::print(stderr, "[AFXDP] kernel confirms: busy-poll ACTIVE "
+                         "(prefer={} usecs={} budget={})\n",
+                 rPrefer, rUsecs, rBudget);
+    else
+      fmt::print(stderr, "[AFXDP] WARN: busy-poll readback MISMATCH — wrote "
+                         "prefer={} usecs={} budget={}, kernel holds "
+                         "prefer={} usecs={} budget={}\n",
+                 on, usecs, budget, rPrefer, rUsecs, rBudget);
   }
 
   if constexpr (HAS_RX) {
@@ -467,6 +545,22 @@ init() {
         napiId, defer, gro, susp,
         USE_IRQ_SUSPEND ? "irq-suspend regime" : "brute-force busy-poll",
         ok ? "applied" : "FAILED");
+      // READBACK via NETDEV_CMD_NAPI_GET — the netlink ACK above only says the
+      // kernel accepted the message; this asks what the NAPI actually runs with.
+      if (ok) {
+        const napi::NapiParams rb = napi::getBusyPoll(napiId);
+        if (rb.valid && rb.deferHardIrqs == defer && rb.groFlushNs == gro
+            && rb.irqSuspendNs == susp)
+          fmt::print(stderr, "[AFXDP] kernel confirms: NAPI {} params VERIFIED\n",
+                     napiId);
+        else if (rb.valid)
+          fmt::print(stderr, "[AFXDP] WARN: NAPI {} readback MISMATCH — kernel "
+                             "holds defer={} gro={}ns irq-suspend={}ns\n",
+                     napiId, rb.deferHardIrqs, rb.groFlushNs, rb.irqSuspendNs);
+        else
+          fmt::print(stderr, "[AFXDP] WARN: NAPI {} readback unavailable — set "
+                             "not independently confirmed\n", napiId);
+      }
     } else {
       fmt::print(stderr, "[AFXDP] WARN: SO_INCOMING_NAPI_ID unavailable "
                          "(napi_id={}) — NAPI config not applied\n", napiId);

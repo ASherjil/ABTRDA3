@@ -34,6 +34,7 @@ namespace napi {
 // with their ABI-frozen values so the header builds against OLDER kernel
 // headers too (e.g. a workstation on a pre-6.13 toolchain) — uAPI enum values
 // never change once released, and enums can't be probed with #ifdef.
+inline constexpr std::uint8_t  kCmdNapiGet              = 11;  // NETDEV_CMD_NAPI_GET
 inline constexpr std::uint8_t  kCmdNapiSet              = 14;  // NETDEV_CMD_NAPI_SET
 inline constexpr std::uint16_t kAttrNapiId              = 2;   // NETDEV_A_NAPI_ID
 inline constexpr std::uint16_t kAttrNapiDeferHardIrqs   = 5;   // NETDEV_A_NAPI_DEFER_HARD_IRQS
@@ -174,6 +175,97 @@ inline bool setBusyPoll(std::uint32_t napiId,
     }
   }
   return true;
+}
+
+// Read back the live busy-poll parameters of one NAPI via NETDEV_CMD_NAPI_GET —
+// the write-then-read-back verification for setBusyPoll(). valid=false means
+// the readback itself failed (no netlink, no family, kernel rejected the GET);
+// a valid result with different values means the SET did not stick.
+struct NapiParams {
+  bool          valid{false};
+  std::uint32_t deferHardIrqs{0};
+  std::uint64_t groFlushNs{0};
+  std::uint64_t irqSuspendNs{0};
+};
+
+inline NapiParams getBusyPoll(std::uint32_t napiId, const char* tag = "AFXDP") {
+  NapiParams out{};
+
+  const int fd = ::socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+  if (fd < 0) {
+    fmt::print(stderr, "[{}] WARN: netlink socket: {}\n", tag, std::strerror(errno));
+    return out;
+  }
+  const std::uint16_t family = detail::resolveFamily(fd, NETDEV_FAMILY_NAME);
+  if (family == 0) {
+    fmt::print(stderr, "[{}] WARN: cannot resolve '{}' genl family\n",
+               tag, NETDEV_FAMILY_NAME);
+    ::close(fd);
+    return out;
+  }
+
+  char buf[256]{};
+  auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
+  nlh->nlmsg_len   = NLMSG_LENGTH(GENL_HDRLEN);
+  nlh->nlmsg_type  = family;
+  nlh->nlmsg_flags = NLM_F_REQUEST;
+  nlh->nlmsg_seq   = 3;
+  auto* gnlh = reinterpret_cast<genlmsghdr*>(NLMSG_DATA(nlh));
+  gnlh->cmd     = kCmdNapiGet;
+  gnlh->version = 1;
+  std::size_t off = NLMSG_ALIGN(nlh->nlmsg_len);
+  off = detail::putAttr<std::uint32_t>(buf, off, kAttrNapiId, napiId);
+  nlh->nlmsg_len = static_cast<std::uint32_t>(off);
+
+  if (::send(fd, buf, nlh->nlmsg_len, 0) < 0) {
+    fmt::print(stderr, "[{}] WARN: napi-get send: {}\n", tag, std::strerror(errno));
+    ::close(fd);
+    return out;
+  }
+
+  char rbuf[2048];
+  ssize_t n = ::recv(fd, rbuf, sizeof(rbuf), 0);  // NLMSG_NEXT mutates n
+  ::close(fd);
+  if (n < static_cast<ssize_t>(NLMSG_HDRLEN)) {
+    fmt::print(stderr, "[{}] WARN: napi-get: no reply\n", tag);
+    return out;
+  }
+
+  for (auto* rh = reinterpret_cast<nlmsghdr*>(rbuf);
+       NLMSG_OK(rh, n); rh = NLMSG_NEXT(rh, n)) {
+    if (rh->nlmsg_type == NLMSG_ERROR) {
+      auto* err = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(rh));
+      fmt::print(stderr, "[{}] WARN: napi-get rejected: {}\n",
+                 tag, std::strerror(-err->error));
+      return out;
+    }
+    if (rh->nlmsg_type != family) continue;
+
+    auto* attr = reinterpret_cast<nlattr*>(
+        reinterpret_cast<char*>(NLMSG_DATA(rh)) + GENL_HDRLEN);
+    int rem = static_cast<int>(rh->nlmsg_len) -
+              static_cast<int>(NLMSG_HDRLEN) - GENL_HDRLEN;
+    for (; rem >= static_cast<int>(NLA_HDRLEN) && rem >= attr->nla_len;
+         rem -= NLA_ALIGN(attr->nla_len),
+         attr = reinterpret_cast<nlattr*>(reinterpret_cast<char*>(attr) +
+                                          NLA_ALIGN(attr->nla_len))) {
+      const char* payload = reinterpret_cast<char*>(attr) + NLA_HDRLEN;
+      switch (attr->nla_type & NLA_TYPE_MASK) {
+        case kAttrNapiDeferHardIrqs:
+          std::memcpy(&out.deferHardIrqs, payload, sizeof(out.deferHardIrqs));
+          break;
+        case kAttrNapiGroFlushTimeout:
+          std::memcpy(&out.groFlushNs, payload, sizeof(out.groFlushNs));
+          break;
+        case kAttrNapiIrqSuspend:
+          std::memcpy(&out.irqSuspendNs, payload, sizeof(out.irqSuspendNs));
+          break;
+        default: break;
+      }
+    }
+    out.valid = true;
+  }
+  return out;
 }
 
 }  // namespace napi
