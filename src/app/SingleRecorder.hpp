@@ -105,14 +105,20 @@ public:
         const std::uint64_t runStart    = tsc::now();   // timing starts AFTER warmup
 
         while (true) {
-            const std::uint64_t t0 = tsc::now();
-            if (t0 - runStart >= durationCyc || stop.stop_requested()) break;
+            if (tsc::now() - runStart >= durationCyc || stop.stop_requested()) break;
 
+            // Buffer prep (acquire + seq stamp) is NOT timed — it is the Tx-side
+            // boilerplate that mirrors release() on the Rx side. Timing brackets
+            // the transmit->receive only: t0 right before commit() (the actual
+            // send: tx_burst / post_send / sendto / SEND_REQUEST), t1 the instant
+            // the frame is matched in the Rx ring (before release()).
             std::uint8_t* dst = m_tx.acquire(m_cfg.frameSize);
             if (!dst) [[unlikely]] { continue; }
             const std::uint32_t seqNet = htonl(seq);
             std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
             std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
+
+            const std::uint64_t t0 = tsc::now();
             m_tx.commit();
             ++sent;
 
@@ -216,9 +222,8 @@ public:
         : m_ch(ch), m_outputPath(std::move(outputPath)) {}
 
     void operator()(std::stop_token /*stop*/) {
-        // 1 ns .. 60 s, 3 significant figures. ~1.5 MB, fixed.
         hdr_histogram* h = nullptr;
-        if (hdr_init(1, 60'000'000'000LL, 3, &h) != 0 || !h) {
+        if (hdr_init(1, 60'000'000'000LL, 5, &h) != 0 || !h) {
             fmt::print(stderr, "[Recorder] hdr_init failed\n");
             return;
         }
