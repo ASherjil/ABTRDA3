@@ -134,26 +134,27 @@ public:
             // a dead 24h run. The same rare branch checks stop_requested so
             // SIGINT always salvages the histogram collected so far.
             std::uint32_t spins = 0;
-            bool gotIt = true;
             while (true) {
                 if (RxFrame f = m_rx.tryReceive(); !f.data.empty()) [[unlikely]] {
                     if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
                         std::memcmp(f.data.data() + 12, expect, 6) == 0) [[likely]] {
                         const std::uint64_t t1 = tsc::now();
                         m_rx.release();
-                        if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]]
+                        if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]] {
                             m_ch.pushFailures.fetch_add(1, std::memory_order_relaxed);
+                        }
                         ++recv;
                         break;
                     }
                     m_rx.release();   // stale / not-ours — drop, keep spinning
                 }
                 if ((++spins & 0xFFFF) == 0) [[unlikely]] {
-                    if (spins >= kLostSpins) { ++lost; gotIt = false; break; }
-                    if (stop.stop_requested()) { gotIt = false; break; }
+                    if (spins >= kLostSpins) {
+                        ++lost;
+                        break;
+                    }
                 }
             }
-            (void)gotIt;
             ++seq;
         }
 
@@ -186,7 +187,6 @@ private:
             std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
             std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
             m_tx.commit();
-            std::uint32_t spins = 0;
             while (true) {
                 RxFrame f = m_rx.tryReceive();
                 if (!f.data.empty()) {
@@ -195,9 +195,6 @@ private:
                         std::memcmp(f.data.data() + 12, expect, 6) == 0;
                     m_rx.release();
                     if (ours) break;   // our echo -> next warmup packet
-                }
-                if ((++spins & 0xFFFF) == 0) [[unlikely]] {
-                    if (spins >= kLostSpins || stop.stop_requested()) break;
                 }
             }
         }
@@ -213,13 +210,11 @@ private:
 };
 
 // ── Consumer: the recorder ──────────────────────────────────────────────────
-// Drains the SPSC queue into an HdrHistogram. Fixed memory; every sample is
-// tallied (not stored), so a 19-billion-sample run stays at ~1.5 MB. Runs on a
-// SEPARATE core so its work never steals cycles from the hot path.
+// Drains the SPSC queue into an HdrHistogram.
 class Recorder {
 public:
-    Recorder(RecorderChannel& ch, std::string outputPath)
-        : m_ch(ch), m_outputPath(std::move(outputPath)) {}
+    Recorder(RecorderChannel& ch, std::string outputPath, std::uint64_t durationSec)
+        : m_ch(ch), m_outputPath(std::move(outputPath)), m_durationSec(durationSec) {}
 
     void operator()(std::stop_token /*stop*/) {
         hdr_histogram* h = nullptr;
@@ -242,17 +237,27 @@ public:
             }
         };
 
-        // Signal the producer that we are calibrated and ready to drain — it waits
-        // on this before sending its first packet, so no samples are produced
-        // before the consumer exists.
         m_ch.ready.store(true, std::memory_order_release);
 
-        // Spin-drain until the producer is done, then a final drain for anything
-        // left in the queue after the done flag was set.
-        while (!m_ch.done.load(std::memory_order_acquire))
-            drain();
-        drain();
+        const std::uint64_t startTsc = tsc::now();
+        const std::uint64_t hbCyc    = static_cast<std::uint64_t>(tscHz) * 600;  // 10 min
+        std::uint64_t       nextHb   = hbCyc;
 
+        while (!m_ch.done.load(std::memory_order_acquire)) {
+            drain();
+
+            // 10-minute heartbeat (recorder thread, off the hot path)
+            const std::uint64_t el = tsc::now() - startTsc;
+            if (el >= nextHb) [[unlikely]] {
+                const double elapsedMin = static_cast<double>(el) / tscHz / 60.0;
+                const double remainMin  = m_durationSec / 60.0 - elapsedMin;
+                fmt::println(stderr, "[Recorder] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={}",
+                           elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded);
+                nextHb += hbCyc;
+            }
+        }
+
+        drain(); // when finished drain the remaining queue content
         report(h, tscHz, recorded);
         hdr_close(h);
     }
@@ -287,8 +292,27 @@ private:
         hdr_percentiles_print(h, f, 5, 1000.0, CSV);
         std::fclose(f);
         fmt::print("[Recorder] wrote percentile CSV to {}\n", m_outputPath);
+
+        // Full per-bucket histogram (value_ns,count) at the histogram's native
+        // resolution — the true frequency distribution for latency-vs-frequency
+        // plots. The percentile CSV above is dense in the TAIL (near P100); this
+        // is dense in the BODY (every recorded bucket), which the percentile
+        // export cannot reconstruct (its bottom half is only ~6 points).
+        const std::string histPath = m_outputPath + ".hist.csv";
+        if (std::FILE* hf = std::fopen(histPath.c_str(), "w")) {
+            std::fprintf(hf, "value_ns,count\n");
+            hdr_iter it;
+            hdr_iter_recorded_init(&it, h);
+            while (hdr_iter_next(&it))
+                std::fprintf(hf, "%lld,%lld\n",
+                             static_cast<long long>(it.value),
+                             static_cast<long long>(it.count));
+            std::fclose(hf);
+            fmt::print("[Recorder] wrote per-bucket histogram to {}\n", histPath);
+        }
     }
 
     RecorderChannel& m_ch;
     std::string      m_outputPath;
+    std::uint64_t    m_durationSec;
 };

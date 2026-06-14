@@ -157,24 +157,51 @@ inline void addAllowedBdf(const std::string& bdf) {
   v.push_back(bdf);
 }
 
+// DPDK-over-AF_XDP: each entry is a full --vdev string
+// ("net_af_xdpN,iface=cx0,start_queue=0,queue_count=1,mode=drv,busy_budget=64").
+// Same prepare()-before-init() registration model as the BDF allowlist so both
+// loopback ports are known before the single EAL init. Dedup on the vdev name.
+inline std::vector<std::string>& vdevs() {
+  static std::vector<std::string> v;
+  return v;
+}
+
+inline void addVdev(const std::string& arg) {
+  auto& v = vdevs();
+  const auto key = arg.substr(0, arg.find(','));
+  for (const auto& e : v)
+    if (e.substr(0, e.find(',')) == key) return;
+  v.push_back(arg);
+}
+
 inline bool ealInit(const std::string& bdf, int lcore) noexcept {
   static bool inited = false;
   if (inited) return true;
 
-  addAllowedBdf(bdf);
+  const auto& vds = vdevs();
+  if (vds.empty()) addAllowedBdf(bdf);   // BDF mode only; AF_XDP regs in prepare()
   const auto& bdfs = allowedBdfs();
 
-  std::string prefix = "abtrda3_" + bdfs.front().substr(0, bdfs.front().find(','));
-  for (char& c : prefix) if (c == ':' || c == '.') c = '_';
+  const std::string& base = !vds.empty() ? vds.front() : bdfs.front();
+  std::string prefix = "abtrda3_" + base.substr(0, base.find(','));
+  for (char& c : prefix) if (c == ':' || c == '.' || c == ',') c = '_';
   std::string lcoreStr = std::to_string(lcore);
 
   std::vector<std::string> args = {
     "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
     "-n", "4", "--file-prefix", prefix, "--force-max-simd-bitwidth=512"
   };
-  for (const auto& b : bdfs) {
-    args.emplace_back("-a");
-    args.emplace_back(b);
+  if (!vds.empty()) {
+    args.emplace_back("--no-pci");            // AF_XDP PMD is a vdev; no PCI probe
+    for (const auto& v : vds) {
+      args.emplace_back("--vdev");
+      args.emplace_back(v);
+    }
+  } else {
+    for (const auto& b : bdfs) {
+      args.emplace_back("-a");
+      args.emplace_back(b);
+    }
   }
 
   std::vector<char*> argv;
@@ -320,6 +347,24 @@ DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>& DPDK<M, Que
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::prepare() noexcept {
   if (m_prepared) return true;
+
+  // DPDK-over-AF_XDP: drive a kernel AF_XDP socket through the net_af_xdp vdev
+  // PMD — no PCI BDF, no vfio rebind (the PMD uses the kernel netdev directly).
+  // Our DPDK API drives it via the SAME rte_ethdev hot path as every other PMD;
+  // only the control plane differs. mode=drv (native XDP), busy_budget enables
+  // preferred busy-poll, force_copy omitted => zero-copy negotiated. m_pci holds
+  // the vdev name so init()'s get_port_by_name() resolves it unchanged.
+  if (m_driver.find("af_xdp") != std::string::npos) {
+    const std::string vname = "net_af_xdp" + std::to_string(dpdk::vdevs().size());
+    dpdk::addVdev(vname + ",iface=" + m_ifname +
+                  ",start_queue=0,queue_count=1,mode=drv,busy_budget=64");
+    m_pci           = vname;
+    m_txReuseInline = false;   // mlx5 full-inline reuse is N/A for the AF_XDP PMD
+    m_prepared      = true;
+    std::fprintf(stderr, "[DPDK] %s: AF_XDP PMD via vdev %s (busy-poll, zero-copy)\n",
+                 m_ifname.c_str(), vname.c_str());
+    return true;
+  }
 
   m_pci = pci::resolveBdf(m_ifname);
   if (m_pci.empty()) m_pci = pci::bdfFromName(m_ifname);

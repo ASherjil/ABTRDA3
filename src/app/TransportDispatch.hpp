@@ -322,7 +322,7 @@ inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg,
         CPU_ZERO(&set);
         CPU_SET(cfg.recRecorderCore, &set);
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-        Recorder rec(ch, cfg.outputPath);
+        Recorder rec(ch, cfg.outputPath, cfg.recDurationSec);
         rec(st);
     });
 
