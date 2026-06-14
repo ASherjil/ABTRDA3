@@ -182,11 +182,7 @@ struct xsk_socket_info {
   std::uint32_t outstanding_tx{0};
 };
 
-template<AFXDPMode     M,
-         std::uint32_t NumRxFrames = 2048,
-         std::uint32_t NumTxFrames = 2048,
-         std::uint32_t FrameSize   = 4096,
-         bool          NeedWakeup  = true>
+template<AFXDPMode M, std::uint32_t NumRxFrames = 2048, std::uint32_t NumTxFrames = 2048, std::uint32_t FrameSize = 4096, bool NeedWakeup = true>
 class AFXDP {
   static_assert(M == AFXDPMode::TxOnly ||
                 (NumRxFrames >= 8 && (NumRxFrames & (NumRxFrames - 1)) == 0),
@@ -298,35 +294,31 @@ private:
 
 // =============================================================================
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-AFXDP(const char* interface, std::uint32_t queueId, const char* bpfProgPath) noexcept
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::AFXDP(const char* interface, std::uint32_t queueId, const char* bpfProgPath) noexcept
   : m_interface{interface}, m_queueId{queueId}, m_bpfProgPath{bpfProgPath} {}
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-~AFXDP() { shutdown(); }
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::~AFXDP() {
+  shutdown();
+}
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-AFXDP(AFXDP&& other) noexcept { moveFrom(other); }
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::AFXDP(AFXDP&& other) noexcept {
+  moveFrom(other);
+}
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>&
-AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-operator=(AFXDP&& other) noexcept {
-  if (this != &other) { shutdown(); moveFrom(other); }
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>& AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::operator=(AFXDP&& other) noexcept {
+  if (this != &other) {
+    shutdown();
+    moveFrom(other);
+  }
   return *this;
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-init() {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init() {
   {
     struct rlimit r{ RLIM_INFINITY, RLIM_INFINITY };
     if (::setrlimit(RLIMIT_MEMLOCK, &r) != 0)
@@ -585,10 +577,8 @@ init() {
   return true;
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-shutdown() noexcept {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::shutdown() noexcept {
   if (m_xsk.xsk) {
     xdp_statistics stats{};
     socklen_t      slen = sizeof(stats);
@@ -623,21 +613,18 @@ shutdown() noexcept {
   }
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-int AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-fd() const noexcept { return m_fd; }
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+int AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::fd() const noexcept {
+  return m_fd;
+}
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-isCopyMode() const noexcept { return m_copyMode; }
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::isCopyMode() const noexcept {
+  return m_copyMode;
+}
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline RxFrame AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-tryReceive() noexcept
-    requires (M != AFXDPMode::TxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline RxFrame AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::tryReceive() noexcept requires (M != AFXDPMode::TxOnly) {
   __u32 idx;
   if (xsk_ring_cons__peek(&m_xsk.rx, 1, &idx) == 0) [[likely]] {
     if constexpr (NeedWakeup) {
@@ -653,11 +640,8 @@ tryReceive() noexcept
   return { .data = {m_umem.buffer + desc->addr, desc->len}, .sec = 0, .nsec = 0, .status = 1 };
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-release() noexcept
-    requires (M != AFXDPMode::TxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::release() noexcept requires (M != AFXDPMode::TxOnly) {
   __u32 idx_fq;
   if (xsk_ring_prod__reserve(&m_umem.fq, 1, &idx_fq) != 1) [[unlikely]] {
     ::recvfrom(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
@@ -671,22 +655,16 @@ release() noexcept
   xsk_ring_cons__release(&m_xsk.rx, 1);
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline std::uint8_t* AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-acquire(std::uint32_t frameLen) noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline std::uint8_t* AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::acquire(std::uint32_t frameLen) noexcept requires (M != AFXDPMode::RxOnly) {
   reapTx();
   m_pendingTxAddr = static_cast<std::uint64_t>(m_txFrameNb) * FrameSize;
   m_pendingTxLen  = frameLen;
   return m_umem.buffer + m_pendingTxAddr;
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-commit() noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::commit() noexcept requires (M != AFXDPMode::RxOnly) {
   __u32 idx;
   while (xsk_ring_prod__reserve(&m_xsk.tx, 1, &idx) != 1) {
     kickTx();
@@ -703,11 +681,8 @@ commit() noexcept
   kickTx();
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-send(std::span<const std::uint8_t> frame) noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::send(std::span<const std::uint8_t> frame) noexcept requires (M != AFXDPMode::RxOnly) {
   auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
   if (!dst) [[unlikely]] return false;
   std::memcpy(dst, frame.data(), frame.size());
@@ -715,21 +690,16 @@ send(std::span<const std::uint8_t> frame) noexcept
   return true;
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M != AFXDPMode::RxOnly) {
   for (std::uint32_t i = 0; i < TX_POOL_FRAMES; i++) {
     std::uint64_t addr = static_cast<std::uint64_t>(i) * FrameSize;
     std::memcpy(m_umem.buffer + addr, frameTemplate.data(), frameTemplate.size());
   }
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-steerAllTrafficToQueue() noexcept {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::steerAllTrafficToQueue() noexcept {
   if (m_queueId != 0) {
     fmt::print(stderr, "[AFXDP] WARN: queue {} != 0 — skipping combined=1 steering "
                        "(it routes all RX to queue 0); steer RSS to queue {} manually\n",
@@ -784,10 +754,8 @@ steerAllTrafficToQueue() noexcept {
   waitForCarrier();
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-waitForCarrier() noexcept {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::waitForCarrier() noexcept {
   const timespec settle{0, 500'000'000};
   ::nanosleep(&settle, nullptr);
 
@@ -812,11 +780,8 @@ waitForCarrier() noexcept {
              m_interface);
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-reapTx() noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::reapTx() noexcept requires (M != AFXDPMode::RxOnly) {
   if (!m_xsk.outstanding_tx) return;
   __u32 idx;
   unsigned int rcvd = xsk_ring_cons__peek(&m_umem.cq, BATCH_SIZE, &idx);
@@ -826,11 +791,8 @@ reapTx() noexcept
   }
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-kickTx() noexcept
-    requires (M != AFXDPMode::RxOnly) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::kickTx() noexcept requires (M != AFXDPMode::RxOnly) {
   if constexpr (HAS_RX) {
     ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
   } else if constexpr (NeedWakeup) {
@@ -841,10 +803,8 @@ kickTx() noexcept
   }
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-loadCustomBpf(const char* path) {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::loadCustomBpf(const char* path) {
   m_xdpProg = xdp_program__open_file(path, nullptr, nullptr);
   if (int err = libxdp_get_error(m_xdpProg)) {
     fmt::print(stderr, "[AFXDP] BPF load failed ({}): {}\n", path, std::strerror(-err));
@@ -861,10 +821,8 @@ loadCustomBpf(const char* path) {
   fmt::print(stderr, "[AFXDP] custom BPF loaded + attached: {}\n", path);
 }
 
-template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames,
-         std::uint32_t FrameSize, bool NeedWakeup>
-void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::
-moveFrom(AFXDP& o) noexcept {
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::moveFrom(AFXDP& o) noexcept {
   m_interface     = o.m_interface;
   m_queueId       = o.m_queueId;
   m_bpfProgPath   = o.m_bpfProgPath;

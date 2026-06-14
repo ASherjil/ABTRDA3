@@ -172,7 +172,10 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
     "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
     "-n", "4", "--file-prefix", prefix, "--force-max-simd-bitwidth=512"
   };
-  for (const auto& b : bdfs) { args.emplace_back("-a"); args.emplace_back(b); }
+  for (const auto& b : bdfs) {
+    args.emplace_back("-a");
+    args.emplace_back(b);
+  }
 
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
@@ -191,13 +194,7 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
 
 enum class DpdkMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
-template<DpdkMode M,
-         std::uint16_t QueueId   = 0,
-         std::uint16_t NbRxDesc  = 256,
-         std::uint16_t NbTxDesc  = 256,
-         std::uint16_t BurstSize = 32,
-         std::uint32_t NumMbufs  = 8191,
-         std::uint16_t MaxFrame  = RTE_MBUF_DEFAULT_DATAROOM>
+template<DpdkMode M, std::uint16_t QueueId = 0, std::uint16_t NbRxDesc = 256, std::uint16_t NbTxDesc = 256, std::uint16_t BurstSize = 32, std::uint32_t NumMbufs = 8191, std::uint16_t MaxFrame = RTE_MBUF_DEFAULT_DATAROOM>
 class DPDK {
   static_assert(BurstSize >= 1, "BurstSize must be >= 1");
   static_assert(NumMbufs > BurstSize, "NumMbufs must exceed BurstSize");
@@ -280,21 +277,17 @@ private:
 
 // =============================================================================
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-DPDK(std::string_view ifname, int lcore, std::string_view driver) noexcept
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::DPDK(std::string_view ifname, int lcore, std::string_view driver) noexcept
   : m_ifname{ifname}, m_driver{driver}, m_lcore{lcore} {}
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-~DPDK() { shutdown(); }
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::~DPDK() {
+  shutdown();
+}
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-DPDK(DPDK&& o) noexcept
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::DPDK(DPDK&& o) noexcept
   : m_ifname{std::move(o.m_ifname)}, m_driver{std::move(o.m_driver)},
     m_lcore{o.m_lcore}, m_pci{std::move(o.m_pci)},
     m_port{o.m_port}, m_pool{std::exchange(o.m_pool, nullptr)}, m_mac{o.m_mac},
@@ -303,11 +296,8 @@ DPDK(DPDK&& o) noexcept
     m_txReuse{std::exchange(o.m_txReuse, nullptr)},
     m_txReuseInline{o.m_txReuseInline} {}
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>&
-DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-operator=(DPDK&& o) noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>& DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::operator=(DPDK&& o) noexcept {
   if (this != &o) {
     shutdown();
     m_ifname        = std::move(o.m_ifname);
@@ -327,10 +317,8 @@ operator=(DPDK&& o) noexcept {
   return *this;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-prepare() noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::prepare() noexcept {
   if (m_prepared) return true;
 
   m_pci = pci::resolveBdf(m_ifname);
@@ -364,10 +352,8 @@ prepare() noexcept {
   return true;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-init(bool doWaitLink) noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(bool doWaitLink) noexcept {
   if (!prepare()) return false;
 
   if (!ealInitOnce(m_pci, m_lcore)) return false;
@@ -468,10 +454,8 @@ init(bool doWaitLink) noexcept {
   return true;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-waitLink() noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::waitLink() noexcept {
   rte_eth_link link{};
   for (int i = 0; i < 200; ++i) {
     rte_eth_link_get_nowait(m_port, &link);
@@ -494,12 +478,13 @@ waitLink() noexcept {
   return true;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-shutdown() noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::shutdown() noexcept {
   if (!m_started) return;
-  if (m_pendingRx) { rte_pktmbuf_free(m_pendingRx); m_pendingRx = nullptr; }
+  if (m_pendingRx) {
+    rte_pktmbuf_free(m_pendingRx);
+    m_pendingRx = nullptr;
+  }
   rte_eth_dev_stop(m_port);
   if constexpr (HAS_TX) {
     if (m_txReuse) {
@@ -511,25 +496,19 @@ shutdown() noexcept {
   m_started = false;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-std::array<std::uint8_t, 6> DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-macAddress() const noexcept { return m_mac; }
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+std::array<std::uint8_t, 6> DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::macAddress() const noexcept {
+  return m_mac;
+}
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
-    requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
   m_txTemplateLen = static_cast<std::uint16_t>(std::min<std::size_t>(frameTemplate.size(), MaxFrame));
   std::memcpy(m_txTemplate.data(), frameTemplate.data(), m_txTemplateLen);
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline RxFrame DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-tryReceive() noexcept
-    requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+inline RxFrame DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::tryReceive() noexcept requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx) {
   if (m_rxIdx >= m_rxCount) [[unlikely]] {
     m_rxCount = rte_eth_rx_burst(m_port, QueueId, m_rxBurst, BurstSize);
     m_rxIdx   = 0;
@@ -543,21 +522,15 @@ tryReceive() noexcept
            .status = 1 };
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-release() noexcept
-    requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::release() noexcept requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx) {
   rte_pktmbuf_free(m_pendingRx);
   m_pendingRx = nullptr;
   ++m_rxIdx;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline std::uint8_t* DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-acquire(std::uint32_t frameLen) noexcept
-    requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+inline std::uint8_t* DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::acquire(std::uint32_t frameLen) noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
   if (m_txReuseInline && frameLen <= INLINE_SAFE_LEN) {
     if (!m_txReuse) [[unlikely]] {
       m_txReuse = rte_pktmbuf_alloc(m_pool);
@@ -584,21 +557,15 @@ acquire(std::uint32_t frameLen) noexcept
   return p;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-commit() noexcept
-    requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::commit() noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
   if (rte_eth_tx_burst(m_port, QueueId, &m_pendingTx, 1) == 0) [[unlikely]]
     rte_pktmbuf_free(m_pendingTx);
   m_pendingTx = nullptr;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-send(std::span<const std::uint8_t> frame) noexcept
-    requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+inline bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::send(std::span<const std::uint8_t> frame) noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
   auto* buf = acquire(static_cast<std::uint32_t>(frame.size()));
   if (!buf) [[unlikely]] return false;
   std::memcpy(buf, frame.data(), frame.size());
@@ -606,17 +573,13 @@ send(std::span<const std::uint8_t> frame) noexcept
   return true;
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-ealInitOnce(const std::string& pci, int lcore) noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::ealInitOnce(const std::string& pci, int lcore) noexcept {
   return dpdk::ealInit(pci, lcore);
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-writeSysfs(const std::string& path, std::string_view val) noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::writeSysfs(const std::string& path, std::string_view val) noexcept {
   const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
   if (fd < 0) return false;
   const ssize_t n = ::write(fd, val.data(), val.size());
@@ -624,10 +587,8 @@ writeSysfs(const std::string& path, std::string_view val) noexcept {
   return n == static_cast<ssize_t>(val.size());
 }
 
-template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
-         std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::
-bindToVfio(const std::string& bdf) noexcept {
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::bindToVfio(const std::string& bdf) noexcept {
   if (::access("/sys/bus/pci/drivers/vfio-pci", F_OK) != 0)
     (void)std::system("modprobe vfio-pci");
   if (pci::currentDriver(bdf) == "vfio-pci") return true;
