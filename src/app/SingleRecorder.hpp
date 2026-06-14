@@ -133,8 +133,8 @@ public:
                 if (RxFrame f = m_rx.tryReceive(); !f.data.empty()) [[unlikely]] {
                     if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
                         std::memcmp(f.data.data() + 12, expect, 6) == 0) [[likely]] {
-                        m_rx.release();
                         const std::uint64_t t1 = tsc::now();
+                        m_rx.release();
                         if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]]
                             m_ch.pushFailures.fetch_add(1, std::memory_order_relaxed);
                         ++recv;
