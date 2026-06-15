@@ -432,8 +432,14 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
   if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
-  constexpr std::uint16_t nb_rxq = HAS_RX ? 1 : 0;
-  constexpr std::uint16_t nb_txq = HAS_TX ? 1 : 0;
+  // The net_af_xdp PMD requires nb_rx_queues == nb_tx_queues (it pairs an XSK
+  // rx+tx per queue). Our single-recorder uses asymmetric TxOnly/RxOnly ports,
+  // which mlx5/i40e accept but af_xdp rejects with -EINVAL. So in af_xdp mode
+  // configure BOTH directions (1 each) regardless of mode — the unused side is
+  // set up only to satisfy the pairing; the hot path still drives one direction.
+  const bool afxdp = (m_driver.find("af_xdp") != std::string::npos);
+  const std::uint16_t nb_rxq = (HAS_RX || afxdp) ? 1 : 0;
+  const std::uint16_t nb_txq = (HAS_TX || afxdp) ? 1 : 0;
   if (rte_eth_dev_configure(m_port, nb_rxq, nb_txq, &conf) != 0) {
     std::fprintf(stderr, "[DPDK] dev_configure failed (port %u)\n", m_port);
     return false;
@@ -445,7 +451,7 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
     return false;
   }
 
-  if constexpr (HAS_RX) {
+  if (HAS_RX || afxdp) {
     rte_eth_rxconf rxconf = info.default_rxconf;
     rxconf.offloads = conf.rxmode.offloads;
     if (rte_eth_rx_queue_setup(m_port, QueueId, nb_rxd, sid, &rxconf, m_pool) < 0) {
@@ -453,7 +459,7 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
       return false;
     }
   }
-  if constexpr (HAS_TX) {
+  if (HAS_TX || afxdp) {
     rte_eth_txconf txconf = info.default_txconf;
     txconf.offloads = conf.txmode.offloads;
     if (rte_eth_tx_queue_setup(m_port, QueueId, nb_txd, sid, &txconf) < 0) {

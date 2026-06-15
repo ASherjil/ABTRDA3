@@ -368,15 +368,8 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
     }
 
     if (transport == "af_xdp") {
-        // Tx on the client port, Rx on the server port — DISTINCT ports => distinct
-        // NAPIs, so the gated TX kick (xdpsock-faithful) drives TX cleanly and the
-        // shared-NAPI igc_xsk_wakeup TX-NOP (which bit the RxTx-same-socket path)
-        // does not apply. NeedWakeup=true on both:
-        //  - Rx: the per-empty-poll recvfrom is TAIL INSURANCE — A/B proved removing
-        //    it (need_wakeup=false / gating) buys ~1.3us median but costs ~7-8us at
-        //    P99/P99.9. For WR-style timing the tail is the spec, so keep it.
-        //  - Tx: TxOnly + NeedWakeup=true => kickTx uses the needs_wakeup-gated kick.
-        AFXDP<AFXDPMode::TxOnly> tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
+
+        AFXDP<AFXDPMode::TxOnly, 2048, 2048, 4096, false> tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
         AFXDP<AFXDPMode::RxOnly> rx(cfg.server.interface.c_str(), cfg.server.xdpQueueId);
         if (!tx.init()) { fmt::println(stderr, "Error: Tx AF_XDP init failed on {}", cfg.client.interface); return 1; }
         if (!rx.init()) { fmt::println(stderr, "Error: Rx AF_XDP init failed on {}", cfg.server.interface); return 1; }
