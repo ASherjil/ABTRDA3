@@ -193,6 +193,9 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
   };
   if (!vds.empty()) {
     args.emplace_back("--no-pci");            // AF_XDP PMD is a vdev; no PCI probe
+    args.emplace_back("--in-memory");         // no /var/run/dpdk/<prefix> files => two
+                                              // af_xdp primaries (RTT server+client) on
+                                              // one host don't collide on the lock
     for (const auto& v : vds) {
       args.emplace_back("--vdev");
       args.emplace_back(v);
