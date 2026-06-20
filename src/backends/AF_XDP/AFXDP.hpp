@@ -260,6 +260,7 @@ private:
   void steerAllTrafficToQueue() noexcept;
   void waitForCarrier() noexcept;
 
+  void clearXdpProgram() noexcept;
   void loadXdpProgram(const char* path);
   void xskConfigureUmem();
   void xskPopulateFillRing();
@@ -337,6 +338,10 @@ bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init() {
     fmt::print(stderr, "[AFXDP] bad interface: {}\n", m_interface);
     return false;
   }
+
+  // Strip any XDP program a prior (possibly crashed) run left attached on this
+  // interface before we attach ours — equivalent to `ip link set dev <iface> xdp off`.
+  clearXdpProgram();
 
   if constexpr (HAS_RX) {
     steerAllTrafficToQueue();
@@ -842,6 +847,19 @@ inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::kickTx() 
   }
   fmt::println(stderr, "[AFXDP] kickTx sendto failed: {}", std::strerror(errno));
   std::abort();
+}
+
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::clearXdpProgram() noexcept {
+  // `ip link set dev <iface> xdp off` in C: detach whatever XDP program is on the
+  // interface so a leftover dispatcher/prog can't block our attach or mis-route RX.
+  // Try every mode (the stale one could be in any); best-effort, errors are expected
+  // when nothing — or a different mode — is attached.
+  bpf_xdp_detach(m_ifindex, XDP_FLAGS_DRV_MODE, nullptr);
+  bpf_xdp_detach(m_ifindex, XDP_FLAGS_SKB_MODE, nullptr);
+  bpf_xdp_detach(m_ifindex, 0, nullptr);
+  fmt::print(stderr, "[AFXDP] {}: cleared any pre-existing XDP program (ip link xdp off)\n",
+             m_interface);
 }
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
