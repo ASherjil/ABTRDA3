@@ -108,13 +108,13 @@
 //      BOTH nonzero — if both are 0, the hardware IRQ fires after each
 //      busy-poll and NAPI falls back to the softirq/IRQ path (measured: 79us
 //      on igc). Two regimes:
-//        * CLASSIC BUSY-POLL (default, USE_IRQ_SUSPEND=false): small defer +
+//        * CLASSIC BUSY-POLL (init enableDeferral=true): small defer +
 //          small gro-flush, irq-suspend=0. Keeps busy-poll owning the NAPI
 //          WITHOUT the kernel-6.13 irq-suspend hrtimer/APIC machinery that
 //          perf showed wastes ~12% of the hot loop (native_write_msr,
 //          lapic_next_deadline, hrtimer_start) on this always-hot
 //          one-in-flight workload.
-//        * IRQ-SUSPEND (USE_IRQ_SUSPEND=true, kernel 6.13+): adds
+//        * IRQ-SUSPEND (init enableIrqSuspend=true, kernel 6.13+): adds
 //          irq-suspend-timeout — good for bursty/idle-cycling server loads,
 //          not a saturated ping-pong.
 //   8. Insert the socket fd into the XSKMAP (key = queue id, matching
@@ -211,9 +211,11 @@ class AFXDP {
 
   static constexpr std::uint32_t BATCH_SIZE = 64;
 
-  static constexpr bool          USE_IRQ_SUSPEND      = false;
+  // NAPI deferral / irq-suspend VALUES. WHICH of them is applied is chosen at
+  // runtime by init(enableDeferral, enableIrqSuspend) -> resolved into
+  // m_napiDefer/m_napiGro/m_napiSusp (both flags off => all 0 = deferral OFF).
   static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = 2;
-  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 2'000;
+  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 200'000;
   static constexpr std::uint64_t NAPI_IRQ_SUSPEND_NS  = 20'000'000;
 
 public:
@@ -227,7 +229,11 @@ public:
   AFXDP(AFXDP&& other) noexcept;
   AFXDP& operator=(AFXDP&& other) noexcept;
 
-  [[nodiscard]] bool init();
+  // enableDeferral   — classic NAPI deferral (napi_defer_hard_irqs + gro_flush_timeout).
+  // enableIrqSuspend — kernel-6.13 irq-suspend-timeout regime (implies defer+gro on).
+  // BOTH false => deferral AND irq-suspend are explicitly ZEROED (defer=gro=suspend=0),
+  //   clearing any netdev-wide value a previous run may have left enabled.
+  [[nodiscard]] bool init(bool enableDeferral = true, bool enableIrqSuspend = false);
   void shutdown() noexcept;
 
   [[nodiscard]] int  fd()         const noexcept;
@@ -259,6 +265,7 @@ public:
 private:
   void steerAllTrafficToQueue() noexcept;
   void waitForCarrier() noexcept;
+  void applyNapiDeferralSysfs() const noexcept;
 
   void clearXdpProgram() noexcept;
   void loadXdpProgram(const char* path);
@@ -293,6 +300,14 @@ private:
   bool            m_customBpf{false};
   bool            m_txKickAlways{false};
 
+  // NAPI regime: the two init() flags, resolved once into the values pushed to
+  // sysfs (netdev-wide) and netlink (per-NAPI). All 0 == deferral OFF.
+  bool            m_enableDeferral{true};
+  bool            m_enableIrqSuspend{false};
+  std::uint32_t   m_napiDefer{0};
+  std::uint64_t   m_napiGro{0};
+  std::uint64_t   m_napiSusp{0};
+
   std::uint64_t   m_pendingRxAddr{0};
   __u32           m_pendingFqIdx{0};   // FILL slot reserved in tryReceive(), filled in release()
   std::uint64_t   m_pendingTxAddr{0};
@@ -326,7 +341,28 @@ AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>& AFXDP<M, NumRxFrames,
 }
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
-bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init() {
+bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init(bool enableDeferral, bool enableIrqSuspend) {
+  m_enableDeferral   = enableDeferral;
+  m_enableIrqSuspend = enableIrqSuspend;
+  // Resolve the NAPI regime once from the two flags. irq-suspend implies defer+gro
+  // (it cannot take effect without them) plus the suspend timeout; deferral is
+  // defer+gro only; both-off ZEROES everything so a netdev-wide value a prior run
+  // enabled is cleared. These feed both the sysfs writes (applyNapiDeferralSysfs)
+  // and the per-NAPI netlink set in verifyConfig().
+  if (m_enableIrqSuspend) {
+    m_napiDefer = NAPI_DEFER_HARD_IRQS;
+    m_napiGro   = NAPI_GRO_FLUSH_NS;
+    m_napiSusp  = NAPI_IRQ_SUSPEND_NS;
+  } else if (m_enableDeferral) {
+    m_napiDefer = NAPI_DEFER_HARD_IRQS;
+    m_napiGro   = NAPI_GRO_FLUSH_NS;
+    m_napiSusp  = 0;
+  } else {
+    m_napiDefer = 0;
+    m_napiGro   = 0;
+    m_napiSusp  = 0;
+  }
+
   {
     struct rlimit r{ RLIM_INFINITY, RLIM_INFINITY };
     if (::setrlimit(RLIMIT_MEMLOCK, &r) != 0)
@@ -342,6 +378,11 @@ bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init() {
   // Strip any XDP program a prior (possibly crashed) run left attached on this
   // interface before we attach ours — equivalent to `ip link set dev <iface> xdp off`.
   clearXdpProgram();
+
+  // Enable (or clear) the netdev-wide busy-poll deferral for the chosen regime.
+  // ALL modes: busy-poll drives the driver from BOTH recvmsg (RX) and sendto (TX),
+  // so a TX-only socket needs it too. Done before the steer/bind recreates the NAPI.
+  applyNapiDeferralSysfs();
 
   if constexpr (HAS_RX) {
     steerAllTrafficToQueue();
@@ -368,6 +409,41 @@ bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init() {
   verifyConfig();
 
   return true;
+}
+
+template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
+void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::applyNapiDeferralSysfs() const noexcept {
+  // The netdev-wide NAPI deferral knobs (napi_defer_hard_irqs, gro_flush_timeout)
+  // PERSIST across runs and are inherited by newly-created NAPIs — so a prior run
+  // that enabled deferral leaves them set. (Re)write them on every init, BEFORE the
+  // steer/bind recreates the NAPI, so the chosen regime is deterministic and a stale
+  // enable cannot silently survive. Both flags off => 0/0 (deferral OFF). The
+  // irq-suspend-timeout has no netdev-wide sysfs (netlink/per-NAPI only) and is
+  // applied in the NAPI_SET block.
+  const auto writeKnob = [this](const char* knob, std::uint64_t value) {
+    char path[128];
+    std::snprintf(path, sizeof(path), "/sys/class/net/%s/%s", m_interface, knob);
+    const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+      fmt::print(stderr, "[AFXDP] WARN: open {}: {}\n", path, std::strerror(errno));
+      return;
+    }
+    char val[24];
+    const int n = std::snprintf(val, sizeof(val), "%llu",
+                                static_cast<unsigned long long>(value));
+    if (::write(fd, val, static_cast<std::size_t>(n)) != n)
+      fmt::print(stderr, "[AFXDP] WARN: write {}={}: {}\n", path, value, std::strerror(errno));
+    ::close(fd);
+  };
+
+  writeKnob("napi_defer_hard_irqs", m_napiDefer);
+  writeKnob("gro_flush_timeout",    m_napiGro);
+
+  fmt::print(stderr,
+             "[AFXDP] {}: NAPI sysfs napi_defer_hard_irqs={} gro_flush_timeout={}ns ({})\n",
+             m_interface, m_napiDefer, m_napiGro,
+             m_enableIrqSuspend ? "irq-suspend regime"
+                                : (m_enableDeferral ? "deferral" : "deferral OFF"));
 }
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
@@ -800,19 +876,24 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::verifyConfig() {
   }
 
 
-  if constexpr (HAS_RX) {
+  // Per-NAPI deferral / irq-suspend via netlink. ALL modes: busy-poll TX needs it
+  // too, and irq-suspend-timeout has no sysfs (netlink-only). On a TX-only socket
+  // SO_INCOMING_NAPI_ID is the bound queue's NAPI (shared RX/TX pair on i40e/igc);
+  // if it reads 0 we skip and rely on the netdev-wide sysfs write above.
+  {
     std::uint32_t napiId  = 0;
     socklen_t     idLen   = sizeof(napiId);
     if (::getsockopt(m_fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napiId, &idLen) == 0
         && napiId != 0) {
-      const std::uint32_t defer = NAPI_DEFER_HARD_IRQS;
-      const std::uint64_t gro   = NAPI_GRO_FLUSH_NS;
-      const std::uint64_t susp  = USE_IRQ_SUSPEND ? NAPI_IRQ_SUSPEND_NS : 0;
+      const std::uint32_t defer = m_napiDefer;
+      const std::uint64_t gro   = m_napiGro;
+      const std::uint64_t susp  = m_napiSusp;
       const bool ok = napi::setBusyPoll(napiId, defer, gro, susp);
       fmt::print(stderr,
         "[AFXDP] NAPI {}: defer-hard-irqs={} gro-flush={}ns irq-suspend={}ns ({}) => {}\n",
         napiId, defer, gro, susp,
-        USE_IRQ_SUSPEND ? "irq-suspend regime" : "brute-force busy-poll",
+        m_enableIrqSuspend ? "irq-suspend regime"
+                           : (m_enableDeferral ? "deferral busy-poll" : "deferral OFF"),
         ok ? "applied" : "FAILED");
       // READBACK via NETDEV_CMD_NAPI_GET — the netlink ACK above only says the
       // kernel accepted the message; this asks what the NAPI actually runs with.

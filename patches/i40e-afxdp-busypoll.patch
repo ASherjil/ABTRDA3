@@ -1,0 +1,55 @@
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -5192,9 +5192,21 @@
+ 
+ 	for (q_idx = 0; q_idx < vsi->num_q_vectors; q_idx++) {
+ 		struct i40e_q_vector *q_vector = vsi->q_vectors[q_idx];
++		struct i40e_ring *ring;
+ 
+ 		if (q_vector->rx.ring || q_vector->tx.ring)
+ 			napi_enable(&q_vector->napi);
++
++		/* Associate each RX queue with this q_vector's NAPI so the
++		 * AF_XDP busy-poll path (net/xdp/xsk.c) can read
++		 * rxq->napi->napi_id. Stock i40e omits this, leaving XSK
++		 * sockets with napi_id=0 and silently disabling SO_BUSY_POLL.
++		 * Mirrors igc_set_queue_napi().
++		 */
++		i40e_for_each_ring(ring, q_vector->rx)
++			netif_queue_set_napi(vsi->netdev, ring->queue_index,
++					     NETDEV_QUEUE_TYPE_RX,
++					     &q_vector->napi);
+ 	}
+ }
+ 
+@@ -5211,6 +5223,14 @@
+ 
+ 	for (q_idx = 0; q_idx < vsi->num_q_vectors; q_idx++) {
+ 		struct i40e_q_vector *q_vector = vsi->q_vectors[q_idx];
++		struct i40e_ring *ring;
++
++		/* Clear the RX queue<->NAPI association set in
++		 * i40e_napi_enable_all() before tearing the NAPI down.
++		 */
++		i40e_for_each_ring(ring, q_vector->rx)
++			netif_queue_set_napi(vsi->netdev, ring->queue_index,
++					     NETDEV_QUEUE_TYPE_RX, NULL);
+ 
+ 		if (q_vector->rx.ring || q_vector->tx.ring)
+ 			napi_disable(&q_vector->napi);
+@@ -12042,8 +12062,14 @@
+ 	q_vector->v_idx = v_idx;
+ 	cpumask_copy(&q_vector->affinity_mask, cpu_possible_mask);
+ 
++	/* Use the config variant (like ice) so each NAPI gets persistent
++	 * per-NAPI config storage. Without it, NETDEV_CMD_NAPI_SET is rejected
++	 * (ENOENT) and napi_complete_done() never defers the hardirq, so
++	 * AF_XDP busy-poll cannot suppress interrupts (1 IRQ/pkt, no benefit).
++	 */
+ 	if (vsi->netdev)
+-		netif_napi_add(vsi->netdev, &q_vector->napi, i40e_napi_poll);
++		netif_napi_add_config(vsi->netdev, &q_vector->napi,
++				      i40e_napi_poll, q_vector->v_idx);
+ 
+ 	/* tie q_vector and vsi together */
+ 	vsi->q_vectors[v_idx] = q_vector;
