@@ -1,26 +1,40 @@
 #pragma once
 
-// SingleRecorder — single-process one-way latency benchmark.
+// SingleRecorder — single-process, OPEN-ENDED one-way latency benchmark.
 //
-// Port 1 transmits and Port 2 receives, both in ONE process, so a single host
-// TSC brackets each packet: there is no cross-machine clock-sync problem and no
-// cross-port PHC problem — t0 and t1 are read from the same core's TSC. This
-// isolates the wire+delivery half of latency (NIC-TX + DMA + wire + NIC-RX +
-// busy-poll RX delivery) that an RTT bundles together with peer turnaround.
+// Port 1 (client) transmits, Port 2 (server) receives, in ONE process, so a
+// single host's invariant TSC brackets every packet — no cross-machine clock
+// sync. Unlike the old serial loopback (one frame in flight: send -> spin ->
+// measure), this is a PIPELINED stream: an independent Tx thread fires frames
+// each carrying their own send-timestamp, and an independent Rx thread timestamps
+// arrival and computes latency = t_arrive - t_send from the in-band stamp. Many
+// frames in flight, so the distribution reflects the offered load.
 //
-// Two threads, each a functor (operator()), connected by a lock-free SPSC queue:
-//   * LoopBack (producer): time-bounded loop. acquire->commit->send->spin-receive
-//     ->verify(MAC+seq)->release, brackets with rdtscp, pushes the raw cycle
-//     delta. NOTHING else touches the hot core — no allocation, no syscalls
-//     beyond the transport's own, no histogram, no I/O.
-//   * Recorder (consumer): pops cycle deltas, converts to ns, records into an
-//     HdrHistogram (fixed ~1.5 MB regardless of sample count — the only way a
-//     24 h / ~19 billion-sample run is feasible). At the end it prints the
-//     percentile table and dumps a plottable CSV.
+// THREE threads, each pinned to its OWN isolated core, all SCHED_OTHER. One
+// busy-poll thread per isolated core needs no RT priority: nothing else is
+// scheduled there, so SCHED_OTHER already runs ~100% — while FIFO would risk
+// starving per-CPU kernel threads (vmstat/kworker) into a lockup and incurs the
+// 95% RT-throttle. (Low-latency tuning guidance: prefer SCHED_OTHER + busy-poll
+// on isolated cores over real-time priorities.)
+//   * TxThread   (hot_path_core): acquire -> stamp seq + tsc::now() -> commit.
+//   * RxThread   (rx_core):       verify MAC+ethertype, stamp arrival, anti-replay
+//                                 seq gate, push (t_arrive - t_send) into the SPSC.
+//   * HistThread (benchmark_recorder_core): pop SPSC, cycles->ns, record into the
+//                                 HdrHistogram, dump CSV. Stops on an in-band
+//                                 end-sentinel pushed by RxThread.
 //
-// The hot loop is bounded by DURATION (TSC cycles), not a sample count, so the
-// same binary does a 60 s smoke test or a 24 h determinism soak by changing one
-// TOML field.
+// CROSS-CORE TSC: t_send is read on the Tx core, t_arrive on the Rx core. Valid
+// here because the box is single-socket with constant_tsc + nonstop_tsc — every
+// core's TSC derives from one crystal and is reset-synchronised (sub-ns), so the
+// cross-core delta is the true one-way latency. A MULTI-socket host would break
+// this and need a PHC.
+//
+// COORDINATION (minimal): ONE atomic `txDone` (Tx -> Rx) plus an in-band queue
+// SENTINEL (Rx -> Hist). The SPSC is FIFO, so Hist drains every real sample before
+// it pops the sentinel — no second flag, no lost tail.
+//
+// The run is bounded by DURATION (TSC cycles), so the same binary does a 60 s
+// smoke test or a 24 h soak by changing one TOML field.
 
 #include "RingConcepts.hpp"
 #include "TestConfig.hpp"
@@ -31,288 +45,447 @@
 
 #include <fmt/core.h>
 
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <memory>
+#include <ctime>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <sched.h>
 
-// ── Shared state between the two functors ──────────────────────────────────
-struct RecorderChannel {
-    rigtorp::SPSCQueue<std::uint64_t> queue;   // raw TSC cycle deltas
-    std::atomic<bool>                 ready{false};  // recorder is draining
-    std::atomic<bool>                 done{false};   // producer finished
-    std::atomic<std::uint64_t>        pushFailures{0};
+// RX -> Hist end marker. A real cycle-delta of ~2^64 cycles is physically
+// impossible (~years), so this value can never collide with a sample.
+inline constexpr std::uint64_t kEndSentinel = ~0ULL;
 
-    explicit RecorderChannel(std::size_t capacity) : queue(capacity) {}
+// Samples dropped at the START of recording (NIC/link cold-start) before the
+// HdrHistogram accumulates — they never skew the percentiles. Each dropped sample
+// is one fewer measured, so the effective window is slightly shorter than
+// duration_sec; add a little margin (e.g. 310s for ~5 min of recorded data).
+inline constexpr std::uint64_t kWarmupDiscard = 500'000;
+
+// ── Frame payload layout ─────────────────────────────────────────────────────
+//   [0..5] dst MAC | [6..11] src MAC | [12..13] ethertype | [14..17] seq (htonl)
+//   | [18..25] tx TSC stamp (native u64). frame_size must be >= kFrameMinBytes.
+inline constexpr std::size_t kOffDstMac     = 0;
+inline constexpr std::size_t kOffSrcMac     = 6;
+inline constexpr std::size_t kOffEtherType  = 12;
+inline constexpr std::size_t kOffSeq        = 14;   // uint32, network order
+inline constexpr std::size_t kOffTxStamp    = 18;   // uint64, native (same host)
+inline constexpr std::size_t kFrameMinBytes = kOffTxStamp + sizeof(std::uint64_t);  // 26
+
+// Unaligned store/load helpers. memcpy with a COMPILE-TIME-CONSTANT size is NOT a
+// function call — GCC/Clang lower it to a single (un)aligned mov, i.e. the exact
+// store/load you would hand-write. This is the correct, optimal idiom; a
+// reinterpret_cast<T*> access is the same speed but UB (strict aliasing + unaligned).
+template<typename T>
+[[gnu::always_inline]] inline void storeU(std::uint8_t* p, T v) noexcept {
+    std::memcpy(p, &v, sizeof(T));
+}
+
+template<typename T>
+[[gnu::always_inline]] inline T loadU(const std::uint8_t* p) noexcept {
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
+
+// Pin the calling thread to `core` and set its scheduling policy. All three
+// recorder threads use SCHED_OTHER (prio 0): on an isolated core a single
+// busy-poll thread runs ~100% under SCHED_OTHER, while avoiding RT throttling and
+// the FIFO lockup risk. Affinity is set regardless of policy.
+inline void pinThread(int core, int policy = SCHED_OTHER, int prio = 0) noexcept {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+
+    sched_param sp{};
+    sp.sched_priority = prio;
+    pthread_setschedparam(pthread_self(), policy, &sp);
+}
+
+// ── Shared cross-core surface — the ONLY state touched by more than one thread ──
+struct Shared {
+    rigtorp::SPSCQueue<std::uint64_t> rxToHist;        // RX writes, Hist reads (cycle deltas)
+    std::atomic<bool>                 txDone{false};   // TX writes, RX reads
+    std::atomic<std::uint64_t>        pushFailures{0}; // RX -> SPSC overflow tally
+    const TestConfig&                 cfg;             // read-only after construction
+    double                            tscHz{0.0};      // calibrated ONCE before threads start
+
+    explicit Shared(const TestConfig& c) : rxToHist(c.recQueueCapacity), cfg(c) {}
 };
 
-// ── Producer: the loopback hot path ─────────────────────────────────────────
-// Owns the Tx and Rx transports (different ports). One packet in flight: send,
-// then spin until the matching echo (own MAC + seq) returns, timing the round.
-template<TxRing Tx, RxRing Rx>
-class LoopBack {
-public:
-    LoopBack(Tx& tx, Rx& rx, const TestConfig& cfg, RecorderChannel& ch,
-             std::uint64_t durationSec)
-        : m_tx(tx), m_rx(rx), m_cfg(cfg), m_ch(ch), m_durationSec(durationSec) {}
+// ── Sequence gate ────────────────────────────────────────────────────────────
+// Each frame carries a monotonically increasing seq. Per frame:
+//   diff == 1  -> in order                       (record)
+//   diff  > 1  -> a gap: diff-1 frames were lost  (record this one, count the loss)
+//   diff <= 0  -> at-or-behind the last accepted  (DROP, do not record):
+//                 stale echo / duplicate / reordered frame
+// `diff` is the SIGNED distance seq-last. The uint32 seq WRAPS at line rate
+// (~every 2 min at 25G), so a plain `seq > last` test would misread a post-wrap gap
+// as "behind" and stall the stream. The subtraction wraps in uint32, and the int32
+// cast (two's-complement, well-defined in C++20) maps slightly-ahead -> small +ve
+// and behind -> -ve — wrap-safe with a single comparison, no magic constant.
+struct AntiReplay {
+    std::uint32_t last{0};
+    bool          have{false};
 
-    void operator()(std::stop_token stop) {
-        // Prefill the Tx ring's ethernet header so the hot path only writes the
-        // sequence number (zero-copy: header lives in the ring slot).
-        std::vector<std::uint8_t> tmpl(m_cfg.frameSize, 0);
-        std::memcpy(&tmpl[0], m_cfg.server.mac.data(), 6);  // dst = Rx port
-        std::memcpy(&tmpl[6], m_cfg.client.mac.data(), 6);  // src = Tx port
-        tmpl[12] = static_cast<std::uint8_t>(m_cfg.etherType >> 8);
-        tmpl[13] = static_cast<std::uint8_t>(m_cfg.etherType & 0xFF);
+    bool accept(std::uint32_t seq, std::uint64_t& lost, std::uint64_t& dropped) noexcept {
+        if (!have) {
+            have = true;
+            last = seq;
+            return true;                                // first frame sets the baseline
+        }
+        const std::int32_t diff = static_cast<std::int32_t>(seq - last);
+        if (diff <= 0) {
+            ++dropped;                                  // stale echo / duplicate / reorder
+            return false;
+        }
+        lost += static_cast<std::uint64_t>(diff - 1);   // 0 if in order, else the gap size
+        last = seq;
+        return true;
+    }
+};
+
+// ── Tx: stream frames, each carrying seq + its own send timestamp ────────────
+template<TxRing Tx>
+class TxThread {
+public:
+    TxThread(Shared& sh, Tx& tx) : m_sh(sh), m_tx(tx) {}
+
+    void run(std::uint64_t durationCyc, std::stop_token stop) {
+        const TestConfig& cfg = m_sh.cfg;
+
+        // Guard a sane frame size (>= 14B hdr + 4B seq + 8B stamp). Also gives GCC
+        // the range fact that silences a -Wstringop-overflow false positive on the
+        // &tmpl[kOffSrcMac] write below (it otherwise assumes frameSize may be 0).
+        if (cfg.frameSize < kFrameMinBytes) {
+            fmt::print(stderr, "[SingleRec/Tx] frame_size {} < {} — aborting\n",
+                       cfg.frameSize, kFrameMinBytes);
+            m_sh.txDone.store(true, std::memory_order_release);
+            return;
+        }
+
+        // Prefill the TX ring's ethernet header so the hot path only writes the
+        // sequence number and the timestamp.
+        std::vector<std::uint8_t> tmpl(cfg.frameSize, 0);
+        std::memcpy(&tmpl[kOffDstMac], cfg.server.mac.data(), 6);   // dst = Rx port
+        std::memcpy(&tmpl[kOffSrcMac], cfg.client.mac.data(), 6);   // src = Tx port
+        tmpl[kOffEtherType]     = static_cast<std::uint8_t>(cfg.etherType >> 8);
+        tmpl[kOffEtherType + 1] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
         m_tx.prefillRing(tmpl);
 
-        // Run duration in TSC cycles — the SOLE stop condition (no watchdog, no
-        // per-packet timeout). On a direct one-in-flight link every packet comes
-        // back, so we simply send then spin-receive until our frame arrives.
-        const double        tscHz       = tsc::calibrateHz();
-        const std::uint64_t durationCyc = static_cast<std::uint64_t>(tscHz)
-                                        * m_durationSec;
+        const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
+        timespec nextSend{};
+        if (intervalNs > 0)
+            clock_gettime(CLOCK_MONOTONIC, &nextSend);
 
-        // Recorder starts first: wait until it is draining before we produce, so
-        // no samples are generated before the consumer is ready.
-        while (!m_ch.ready.load(std::memory_order_acquire) && !stop.stop_requested())
-            ;
+        std::uint32_t       seq   = 0;
+        const std::uint64_t start = tsc::now();
 
-        std::uint32_t seq = 0;
-        std::uint64_t sent = 0, recv = 0, lost = 0;
-
-        // Per-round match pattern for bytes 12..17 of the frame: ethertype (2B,
-        // constant) + seq (4B, rewritten each round). Together with the dst-MAC
-        // compare this verifies dst MAC + ethertype + seq on every counted
-        // sample — one contiguous 6-byte compare on an already-loaded cacheline.
-        std::uint8_t expect[6] = {
-            static_cast<std::uint8_t>(m_cfg.etherType >> 8),
-            static_cast<std::uint8_t>(m_cfg.etherType & 0xFF), 0, 0, 0, 0 };
-
-        // Warm the NIC datapath BEFORE timing starts — kick the "diesel engine".
-        // Sends/receives a burst that is NOT timed and discarded, so the cold
-        // first-packet cost (TX path bring-up, i40e GLQF register init, descriptor
-        // rings, CPU caches) AND the documented XXV710 cold-start frame loss
-        // (first ~0-63 frames) never enter the measurement. Transport-generic.
-        primeDatapath(seq, stop);
-
-        const std::uint64_t runStart    = tsc::now();   // timing starts AFTER warmup
-
-        while (true) {
-            if (tsc::now() - runStart >= durationCyc || stop.stop_requested()) break;
-
-            // Buffer prep (acquire + seq stamp) is NOT timed — it is the Tx-side
-            // boilerplate that mirrors release() on the Rx side. Timing brackets
-            // the transmit->receive only: t0 right before commit() (the actual
-            // send: tx_burst / post_send / sendto / SEND_REQUEST), t1 the instant
-            // the frame is matched in the Rx ring (before release()).
-            std::uint8_t* dst = m_tx.acquire(m_cfg.frameSize);
-            if (!dst) [[unlikely]] { continue; }
-            const std::uint32_t seqNet = htonl(seq);
-            std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
-            std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
-
-            const std::uint64_t t0 = tsc::now();
-            m_tx.commit();
-            ++sent;
-
-            // Spin until the Rx port delivers THIS frame (one-way, no reflection):
-            // match dst MAC (the Rx port) + ethertype + the seq we just wrote, so
-            // every counted sample is provably our own packet — never stray or
-            // stale traffic. The spin is BOUNDED at kLostSpins (~seconds, five
-            // orders of magnitude beyond any real frame) — a frame killed by a
-            // line bit-error (25G BER 1e-15 => ~2% odds of one per 24h soak) is
-            // declared LOST: tallied, NOT recorded, and the loop moves on with
-            // the next seq (the late original then fails the seq match and is
-            // dropped). Without the bound, one lost frame = infinite spin =
-            // a dead 24h run. The same rare branch checks stop_requested so
-            // SIGINT always salvages the histogram collected so far.
-            std::uint32_t spins = 0;
-            while (true) {
-                if (RxFrame f = m_rx.tryReceive(); !f.data.empty()) [[unlikely]] {
-                    if (std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
-                        std::memcmp(f.data.data() + 12, expect, 6) == 0) [[likely]] {
-                        const std::uint64_t t1 = tsc::now();
-                        m_rx.release();
-                        if (!m_ch.queue.try_push(t1 - t0)) [[unlikely]] {
-                            m_ch.pushFailures.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        ++recv;
-                        break;
-                    }
-                    m_rx.release();   // stale / not-ours — drop, keep spinning
+        while (tsc::now() - start < durationCyc && !stop.stop_requested()) {
+            // Optional pacing (send_interval_us). 0 => max rate (back-to-back).
+            if (intervalNs > 0) {
+                nextSend.tv_nsec += static_cast<long>(intervalNs);
+                while (nextSend.tv_nsec >= 1'000'000'000L) {
+                    nextSend.tv_sec  += 1;
+                    nextSend.tv_nsec -= 1'000'000'000L;
                 }
-                if ((++spins & 0xFFFF) == 0) [[unlikely]] {
-                    if (spins >= kLostSpins) {
-                        ++lost;
-                        break;
-                    }
-                }
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &nextSend, nullptr);
             }
+
+            std::uint8_t* dst = m_tx.acquire(cfg.frameSize);
+            if (!dst) [[unlikely]]
+                continue;
+
+            storeU<std::uint32_t>(dst + kOffSeq, htonl(seq));   // seq, network order
+
+            const std::uint64_t t0 = tsc::now();               // send timestamp (in-band)
+            storeU<std::uint64_t>(dst + kOffTxStamp, t0);       // native order (same host)
+            m_tx.commit();
             ++seq;
         }
 
-        m_ch.done.store(true, std::memory_order_release);
-        fmt::print(stderr, "[LoopBack] sent={} recv={} lost={} push_fail={}\n",
-                   sent, recv, lost, m_ch.pushFailures.load(std::memory_order_relaxed));
+        m_sh.txDone.store(true, std::memory_order_release);
+        fmt::print(stderr, "[SingleRec/Tx] sent={}\n", seq);
     }
 
 private:
-    // Warm the TX->RX datapath before timing — kick the NIC "diesel engine". A
-    // LONG fixed burst (500k packets ~= 2.5s at ~5us/round-trip), each waited
-    // UNBOUNDED (no per-packet deadline). The length is deliberate: the clean
-    // dev_stop shutdown parks the PHY, so THIS run's dev_start brings the link up
-    // FROM PARKED -> a cold settle plus a one-time ~4.7ms link re-sync ~85ms in.
-    // A 2.5s window comfortably covers that, and the unbounded per-packet wait lets
-    // the settling round-trip complete and be ABSORBED here instead of leaking into
-    // the timed loop. Advances `seq` so timing starts past the cold packets. NOT
-    // timed, results discarded. Transport-generic (acquire/commit + tryReceive/
-    // release). Only SIGINT (stop_token) can break it.
-    [[gnu::cold]]
-    void primeDatapath(std::uint32_t& seq, std::stop_token& stop) {
-        constexpr std::uint32_t kWarmupPackets = 500'000;   // ~2.5s; covers the ~85ms re-sync
-        std::uint8_t expect[6] = {
-            static_cast<std::uint8_t>(m_cfg.etherType >> 8),
-            static_cast<std::uint8_t>(m_cfg.etherType & 0xFF), 0, 0, 0, 0 };
-        for (std::uint32_t w = 0; w < kWarmupPackets && !stop.stop_requested(); ++w, ++seq) {
-            std::uint8_t* dst = m_tx.acquire(m_cfg.frameSize);
-            if (!dst) continue;
-            const std::uint32_t seqNet = htonl(seq);
-            std::memcpy(dst + 14, &seqNet, sizeof(seqNet));
-            std::memcpy(expect + 2, &seqNet, sizeof(seqNet));
-            m_tx.commit();
-            while (true) {
-                RxFrame f = m_rx.tryReceive();
-                if (!f.data.empty()) {
-                    const bool ours =
-                        std::memcmp(f.data.data(), m_cfg.server.mac.data(), 6) == 0 &&
-                        std::memcmp(f.data.data() + 12, expect, 6) == 0;
-                    m_rx.release();
-                    if (ours) break;   // our echo -> next warmup packet
-                }
-            }
-        }
-    }
-
-    static constexpr std::uint32_t kLostSpins = 1u << 26;   // ~0.2-3s of empty polls
-
-    Tx&               m_tx;
-    Rx&               m_rx;
-    const TestConfig& m_cfg;
-    RecorderChannel&  m_ch;
-    std::uint64_t     m_durationSec;
+    Shared& m_sh;
+    Tx&     m_tx;
 };
 
-// ── Consumer: the recorder ──────────────────────────────────────────────────
-// Drains the SPSC queue into an HdrHistogram.
-class Recorder {
+// ── Rx: verify, stamp arrival, compute latency, push to the SPSC ────────────
+template<RxRing Rx>
+class RxThread {
 public:
-    Recorder(RecorderChannel& ch, std::string outputPath, std::uint64_t durationSec)
-        : m_ch(ch), m_outputPath(std::move(outputPath)), m_durationSec(durationSec) {}
+    RxThread(Shared& sh, Rx& rx) : m_sh(sh), m_rx(rx) {}
 
-    void operator()(std::stop_token /*stop*/) {
+    void run() {
+        const TestConfig& cfg = m_sh.cfg;
+
+        // Expected 14-byte header (dst MAC + src MAC + ethertype), verified IN FULL
+        // per frame via two OVERLAPPING 8-byte loads: offset 0 covers bytes 0..7,
+        // offset 6 covers bytes 6..13 — together the whole header (bytes 6..7 twice,
+        // harmless). Branchless, two GPR loads, no memcmp, no vector unit. Pad to 16
+        // so the offset-6 load reads 8 valid bytes.
+        std::array<std::uint8_t, 16> hdr = {0};
+        std::memcpy(&hdr[kOffDstMac], cfg.server.mac.data(), 6);
+        std::memcpy(&hdr[kOffSrcMac], cfg.client.mac.data(), 6);
+        hdr[kOffEtherType]     = static_cast<std::uint8_t>(cfg.etherType >> 8);
+        hdr[kOffEtherType + 1] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
+        const std::uint64_t expHdrLo = loadU<std::uint64_t>(hdr.data() + kOffDstMac);   // bytes 0..7
+        const std::uint64_t expHdrHi = loadU<std::uint64_t>(hdr.data() + kOffSrcMac);   // bytes 6..13
+
+        AntiReplay    gate;
+        std::uint64_t recorded   = 0;
+        std::uint64_t lost       = 0;
+        std::uint64_t dropped    = 0;
+        std::uint32_t graceEmpty = 0;
+
+        while (true) {
+            RxFrame f = m_rx.tryReceive();
+            if (f.data.empty()) {
+                // After Tx is done, stop once the ring has stayed empty for a
+                // bounded grace window (the last in-flight frames have arrived).
+                if (m_sh.txDone.load(std::memory_order_acquire)) {
+                    if (++graceEmpty >= kGraceEmptyPolls)
+                        break;
+                }
+                continue;
+            }
+            graceEmpty = 0;
+
+            const std::uint64_t t1 = tsc::now();           // arrival timestamp
+
+            const std::uint8_t* p = f.data.data();
+
+            // Runt guard: a stray sub-26B frame must not let the stamp load read
+            // past the buffer. Our frames are >= 64, so this is never taken.
+            if (f.data.size() < kFrameMinBytes) [[unlikely]] {
+                m_rx.release();
+                continue;
+            }
+
+            // Branchless FULL-header check (dst MAC + src MAC + ethertype) via two
+            // overlapping 8-byte loads. One OR, one test, no branch on the hot path.
+            const std::uint64_t hdrLo = loadU<std::uint64_t>(p + kOffDstMac);   // bytes 0..7
+            const std::uint64_t hdrHi = loadU<std::uint64_t>(p + kOffSrcMac);   // bytes 6..13
+            if (((hdrLo ^ expHdrLo) | (hdrHi ^ expHdrHi)) != 0) [[unlikely]] {
+                m_rx.release();                            // not ours — drop
+                continue;
+            }
+
+            const std::uint32_t seqNet = loadU<std::uint32_t>(p + kOffSeq);
+            const std::uint64_t t0     = loadU<std::uint64_t>(p + kOffTxStamp);
+            m_rx.release();                                 // done with the buffer
+
+            const std::uint32_t seq = ntohl(seqNet);
+            if (!gate.accept(seq, lost, dropped)) {
+                continue;                                   // stale / dup / reorder — not recorded
+            }
+
+            if (!m_sh.rxToHist.try_push(t1 - t0)) [[unlikely]] {
+                m_sh.pushFailures.fetch_add(1, std::memory_order_relaxed);
+            }
+            ++recorded;
+        }
+
+        // In-band end marker. The SPSC is FIFO, so Hist pops every real sample
+        // before this — spin until it fits (Hist is draining, space frees).
+        while (!m_sh.rxToHist.try_push(kEndSentinel));
+
+        fmt::print(stderr,
+                   "[SingleRec/Rx] recorded={} lost={} dropped={} push_fail={}\n",
+                   recorded, lost, dropped,
+                   m_sh.pushFailures.load(std::memory_order_relaxed));
+    }
+
+private:
+    // Empty polls after txDone before declaring the stream drained (~tens of ms).
+    static constexpr std::uint32_t kGraceEmptyPolls = 1U << 20;
+
+    Shared& m_sh;
+    Rx&     m_rx;
+};
+
+// ── Hist: drain the SPSC into an HdrHistogram, then report ───────────────────
+class HistThread {
+public:
+    HistThread(Shared& sh, std::string outputPath, std::uint64_t durationSec)
+        : m_sh(sh), m_outputPath(std::move(outputPath)), m_durationSec(durationSec) {}
+
+    void run(std::stop_token stop) {
+        const double tscHz = m_sh.tscHz;   // calibrated once by Bench, shared read-only
+
+        // Record raw TSC CYCLE deltas (not truncated ns) so the histogram keeps the
+        // full hardware resolution — 1 cycle ~= 0.4 ns at this TSC — and cycles->ns
+        // happens once per statistic at report time. Range = 1 cycle .. 60 s of
+        // cycles, 5 significant figures (HdrHistogram's max: 0.001% relative error).
         hdr_histogram* h = nullptr;
-        if (hdr_init(1, 60'000'000'000LL, 5, &h) != 0 || !h) {
-            fmt::print(stderr, "[Recorder] hdr_init failed\n");
+        const std::int64_t maxCyc = static_cast<std::int64_t>(tscHz * 60.0);
+        if (hdr_init(1, maxCyc, 5, &h) != 0 || !h) {
+            fmt::print(stderr, "[SingleRec/Hist] hdr_init failed\n");
             return;
         }
-        // tsc_hz on this thread; producer calibrated its own — both read the same
-        // invariant TSC, so the rate matches. Recalibrating here keeps the
-        // consumer self-contained for the cycles->ns conversion.
-        const double tscHz = tsc::calibrateHz();
 
-        std::uint64_t recorded = 0;
-        auto drain = [&] {
-            while (std::uint64_t* cyc = m_ch.queue.front()) {
-                const double ns = tsc::cyclesToNs(*cyc, tscHz);
-                hdr_record_value(h, static_cast<std::int64_t>(ns));
-                m_ch.queue.pop();
-                ++recorded;
-            }
-        };
-
-        m_ch.ready.store(true, std::memory_order_release);
-
+        std::uint64_t       recorded  = 0;
+        std::uint64_t       discarded = 0;
         const std::uint64_t startTsc = tsc::now();
-        const std::uint64_t hbCyc    = static_cast<std::uint64_t>(tscHz) * 600;  // 10 min
+        const std::uint64_t hbCyc    = static_cast<std::uint64_t>(tscHz) * 600;   // 10 min
         std::uint64_t       nextHb   = hbCyc;
 
-        while (!m_ch.done.load(std::memory_order_acquire)) {
-            drain();
-
-            // 10-minute heartbeat (recorder thread, off the hot path)
+        while (true) {
+            // 10-minute heartbeat (off the hot path).
             const std::uint64_t el = tsc::now() - startTsc;
             if (el >= nextHb) [[unlikely]] {
                 const double elapsedMin = static_cast<double>(el) / tscHz / 60.0;
-                const double remainMin  = m_durationSec / 60.0 - elapsedMin;
-                fmt::println(stderr, "[Recorder] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={}",
-                           elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded);
+                const double remainMin  = static_cast<double>(m_durationSec) / 60.0 - elapsedMin;
+                fmt::println(stderr,
+                    "[SingleRec/Hist] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={} discarded={}",
+                    elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded, discarded);
                 nextHb += hbCyc;
             }
+
+            std::uint64_t* cyclePtr = m_sh.rxToHist.front();
+            if (!cyclePtr) {
+                if (stop.stop_requested()) {
+                    break;                                  // SIGINT backstop
+                }
+                continue;
+            }
+            const std::uint64_t cyc = *cyclePtr;
+            m_sh.rxToHist.pop();
+            if (cyc == kEndSentinel) {
+                break;
+            }// RX signalled end-of-stream
+
+            // Drop the first kWarmupDiscard samples (NIC/link cold-start) before
+            // accumulating — they never enter the histogram or the percentiles.
+            if (discarded < kWarmupDiscard) {
+                if (++discarded == kWarmupDiscard)
+                    fmt::println(stderr, "[SingleRec/Hist] warmup complete — {} samples discarded, now recording", kWarmupDiscard);
+                continue;
+            }
+
+            hdr_record_value(h, static_cast<std::int64_t>(cyc));   // raw cycles
+            ++recorded;
         }
 
-        drain(); // when finished drain the remaining queue content
-        report(h, tscHz, recorded);
+        report(h, recorded, tscHz);
         hdr_close(h);
     }
 
 private:
-    void report(hdr_histogram* h, double /*tscHz*/, std::uint64_t recorded) {
-        auto us = [](std::int64_t ns) { return static_cast<double>(ns) / 1000.0; };
+    void report(hdr_histogram* h, std::uint64_t recorded, double tscHz) {
+        // Histogram values are TSC cycles; convert to nanoseconds for display.
+        auto ns = [tscHz](std::int64_t cyc) {
+            return tsc::cyclesToNs(static_cast<std::uint64_t>(cyc), tscHz);
+        };
 
         fmt::print("\n=== One-Way Latency Results ({} samples) ===\n", recorded);
-        fmt::print("Min:    {:.3f} us\n", us(hdr_min(h)));
-        fmt::print("Median: {:.3f} us\n", us(hdr_value_at_percentile(h, 50.0)));
-        fmt::print("P99:    {:.3f} us\n", us(hdr_value_at_percentile(h, 99.0)));
-        fmt::print("P99.9:  {:.3f} us\n", us(hdr_value_at_percentile(h, 99.9)));
-        fmt::print("P99.99: {:.3f} us\n", us(hdr_value_at_percentile(h, 99.99)));
-        fmt::print("P99.999:{:.3f} us\n", us(hdr_value_at_percentile(h, 99.999)));
-        fmt::print("Max:    {:.3f} us\n", us(hdr_max(h)));
-        fmt::print("Mean:   {:.3f} us\n", us(static_cast<std::int64_t>(hdr_mean(h))));
+        fmt::print("Min:    {:.1f} ns\n", ns(hdr_min(h)));
+        fmt::print("Median: {:.1f} ns\n", ns(hdr_value_at_percentile(h, 50.0)));
+        fmt::print("P99:    {:.1f} ns\n", ns(hdr_value_at_percentile(h, 99.0)));
+        fmt::print("P99.9:  {:.1f} ns\n", ns(hdr_value_at_percentile(h, 99.9)));
+        fmt::print("P99.99: {:.1f} ns\n", ns(hdr_value_at_percentile(h, 99.99)));
+        fmt::print("P99.999:{:.1f} ns\n", ns(hdr_value_at_percentile(h, 99.999)));
+        fmt::print("Max:    {:.1f} ns\n", ns(hdr_max(h)));
+        fmt::print("Mean:   {:.1f} ns\n", hdr_mean(h) * 1e9 / tscHz);   // double cycles -> ns
         fmt::print("-----------------------------\n");
 
-        if (m_outputPath.empty()) return;
+        if (m_outputPath.empty())
+            return;
 
-        // Dump a plottable CSV (percentile distribution) — upload to
-        // hdrhistogram.github.io/HdrHistogram/plotFiles.html or feed to gnuplot.
+        // Percentile-distribution CSV — upload to hdrhistogram.github.io plotFiles
+        // or feed to gnuplot. Dense in the TAIL. Values are cycles; scale by
+        // cycles-per-ns so the Value column comes out in nanoseconds.
         std::FILE* f = std::fopen(m_outputPath.c_str(), "w");
         if (!f) {
-            fmt::print(stderr, "[Recorder] cannot open {}: {}\n",
+            fmt::print(stderr, "[SingleRec/Hist] cannot open {}: {}\n",
                        m_outputPath, std::strerror(errno));
             return;
         }
-        // CLASSIC=hdr_percentiles_csv? The C lib exposes hdr_percentiles_print.
-        // 5 ticks/half-distance, value scale 1000.0 -> microseconds, CSV format.
-        hdr_percentiles_print(h, f, 5, 1000.0, CSV);
+        const double cyclesPerNs = tscHz / 1e9;
+        hdr_percentiles_print(h, f, 5, cyclesPerNs, CSV);   // 5 ticks/half, cycles -> ns
         std::fclose(f);
-        fmt::print("[Recorder] wrote percentile CSV to {}\n", m_outputPath);
+        fmt::print("[SingleRec/Hist] wrote percentile CSV to {}\n", m_outputPath);
 
-        // Full per-bucket histogram (value_ns,count) at the histogram's native
-        // resolution — the true frequency distribution for latency-vs-frequency
-        // plots. The percentile CSV above is dense in the TAIL (near P100); this
-        // is dense in the BODY (every recorded bucket), which the percentile
-        // export cannot reconstruct (its bottom half is only ~6 points).
+        // Full per-bucket histogram (value_ns,count) for a latency(x)-vs-frequency(y)
+        // plot — dense in the BODY, which the percentile export cannot reconstruct.
+        // Bucket values converted cycles -> ns (sub-ns resolution preserved).
         const std::string histPath = m_outputPath + ".hist.csv";
         if (std::FILE* hf = std::fopen(histPath.c_str(), "w")) {
             std::fprintf(hf, "value_ns,count\n");
             hdr_iter it;
             hdr_iter_recorded_init(&it, h);
-            while (hdr_iter_next(&it))
-                std::fprintf(hf, "%lld,%lld\n",
-                             static_cast<long long>(it.value),
+            while (hdr_iter_next(&it)) {
+                std::fprintf(hf, "%.1f,%lld\n",
+                             tsc::cyclesToNs(static_cast<std::uint64_t>(it.value), tscHz),
                              static_cast<long long>(it.count));
+            }
             std::fclose(hf);
-            fmt::print("[Recorder] wrote per-bucket histogram to {}\n", histPath);
+            fmt::print("[SingleRec/Hist] wrote per-bucket histogram to {}\n", histPath);
         }
     }
 
-    RecorderChannel& m_ch;
-    std::string      m_outputPath;
-    std::uint64_t    m_durationSec;
+    Shared&       m_sh;
+    std::string   m_outputPath;
+    std::uint64_t m_durationSec;
+};
+
+// ── Coordinator: owns the shared surface + the three threads + lifecycle ─────
+template<TxRing Tx, RxRing Rx>
+class Bench {
+public:
+    Bench(const TestConfig& cfg, Tx& tx, Rx& rx)
+        : m_sh(cfg),
+          m_tx(m_sh, tx),
+          m_rx(m_sh, rx),
+          m_hist(m_sh, cfg.outputPath, cfg.recDurationSec) {}
+
+    void run(std::uint64_t durationSec, std::stop_token stop) {
+        // Calibrate the TSC once (here, before any thread starts); both the Tx
+        // duration bound and the Hist cycles->ns conversion read this rate.
+        m_sh.tscHz = tsc::calibrateHz();
+        const std::uint64_t durCyc = static_cast<std::uint64_t>(m_sh.tscHz) * durationSec;
+
+        // Consumers up first; each thread self-pins to its isolated core (SCHED_OTHER).
+        m_tHist = std::jthread([this, stop] {
+            pinThread(m_sh.cfg.recRecorderCore);
+            m_hist.run(stop);
+        });
+        m_tRx = std::jthread([this] {
+            pinThread(m_sh.cfg.recRxCore);
+            m_rx.run();
+        });
+        m_tTx = std::jthread([this, durCyc, stop] {
+            pinThread(m_sh.cfg.recHotPathCore);
+            m_tx.run(durCyc, stop);
+        });
+
+        // Pipeline shutdown order: Tx ends (duration) -> RX drains + sentinel ->
+        // Hist pops sentinel + reports.
+        m_tTx.join();
+        m_tRx.join();
+        m_tHist.join();
+    }
+
+private:
+    Shared       m_sh;
+    TxThread<Tx> m_tx;
+    RxThread<Rx> m_rx;
+    HistThread   m_hist;
+    std::jthread m_tHist;
+    std::jthread m_tRx;
+    std::jthread m_tTx;
 };

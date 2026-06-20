@@ -132,7 +132,7 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
         // throughput. interface + queue are the only runtime params; the BPF
         // (af_xdp_kern.o) redirects everything on the queue to userspace.
         auto setup = [&](auto& xsk) -> bool {
-            if (!xsk.init()) {
+            if (!xsk.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend)) {
                 fmt::println(stderr, "Error: AF_XDP init failed on {}", role.interface);
                 return false;
             }
@@ -292,44 +292,26 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
 // ── Single-process one-way latency recorder ─────────────────────────────────
 //
 // Builds a Tx transport (on the client port) and an Rx transport (on the server
-// port) in ONE process, runs LoopBack on the calling thread (already pinned to
-// hot_path_core + SCHED_FIFO by the RuntimeSetup in main) and Recorder on a
-// second thread self-pinned to benchmark_recorder_core. One host TSC brackets
-// every packet, so there is no clock-sync problem (see SingleRecorder.hpp).
+// port) in ONE process and hands them to Bench, which runs three SCHED_OTHER
+// threads — TxThread, RxThread, HistThread — each self-pinned to its own isolated
+// core. The Tx stamps each frame with tsc::now(); the Rx stamps arrival and
+// computes one-way latency from the in-band stamp. One host's invariant TSC backs
+// both ends (cross-core, single-socket — see SingleRecorder.hpp), so there is no
+// clock-sync problem.
 //
-// Transport-generic: LoopBack/Recorder are templated on TxRing/RxRing, so this
-// helper just constructs the right Tx+Rx pair and runs them. Both ports must use
-// the same transport (client.transport == server.transport).
+// Transport-generic: Bench<Tx,Rx> is templated on TxRing/RxRing, so this helper
+// just constructs the right Tx+Rx pair and runs them. Both ports must use the
+// same transport (client.transport == server.transport).
 
 // Run the recorder once the Tx and Rx transports are constructed + init'd.
 template<TxRing Tx, RxRing Rx>
 inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg,
                                 std::stop_token stop) {
-    RecorderChannel ch(cfg.recQueueCapacity);
-
-    // Recorder on its own core. CRITICAL: it MUST be demoted to SCHED_OTHER. The
-    // jthread is spawned AFTER RuntimeSetup promoted the main thread to
-    // SCHED_FIFO:49, so it INHERITS FIFO:49. If left at FIFO:49 on a core that
-    // also handles the RX NIC IRQ, it starves ksoftirqd there — which silently
-    // kills packet_mmap RX (the kernel softirq can never fill the mmap ring, so
-    // tryReceive() spins forever: observed sent=1 recv=0). AF_XDP busy-polls RX
-    // inline so it survived this, but the kernel-softirq transports do not.
-    // Setting affinity alone does NOT change policy — demote explicitly.
-    std::jthread recThread([&](std::stop_token st) {
-        sched_param sp{};                       // priority 0
-        pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cfg.recRecorderCore, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-        Recorder rec(ch, cfg.outputPath, cfg.recDurationSec);
-        rec(st);
-    });
-
-    // Hot path on THIS thread (already pinned to hot_path_core + SCHED_FIFO).
-    LoopBack<Tx, Rx> hot(tx, rx, cfg, ch, cfg.recDurationSec);
-    hot(stop);
-    // hot() set ch.done; recThread drains + reports, then joins at scope exit.
+    // Bench owns the shared SPSC + the three SCHED_OTHER threads (Tx/Rx/Hist),
+    // each self-pinned to its own isolated core. run() blocks until the soak
+    // completes (Tx duration -> RX drains + sentinel -> Hist reports).
+    Bench<Tx, Rx> bench(cfg, tx, rx);
+    bench.run(cfg.recDurationSec, stop);
 }
 
 [[nodiscard]]
@@ -343,9 +325,20 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
         return 1;
     }
 
-    fmt::println("[SingleRecorder] {} | Tx={} (hot core {}) Rx={} (rec core {}) duration={}s",
+    if (cfg.recHotPathCore == cfg.recRxCore ||
+        cfg.recHotPathCore == cfg.recRecorderCore ||
+        cfg.recRxCore == cfg.recRecorderCore) {
+        fmt::println(stderr, "Error: single_recorder needs three DISTINCT cores "
+                             "(tx={} rx={} recorder={})",
+                     cfg.recHotPathCore, cfg.recRxCore, cfg.recRecorderCore);
+        return 1;
+    }
+
+    fmt::println("[SingleRecorder] {} | Tx={} (core {}) Rx={} (core {}) Hist core {} "
+                 "duration={}s",
                  transport, cfg.client.interface, cfg.recHotPathCore,
-                 cfg.server.interface, cfg.recRecorderCore, cfg.recDurationSec);
+                 cfg.server.interface, cfg.recRxCore, cfg.recRecorderCore,
+                 cfg.recDurationSec);
 
     if (transport == "packet_mmap") {
         RingConfig txc{};
@@ -371,8 +364,11 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
 
         AFXDP<AFXDPMode::TxOnly, 2048, 2048, 4096, false> tx(cfg.client.interface.c_str(), cfg.client.xdpQueueId);
         AFXDP<AFXDPMode::RxOnly> rx(cfg.server.interface.c_str(), cfg.server.xdpQueueId);
-        if (!tx.init()) { fmt::println(stderr, "Error: Tx AF_XDP init failed on {}", cfg.client.interface); return 1; }
-        if (!rx.init()) { fmt::println(stderr, "Error: Rx AF_XDP init failed on {}", cfg.server.interface); return 1; }
+        // NAPI regime from [af_xdp] (enable_deferral / enable_irq_suspend); default
+        // both-off = defer=0/gro=0 (re-arms inline, no busy-poll gap needed — the
+        // low-latency regime). Orthogonal to the SCHED_OTHER thread policy.
+        if (!tx.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend)) { fmt::println(stderr, "Error: Tx AF_XDP init failed on {}", cfg.client.interface); return 1; }
+        if (!rx.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend)) { fmt::println(stderr, "Error: Rx AF_XDP init failed on {}", cfg.server.interface); return 1; }
         if (cfg.nicTunerMode != NicTunerMode::Off) {
             NicTuner::setCoalescingZero(cfg.client.interface.c_str());
             NicTuner::setCoalescingZero(cfg.server.interface.c_str());

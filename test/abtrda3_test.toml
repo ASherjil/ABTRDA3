@@ -1,70 +1,79 @@
-# ABTRDA3 Ping-Pong Test Configuration
+# ABTRDA3 Test Configuration — rtserver (single-host benchmark bench)
 #
-# Server and client each pick their own transport so a fast x86 box
-# (intel_i210) can drive an ARM64 SoC (cadence_gem) and vice-versa.
+# One file drives every mode:
+#   sudo ./abtrda3_test --server  [--config ...]           # RTT reflector   (uses [server])
+#   sudo ./abtrda3_test --client  [--count N] [--config ...] # RTT originator (uses [client])
+#   sudo ./abtrda3_test --txgen   [--count N] [--config ...] # one-way Tx flood (uses [client])
+#   sudo ./abtrda3_test --rxsink  [--config ...]            # one-way Rx sink  (uses [server])
+#   sudo ./abtrda3_test --single  [--config ...]            # single-process one-way latency
 #
-# Valid transports: "packet_mmap" | "af_xdp" | "intel_i210" | "cadence_gem"
+# --single (SingleRecorder): Tx = [client] port, Rx = [server] port, both on THIS
+# host and directly cabled to each other. Three SCHED_OTHER threads pinned to the
+# [single_recorder] cores (Tx/Rx/Hist). client.transport MUST equal server.transport.
+#
+# Valid transports: "packet_mmap" | "af_xdp" | "dpdk" | "verbs"
 
 [general]
 watchdog_sec     = 30
 ether_type       = 0x88B5
-frame_size       = 64
-nic_tuner        = "nfs_safe"        # "off" | "nfs_safe" (NFS boot) | "full" (dedicated LAN)
-send_interval_us = 0                # 0 = back-to-back, 1000 = 1ms (WR-like)
-output           = ""
+frame_size       = 64                 # MUST be >= 26 (14B eth hdr + 4B seq + 8B TSC stamp)
+nic_tuner        = "off"              # "off" | "nfs_safe" | "full" (dedicated LAN)
+send_interval_us = 0                  # 0 = saturate; >0 = paced (1000 = 1ms, WR-like)
+output           = "single_latency.csv"  # SingleRecorder writes <output> + <output>.hist.csv ("" disables)
 
+# ── Tx port (also RTT --client / --txgen) ───────────────────────────────────
+[client]
+transport    = "af_xdp"
+interface    = "xxv0"                 # XXV710 port 0, i40e, PCI 02:00.0
+driver       = ""                     # DPDK only: kernel driver to unbind for vfio (i40e/igc); "" otherwise
+mac          = "40:a6:b7:02:b3:10"
+cpu_core     = 3                      # RTT-mode hot core (--single uses [single_recorder] cores)
+xdp_queue_id = 0
+count        = 1000                   # --client / --txgen default (overridable with --count)
+
+# ── Rx port (also RTT --server / --rxsink) ──────────────────────────────────
 [server]
-transport    = "af_xdp"          # runs on cfc-865-mkdev16 (x86_64)
-interface    = "enp1s0f1np1"
-driver       = ""                 # kernel driver to unbind for the PMD
+transport    = "af_xdp"
+interface    = "xxv1"                 # XXV710 port 1, i40e, PCI 02:00.1
+driver       = ""
 mac          = "40:a6:b7:02:b3:11"
 cpu_core     = 2
 xdp_queue_id = 0
 
-[client]
-transport    = "af_xdp"         # runs on cfd-865-mkdev50 (aarch64 Zynq UltraScale+)
-interface    = "enp1s0f0np0"
-driver       = ""
-mac          = "40:a6:b7:02:b3:10"
-cpu_core     = 3
-xdp_queue_id = 0
-count        = 1000             # overridable with --count
+# ── SingleRecorder (--single) ───────────────────────────────────────────────
+# Three DISTINCT isolated cores (rtserver: isolcpus=2-4). Run is time-bounded:
+# duration_sec = 60 for a smoke test, 86400 for a 24 h soak. The first 500k samples
+# are discarded as warmup (fixed in code), so add a little margin to duration_sec
+# (e.g. 310 for ~5 min of recorded data).
+[single_recorder]
+hot_path_core           = 2           # Tx thread
+rx_core                 = 3           # Rx thread   (must differ from tx + recorder)
+benchmark_recorder_core = 4           # Hist thread
+duration_sec            = 60
+queue_capacity          = 1048576     # SPSC cycle-delta slots
+
+# ── AF_XDP NAPI regime ──────────────────────────────────────────────────────
+# ENABLE toggles only — the VALUES (defer_hard_irqs=2, gro_flush_timeout=200000ns,
+# irq_suspend_timeout=20ms) are fixed in AFXDP.hpp. Both false => deferral OFF
+# (re-arm inline, no busy-poll gap needed) = the low-latency default.
+#   enable_irq_suspend implies deferral on (kernel 6.13+; needs defer+gro nonzero).
+# (umem frame size / count / need_wakeup are compile-time template params on AFXDP<>.)
+[af_xdp]
+enable_deferral    = false
+enable_irq_suspend = false
 
 [packet_mmap]
 block_size   = 4096
 block_number = 512
 
-[af_xdp]
-umem_frame_size = 2048
-frame_count     = 4096
-need_wakeup     = true
-
-
-# ── MAC reference ─────────────────────────────────────────────────────────
-# mkdev16: eno1=20:87:56:b6:6a:27  eno2=20:87:56:b6:33:67  eno3=20:87:56:b6:33:68
-# mkdev30: eno1=d4:f5:27:2a:69:f1  eno2=d4:f5:27:2a:a9:59  eno3=d4:f5:27:2a:a9:58
-# mkdev50: end0=fc:0f:e7:1b:8b:55
+# ── Other NIC pairs on rtserver (swap [client]/[server] interface+mac+driver) ─
+# XXV710  (i40e, 25G SFP28):  xxv0 40:a6:b7:02:b3:10  <->  xxv1 40:a6:b7:02:b3:11   PCI 02:00.0/.1
+# ConnectX-4 Lx (mlx5, 25G):  cx0  b8:83:03:9c:d4:5c  <->  cx1  b8:83:03:9c:d4:5d   PCI 01:00.0/.1
+# I225-V  (igc, 2.5G RJ45):   enp6s0 f0:2f:74:b1:41:96 <-> enp7s0 f0:2f:74:b1:41:97 PCI 06:00.0 / 07:00.0
 #
-# ── Running ────────────────────────────────────────────────────────────────
-# sudo ./abtrda3_test --server [--config ...]
-# sudo ./abtrda3_test --client [--count N] [--config ...]
-# sudo ./abtrda3_test --txgen  [--count N] [--config ...]
-# sudo ./abtrda3_test --rxsink [--config ...]
-# ./profile_hotpath.sh --no-perf
-
-#1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
-#link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-#2: enp6s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
-#link/ether f0:2f:74:b1:41:96 brd ff:ff:ff:ff:ff:ff
-#altname enxf02f74b14196
-#3: enp7s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
-#link/ether f0:2f:74:b1:41:97 brd ff:ff:ff:ff:ff:ff
-#altname enxf02f74b14197
-#4: enp1s0f0np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
-#link/ether 40:a6:b7:02:b3:10 brd ff:ff:ff:ff:ff:ff
-#altname enx40a6b702b310
-#5: enp1s0f1np1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
-#link/ether 40:a6:b7:02:b3:11 brd ff:ff:ff:ff:ff:ff
-#altname enx40a6b702b311
-
-
+# Transport notes:
+#   af_xdp  — Intel (i40e/igc) + mlx5. i40e busy-poll needs the patched driver.
+#   dpdk    — set driver = "i40e" | "igc" (vfio unbind) | "mlx5_core" (bifurcated, no vfio).
+#   verbs   — mlx5 only (cx0/cx1); Intel NICs have no verbs provider.
+#
+# Cores: rtserver isolcpus=2-4, nohz_full=2-4, rcu_nocbs=2-4, irqaffinity=0,1.

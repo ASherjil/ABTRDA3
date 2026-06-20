@@ -38,9 +38,12 @@ struct TestConfig {
     std::uint32_t mmapBlockSize   = 4096;
     std::uint32_t mmapBlockNumber = 512;
 
-    // NOTE: AF_XDP frame size / frame count / need_wakeup are COMPILE-TIME template
-    // params on AFXDP<> (FrameSize, NumRxFrames/NumTxFrames, NeedWakeup), NOT runtime
-    // config — so there is deliberately no [af_xdp] TOML section to read here.
+    // AF_XDP frame size / frame count / need_wakeup are COMPILE-TIME template params
+    // on AFXDP<> (FrameSize, NumRxFrames/NumTxFrames, NeedWakeup), NOT runtime config.
+    // The only AF_XDP runtime knobs are the NAPI-regime ENABLE toggles below; their
+    // VALUES (defer=2, gro=200000ns, irq-suspend=20ms) stay fixed in AFXDP.hpp.
+    bool          afxdpEnableDeferral   = false;   // [af_xdp] enable_deferral
+    bool          afxdpEnableIrqSuspend = false;   // [af_xdp] enable_irq_suspend
 
     // [single_recorder] — single-process one-way Tx->Rx latency benchmark.
     // hotPathCore runs the timed loop; recorderCore drains the SPSC queue into
@@ -48,8 +51,9 @@ struct TestConfig {
     // durationSec bounds the run (time-based, not sample-count) — e.g. 60 for a
     // smoke test, 86400 for a 24 h determinism soak. Output CSV path = general
     // `output`. Tx reuses [client], Rx reuses [server].
-    int           recHotPathCore  = 2;
-    int           recRecorderCore = 4;
+    int           recHotPathCore  = 2;           // Tx thread
+    int           recRxCore       = 3;           // Rx thread (distinct isolated core)
+    int           recRecorderCore = 4;           // Hist thread
     std::uint64_t recDurationSec  = 60;
     std::size_t   recQueueCapacity = 1u << 20;   // 1,048,576 cycle-delta slots
 };
@@ -102,10 +106,13 @@ inline TestConfig loadConfig(const char* path) {
     cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096));
     cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));
 
-    // [af_xdp] frame size/count/need_wakeup are compile-time template params on
-    // AFXDP<> — intentionally NOT read from TOML (see struct note above).
+    // [af_xdp] — only the NAPI-regime enable toggles are runtime; frame size/count/
+    // need_wakeup are compile-time template params on AFXDP<> (see struct note).
+    cfg.afxdpEnableDeferral   = tbl["af_xdp"]["enable_deferral"].value_or(false);
+    cfg.afxdpEnableIrqSuspend = tbl["af_xdp"]["enable_irq_suspend"].value_or(false);
 
     cfg.recHotPathCore   = tbl["single_recorder"]["hot_path_core"].value_or(2);
+    cfg.recRxCore        = tbl["single_recorder"]["rx_core"].value_or(3);
     cfg.recRecorderCore  = tbl["single_recorder"]["benchmark_recorder_core"].value_or(4);
     cfg.recDurationSec   = static_cast<std::uint64_t>(tbl["single_recorder"]["duration_sec"].value_or(60));
     cfg.recQueueCapacity = static_cast<std::size_t>(tbl["single_recorder"]["queue_capacity"].value_or(1u << 20));
