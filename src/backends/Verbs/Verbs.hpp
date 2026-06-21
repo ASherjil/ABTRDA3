@@ -123,7 +123,7 @@
 
 enum class VerbsMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
-template<VerbsMode M, std::uint8_t PortNum = 1, std::uint16_t SqDepth = 256, std::uint16_t RqDepth = 256, std::uint16_t SignalEvery = 64, std::uint16_t MaxInline = 128, std::uint16_t MaxFrame = 2048>
+template<VerbsMode M, std::uint8_t PortNum = 1, std::uint16_t SqDepth = 256, std::uint16_t RqDepth = 8192, std::uint16_t SignalEvery = 64, std::uint16_t MaxInline = 128, std::uint16_t MaxFrame = 2048>
 class Verbs {
   static constexpr bool HAS_RX = (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
   static constexpr bool HAS_TX = (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);

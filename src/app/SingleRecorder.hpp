@@ -48,6 +48,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -66,10 +67,11 @@
 // impossible (~years), so this value can never collide with a sample.
 inline constexpr std::uint64_t kEndSentinel = ~0ULL;
 
-// Samples dropped at the START of recording (NIC/link cold-start) before the
-// HdrHistogram accumulates — they never skew the percentiles. Each dropped sample
-// is one fewer measured, so the effective window is slightly shorter than
-// duration_sec; add a little margin (e.g. 310s for ~5 min of recorded data).
+// Frames discarded at the START by RxThread (NIC/link cold-start, before the Rx is
+// at speed) — never pushed to the histogram, so they never skew the percentiles. At
+// the boundary RxThread prints the warmup-window stats and RESETS the loss counters
+// so the final report covers only the steady-state window. Each discarded frame is
+// one fewer measured — add a little margin to duration_sec (e.g. 310s for ~5 min).
 inline constexpr std::uint64_t kWarmupDiscard = 500'000;
 
 // ── Frame payload layout ─────────────────────────────────────────────────────
@@ -267,7 +269,7 @@ public:
 
             const std::uint64_t t1 = tsc::now();           // arrival timestamp
 
-            const std::uint8_t* p = f.data.data();
+            const std::uint8_t* packet = f.data.data();
 
             // Runt guard: a stray sub-26B frame must not let the stamp load read
             // past the buffer. Our frames are >= 64, so this is never taken.
@@ -278,20 +280,24 @@ public:
 
             // Branchless FULL-header check (dst MAC + src MAC + ethertype) via two
             // overlapping 8-byte loads. One OR, one test, no branch on the hot path.
-            const std::uint64_t hdrLo = loadU<std::uint64_t>(p + kOffDstMac);   // bytes 0..7
-            const std::uint64_t hdrHi = loadU<std::uint64_t>(p + kOffSrcMac);   // bytes 6..13
+            const std::uint64_t hdrLo = loadU<std::uint64_t>(packet + kOffDstMac);   // bytes 0..7
+            const std::uint64_t hdrHi = loadU<std::uint64_t>(packet + kOffSrcMac);   // bytes 6..13
             if (((hdrLo ^ expHdrLo) | (hdrHi ^ expHdrHi)) != 0) [[unlikely]] {
                 m_rx.release();                            // not ours — drop
                 continue;
             }
 
-            const std::uint32_t seqNet = loadU<std::uint32_t>(p + kOffSeq);
-            const std::uint64_t t0     = loadU<std::uint64_t>(p + kOffTxStamp);
+            const std::uint32_t seqNet = loadU<std::uint32_t>(packet + kOffSeq);
+            const std::uint64_t t0     = loadU<std::uint64_t>(packet + kOffTxStamp);
             m_rx.release();                                 // done with the buffer
 
             const std::uint32_t seq = ntohl(seqNet);
             if (!gate.accept(seq, lost, dropped)) {
                 continue;                                   // stale / dup / reorder — not recorded
+            }
+
+            if (inWarmup(lost, dropped)) {
+                continue;
             }
 
             if (!m_sh.rxToHist.try_push(t1 - t0)) [[unlikely]] {
@@ -311,11 +317,29 @@ public:
     }
 
 private:
+    [[gnu::always_inline, gnu::hot]]
+    inline bool inWarmup(std::uint64_t& lost, std::uint64_t& dropped) noexcept {
+        if (m_warmupSeen >= kWarmupDiscard) {
+            return false;
+        }
+        if (++m_warmupSeen == kWarmupDiscard) {
+            fmt::print(stderr,
+                "[SingleRec/Rx] warmup done — recorded={} lost={} dropped={} push_fail={} (counters reset)\n",
+                m_warmupSeen, lost, dropped,
+                m_sh.pushFailures.load(std::memory_order_relaxed));
+            lost    = 0;
+            dropped = 0;
+            m_sh.pushFailures.store(0, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     // Empty polls after txDone before declaring the stream drained (~tens of ms).
     static constexpr std::uint32_t kGraceEmptyPolls = 1U << 20;
 
-    Shared& m_sh;
-    Rx&     m_rx;
+    Shared&       m_sh;
+    Rx&           m_rx;
+    std::uint64_t m_warmupSeen = 0;   // accepted frames seen during warmup (caps at kWarmupDiscard)
 };
 
 // ── Hist: drain the SPSC into an HdrHistogram, then report ───────────────────
@@ -339,7 +363,6 @@ public:
         }
 
         std::uint64_t       recorded  = 0;
-        std::uint64_t       discarded = 0;
         const std::uint64_t startTsc = tsc::now();
         const std::uint64_t hbCyc    = static_cast<std::uint64_t>(tscHz) * 600;   // 10 min
         std::uint64_t       nextHb   = hbCyc;
@@ -351,8 +374,8 @@ public:
                 const double elapsedMin = static_cast<double>(el) / tscHz / 60.0;
                 const double remainMin  = static_cast<double>(m_durationSec) / 60.0 - elapsedMin;
                 fmt::println(stderr,
-                    "[SingleRec/Hist] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={} discarded={}",
-                    elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded, discarded);
+                    "[SingleRec/Hist] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={}",
+                    elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded);
                 nextHb += hbCyc;
             }
 
@@ -366,17 +389,11 @@ public:
             const std::uint64_t cyc = *cyclePtr;
             m_sh.rxToHist.pop();
             if (cyc == kEndSentinel) {
-                break;
-            }// RX signalled end-of-stream
-
-            // Drop the first kWarmupDiscard samples (NIC/link cold-start) before
-            // accumulating — they never enter the histogram or the percentiles.
-            if (discarded < kWarmupDiscard) {
-                if (++discarded == kWarmupDiscard)
-                    fmt::println(stderr, "[SingleRec/Hist] warmup complete — {} samples discarded, now recording", kWarmupDiscard);
-                continue;
+                break;                                      // RX signalled end-of-stream
             }
 
+            // Warmup discard lives in RxThread (it skips pushing the cold-start
+            // frames), so every sample delivered here is already steady-state.
             hdr_record_value(h, static_cast<std::int64_t>(cyc));   // raw cycles
             ++recorded;
         }
