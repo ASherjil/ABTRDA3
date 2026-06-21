@@ -535,6 +535,31 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::waitLi
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::shutdown() noexcept {
   if (!m_started) return;
+
+  // DIAGNOSTIC: dump the NIC's OWN packet counters before teardown. This is the
+  // wire truth, independent of our hot-path bookkeeping — the discriminator for the
+  // "recorded >> sent" DPDK bug: compare TX opackets vs RX ipackets vs the app's
+  // recorded. ipackets ~= recorded (>> sent) => wire/PMD genuinely duplicates;
+  // ipackets ~= sent but recorded >> sent => our tryReceive/release re-reads buffers.
+  // imissed = RX-ring overrun (no descriptor); rx_nombuf = mempool exhausted.
+  {
+    rte_eth_stats st{};
+    if (rte_eth_stats_get(m_port, &st) == 0) {
+      std::fprintf(stderr,
+          "[DPDK] %s STATS: opackets=%llu ipackets=%llu obytes=%llu ibytes=%llu "
+          "imissed=%llu ierrors=%llu oerrors=%llu rx_nombuf=%llu\n",
+          m_ifname.c_str(),
+          static_cast<unsigned long long>(st.opackets),
+          static_cast<unsigned long long>(st.ipackets),
+          static_cast<unsigned long long>(st.obytes),
+          static_cast<unsigned long long>(st.ibytes),
+          static_cast<unsigned long long>(st.imissed),
+          static_cast<unsigned long long>(st.ierrors),
+          static_cast<unsigned long long>(st.oerrors),
+          static_cast<unsigned long long>(st.rx_nombuf));
+    }
+  }
+
   if (m_pendingRx) {
     rte_pktmbuf_free(m_pendingRx);
     m_pendingRx = nullptr;
@@ -613,8 +638,16 @@ inline std::uint8_t* DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, M
 
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::commit() noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
-  if (rte_eth_tx_burst(m_port, QueueId, &m_pendingTx, 1) == 0) [[unlikely]]
-    rte_pktmbuf_free(m_pendingTx);
+  // BACKPRESSURE (mirrors AF_XDP's `while (reserve != 1) completeTx()` and the
+  // verbs SQ): retry until the frame is truly queued — NEVER drop. The PMD reaps
+  // TX completions inside rte_eth_tx_burst, so spinning here frees ring slots.
+  // The old drop-on-full advanced the caller's seq for frames that never egressed,
+  // so the pipelined Tx (flat-out, decoupled from Rx) overran the TX ring and the
+  // receiver saw ~64% of sends as false "loss". Unbounded like AF_XDP; the Tx
+  // duration bound stops the run, and a live link always drains the ring.
+  while (rte_eth_tx_burst(m_port, QueueId, &m_pendingTx, 1) == 0) [[unlikely]] {
+    // ring full — spin; completions drain inside the next tx_burst
+  }
   m_pendingTx = nullptr;
 }
 
