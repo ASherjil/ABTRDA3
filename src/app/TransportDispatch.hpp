@@ -53,7 +53,7 @@ void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
                   std::uint32_t count, std::stop_token stop) {
     switch (mode) {
         case RunMode::Server: run_server(tx, rx, cfg, stop);           break;
-        case RunMode::Client: run_client(tx, rx, cfg, count, stop);    break;
+        case RunMode::Client: run_client(tx, rx, cfg, stop);           break;
         case RunMode::TxGen:  run_txgen(tx, cfg, count, stop);         break;
         case RunMode::RxSink: run_rxsink(rx, cfg, stop);               break;
     }
@@ -62,8 +62,8 @@ void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
 // ── Spawn a low-priority thread that runs a TapBridge ──────────────────────
 //
 // The bridge itself MUST outlive the returned jthread, so the caller owns it.
-// This helper just handles the thread attributes (demote from SCHED_FIFO,
-// clear inherited CPU affinity) and spawns the jthread.
+// This helper just handles the thread attributes (set SCHED_OTHER, clear
+// inherited CPU affinity) and spawns the jthread.
 template<TxRing Tx, RxRing Rx>
 [[nodiscard]]
 std::jthread spawnTapDeviceThread(TapBridge<Tx, Rx>& tap) {
@@ -78,11 +78,11 @@ std::jthread spawnTapDeviceThread(TapBridge<Tx, Rx>& tap) {
 
         tap(st);
     });
-    // The child inherits our SCHED_FIFO + CPU-1 pin from the runtime setup
-    // and is non-preemptible at equal priority until it runs the
+    // The child inherits our pinned-core affinity from the runtime setup and
+    // competes with the hot loop on that one core until it runs the
     // sched_setscheduler/sched_setaffinity prologue above.  Yield long
     // enough for it to execute that prologue and migrate to another core,
-    // otherwise it never gets CPU during the hot test loop and Q0 fills up
+    // otherwise it gets little CPU during the hot test loop and Q0 fills up
     // un-drained.  Same trick used in startRxWatcher() during development.
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     return t;
@@ -171,7 +171,7 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
             }
             case RunMode::Server:
             case RunMode::Client: {
-                AFXDP<AFXDPMode::RxTx> xsk(role.interface.c_str(), role.xdpQueueId);
+                AFXDP<AFXDPMode::RxTx, 2048, 2048, 4096, false> xsk(role.interface.c_str(), role.xdpQueueId);
                 if (!setup(xsk)) return 1;
                 dispatchMode(xsk, xsk, mode, cfg, count, stop);
                 return 0;

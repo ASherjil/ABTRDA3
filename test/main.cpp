@@ -11,7 +11,7 @@
 //
 // Usage:
 //   sudo ./abtrda3_test --server [--config <file>]
-//   sudo ./abtrda3_test --client [--count N] [--config <file>]
+//   sudo ./abtrda3_test --client [--config <file>]          (RTT; time-bounded via duration_sec)
 //   sudo ./abtrda3_test --txgen  [--count N] [--config <file>]
 //   sudo ./abtrda3_test --rxsink [--config <file>]
 
@@ -62,7 +62,7 @@ struct CliArgs {
 void printUsage(const char* argv0) {
     fmt::println("Usage:\n"
                  "  {0} --server  [--config <file>]\n"
-                 "  {0} --client  [--count <N>] [--config <file>]\n"
+                 "  {0} --client  [--config <file>]   (RTT; time-bounded via [client].duration_sec)\n"
                  "  {0} --txgen   [--count <N>] [--config <file>]\n"
                  "  {0} --rxsink  [--config <file>]\n"
                  "  {0} --single  [--config <file>]   (single-process one-way Tx->Rx latency)",
@@ -93,7 +93,7 @@ int main(int argc, char* argv[]) {
 
     // ── Single-process one-way recorder: needs BOTH ports + its own core layout.
     // Tx=client port, Rx=server port; the hot path runs on recHotPathCore (pinned
-    // + SCHED_FIFO here), the recorder self-pins to recRecorderCore inside the
+    // + SCHED_OTHER here), the recorder self-pins to recRecorderCore inside the
     // dispatch. NicTuner is applied to both ports inside runSingleRecorder.
     if (args.runMode == RunMode::SingleRecorder) {
         fmt::println("[Config] Loaded from {} — mode=SingleRecorder tx={} rx={}",
@@ -128,7 +128,7 @@ int main(int argc, char* argv[]) {
         fmt::println(stderr, "[NicTuner] Off");
     }
 
-    // RT setup (watchdog, CPU pin, SCHED_FIFO, mlockall, signal handler)
+    // RT setup (watchdog, CPU pin, SCHED_OTHER, mlockall, signal handler)
     RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(args.runMode));
 
     return runTransport(cfg, role, args.runMode, count, rt.stopToken());

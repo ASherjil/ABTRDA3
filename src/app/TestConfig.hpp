@@ -33,7 +33,14 @@ struct TestConfig {
     RoleConfig    server;
     RoleConfig    client;
 
-    std::uint32_t clientCount = 10;
+    std::uint32_t clientCount = 10;            // --txgen burst length (--client is time-based)
+
+    // [client] RTT (--client) — now DURATION-bounded like --single, not count.
+    // The hot ping-pong loop runs on [client].cpu_core; a histogram thread on
+    // recorder_core (must DIFFER from cpu_core) drains RTT samples into an
+    // HdrHistogram, so a 24 h soak needs no unbounded std::vector.
+    std::uint64_t clientDurationSec  = 60;
+    int           clientRecorderCore = 4;
 
     std::uint32_t mmapBlockSize   = 4096;
     std::uint32_t mmapBlockNumber = 512;
@@ -101,7 +108,9 @@ inline TestConfig loadConfig(const char* path) {
     cfg.server = loadRole(tbl, "server");
     cfg.client = loadRole(tbl, "client");
 
-    cfg.clientCount = static_cast<std::uint32_t>(tbl["client"]["count"].value_or(10));
+    cfg.clientCount        = static_cast<std::uint32_t>(tbl["client"]["count"].value_or(10));
+    cfg.clientDurationSec  = static_cast<std::uint64_t>(tbl["client"]["duration_sec"].value_or(60));
+    cfg.clientRecorderCore = tbl["client"]["recorder_core"].value_or(4);
 
     cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096));
     cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));

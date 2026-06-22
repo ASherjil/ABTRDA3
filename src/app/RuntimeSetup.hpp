@@ -15,13 +15,17 @@
 #include <thread>
 
 // =============================================================================
-// RuntimeSetup — RT environment for the hot path
+// RuntimeSetup — runtime environment for the hot path
 //
-// Handles: mlockall, signal handler, watchdog, CPU pinning, SCHED_FIFO.
-// Construct AFTER NicTuner (so watchdog inherits SCHED_OTHER, not FIFO).
+// Handles: mlockall, signal handler, watchdog, CPU pinning. The hot thread runs
+// SCHED_OTHER (busy-poll on its isolated core), NOT SCHED_FIFO: on a dedicated
+// isolated core a single polling thread already runs ~100% under SCHED_OTHER,
+// while real-time priority risks starving per-CPU kernel threads (vmstat,
+// ksoftirqd) into a lockup and incurs the kernel's 95% RT-throttle (per
+// low-latency tuning guidance). Construct AFTER NicTuner.
 //
-// Each step prints a diagnostic line BEFORE and AFTER it runs so that if
-// something hangs, the last printed line tells us exactly where.
+// The early steps print a diagnostic line before/after so that if init hangs
+// (e.g. mlockall over NFS, PMD bring-up), the last printed line localises it.
 // =============================================================================
 
 class RuntimeSetup {
@@ -29,53 +33,47 @@ public:
     RuntimeSetup(int cpuCore, int watchdogSec, const char* roleName) {
         // Step 1 — mlockall (can hang on NFS-rooted systems if pages need
         // to be faulted over the network).
-        fmt::println(stderr, "[RT] step 1/6 mlockall(MCL_CURRENT | MCL_FUTURE)…");
+        fmt::println(stderr, "[RT] step 1/5 mlockall(MCL_CURRENT | MCL_FUTURE)…");
         if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-            fmt::println(stderr, "[RT] step 1/6 mlockall FAILED: {}", std::strerror(errno));
+            fmt::println(stderr, "[RT] step 1/5 mlockall FAILED: {}", std::strerror(errno));
         else
-            fmt::println(stderr, "[RT] step 1/6 mlockall OK");
+            fmt::println(stderr, "[RT] step 1/5 mlockall OK");
 
         // Step 2 — signal handler (SIGINT → cooperative stop).
-        fmt::println(stderr, "[RT] step 2/6 install SIGINT handler…");
+        fmt::println(stderr, "[RT] step 2/5 install SIGINT handler…");
         std::signal(SIGINT, [](int) { s_stop.request_stop(); });
-        fmt::println(stderr, "[RT] step 2/6 SIGINT handler OK");
+        fmt::println(stderr, "[RT] step 2/5 SIGINT handler OK");
 
-        // Step 3 — watchdog thread. Spawned BEFORE SCHED_FIFO so it inherits
-        // SCHED_OTHER and will be scheduled on core 0. watchdogSec <= 0 DISABLES
-        // it (used by --single, whose hot loop self-terminates on duration and
-        // must not be cut short by a watchdog).
+        // Step 3 — watchdog thread. It pins itself to core 0 at SCHED_OTHER.
+        // watchdogSec <= 0 DISABLES it (used by --single, whose hot loop
+        // self-terminates on duration and must not be cut short by a watchdog).
         if (watchdogSec > 0) {
             fmt::println(stderr, "[{}] Watchdog: auto-shutdown in {} seconds", roleName, watchdogSec);
-            fmt::println(stderr, "[RT] step 3/6 spawning watchdog thread…");
+            fmt::println(stderr, "[RT] step 3/5 spawning watchdog thread…");
             spawnWatchdog(watchdogSec);
-            fmt::println(stderr, "[RT] step 3/6 watchdog thread detached OK");
+            fmt::println(stderr, "[RT] step 3/5 watchdog thread detached OK");
         } else {
             fmt::println(stderr, "[{}] Watchdog: DISABLED (run self-terminates)", roleName);
         }
 
         // Step 4 — yield briefly so watchdog actually runs and settles on core 0
-        // before we hog core cpuCore with SCHED_FIFO.
-        fmt::println(stderr, "[RT] step 4/6 yielding 10 ms…");
+        // before we busy-poll core cpuCore (SCHED_OTHER).
+        fmt::println(stderr, "[RT] step 4/5 yielding 10 ms…");
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        fmt::println(stderr, "[RT] step 4/6 yield OK");
+        fmt::println(stderr, "[RT] step 4/5 yield OK");
 
-        // ABTRDA3_RT_BYPASS: skip CPU pin + SCHED_FIFO if set.
+        // ABTRDA3_RT_BYPASS: skip CPU pinning if set.
         // Use to isolate whether a hang is in RT tuning or in the PMD itself.
         if (std::getenv("ABTRDA3_RT_BYPASS")) {
-            fmt::println(stderr, "[RT] ABTRDA3_RT_BYPASS set — skipping CPU pin and SCHED_FIFO");
+            fmt::println(stderr, "[RT] ABTRDA3_RT_BYPASS set — skipping CPU pin");
             return;
         }
 
-        // Step 5 — pin main thread to the hot-path core.
-        fmt::println(stderr, "[RT] step 5/6 pinning to core {}…", cpuCore);
+        // Step 5 — pin the main thread to its isolated hot-path core and run
+        // SCHED_OTHER (busy-poll). No SCHED_FIFO — see the class comment.
+        fmt::println(stderr, "[RT] step 5/5 pinning to core {} (SCHED_OTHER)…", cpuCore);
         pinToCore(cpuCore);
-        fmt::println(stderr, "[RT] step 5/6 pin OK");
-
-        // Step 6 — promote to SCHED_FIFO. After this, any CPU hog bug on this
-        // core will starve SSH / ksoftirqd / networking on the same core.
-        fmt::println(stderr, "[RT] step 6/6 SCHED_FIFO prio 49…");
-        setFifo(49);
-        fmt::println(stderr, "[RT] step 6/6 SCHED_FIFO OK — RuntimeSetup complete");
+        setSchedOther();
     }
 
     [[nodiscard]] std::stop_token stopToken() const { return s_stop.get_token(); }
@@ -110,26 +108,21 @@ private:
     }
 
     static void pinToCore(int core) {
-        fmt::println(stderr, "[RT]   pinToCore: building cpuset…");
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(core, &cpuset);
-        fmt::println(stderr, "[RT]   pinToCore: calling sched_setaffinity(0, &mask_with_cpu_{})…", core);
-        const int rc = sched_setaffinity(0, sizeof(cpuset), &cpuset);
-        fmt::println(stderr, "[RT]   pinToCore: sched_setaffinity returned {} (errno={})",
-                     rc, rc == 0 ? 0 : errno);
-        if (rc != 0)
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
             fmt::println(stderr, "[Warn] sched_setaffinity(core {}) failed: {}",
                          core, std::strerror(errno));
-        else
-            fmt::println(stderr, "[RT] Pinned to core {}", core);
     }
 
-    static void setFifo(int priority) {
+    // Run the hot thread under SCHED_OTHER (prio 0). On an isolated core a single
+    // busy-poll thread already occupies ~100% of it without real-time priority,
+    // and SCHED_OTHER avoids the RT-throttle / per-CPU-kthread lockup risk.
+    static void setSchedOther() {
         sched_param sp{};
-        sp.sched_priority = priority;
-        if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
-            fmt::println(stderr, "[Warn] SCHED_FIFO:{} failed: {}",
-                         priority, std::strerror(errno));
+        sp.sched_priority = 0;
+        if (sched_setscheduler(0, SCHED_OTHER, &sp) != 0)
+            fmt::println(stderr, "[Warn] SCHED_OTHER failed: {}", std::strerror(errno));
     }
 };
