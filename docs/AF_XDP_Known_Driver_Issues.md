@@ -8,8 +8,8 @@ inherited from each driver's NAPI / zero-copy maturity (i40e < mlx5 sound; igc
 buggy). Every anomaly below was localised against **xdpsock** (the kernel's own
 reference AF_XDP app) — if xdpsock fails too, the fault is in the driver, not our code.
 
-NICs covered: Intel XXV710 (i40e), Intel I225-V (igc). ConnectX-4 Lx (mlx5) — **TBD,
-added later**.
+NICs covered: Intel XXV710 (i40e), Intel I225-V (igc). ConnectX-4 Lx (mlx5) — §3, which
+is **DPDK PMD** (not AF_XDP) latency findings from the single-frame campaign.
 
 ---
 
@@ -186,6 +186,62 @@ irrelevant to RTT (where the RX busy-poll drives the same NAPI).
 
 ---
 
-## ConnectX-4 Lx — `mlx5` (netdevs `cx0` / `cx1`)
+## 3. ConnectX-4 Lx — DPDK `mlx5` PMD (netdevs `cx0` / `cx1`)
 
-TBD — to be documented after the CX4 campaign.
+Not AF_XDP — these are **native DPDK mlx5 PMD** (bifurcated, no vfio) latency traps found
+with the single-frame SingleRecorder (Tx core 2, Rx core 3, **one packet per `tx_burst`**).
+All are **CX4 Lx specific** (no eMPW, forced inline; CX5+ default inline-0 and would differ).
+**Headline: raw verbs beats the DPDK PMD on the same silicon — the gap is PMD software,
+not the NIC.** Probe knobs below live in the working tree (to be git-restored); the
+production sub-2 µs answer on mlx5 is **verbs**.
+
+### 3.1 Flat-out single-frame TX balloons to ~148 µs — full-inline deep-buffering
+**Symptom.** Flat-out (`send_interval_us=0`) → median **148 µs** (min 142 µs — every frame
+parked behind a deep queue), 0 loss. Paced (1 Mpps) → **1.73 µs**.
+**Mechanism.** With full inline (`txqs_min_inline=0`, the reuse-path default) the PMD copies
+all 64 B into the WQE; mlx5 accepts these into a deep internal TX FIFO faster than it
+egresses (doorbell-bound ~6 Mpps) → ~900 in flight. HW-timestamps put RX-side at only 1.3 µs,
+so the 148 µs is **TX-side**. Ruled out by controlled test: completion coalescing
+(`MLX5_TX_COMP_THRESH=1` rebuild → no change), our reuse code (fresh-mbuf → same 148 µs),
+MPW (`txq_mpw_en=1` engaged "Legacy MPW", no change — can't pack at `tx_burst(...,1)`).
+**Fix.** Minimal inline — devarg **`txq_inline_max=18`** (CX4-forced 18 B header inlined,
+**DMA the body**) + fresh-mbuf (DMA needs a stable buffer): median **148 → ~4 µs**. The DMA
+read acts as a natural throttle that keeps the TX pipeline shallow.
+
+### 3.2 It's the PMD, not the NIC (verbs proves it)
+Same NIC, same flat-out single-frame: **verbs (raw RAW_PACKET QP) = 8.17 Mpps / 1.29 µs,
+shallow SQ**; DPDK PMD = 6.2 Mpps / deep / 148 µs. The silicon drains single-frame fine;
+the PMD TX path is the cost (`perf -C2`: 79 % in `mlx5_tx_burst_i` + `mlx5_tx_handle_completion`).
+Parallels raw-AF_XDP beating DPDK's af_xdp PMD — raw datapaths beat the general PMD for ULL.
+
+### 3.3 mempool MC-ring lock — Tx/Rx threads aren't EAL lcores
+**Symptom.** `perf -C2`: **48 % in `common_ring_mc_dequeue`** (`lock cmpxchg`) — heavy locking
+where a single-producer path should have none.
+**Mechanism.** Our Tx/Rx are `std::thread`s on isolated cores, **not registered EAL lcores**
+→ `rte_lcore_id()` invalid → the per-lcore mempool **cache is bypassed** → every alloc/free
+hits the shared MC ring atomically.
+**Fix.** `rte_thread_register()` once per hot-path thread → cache on, lock gone, LIFO keeps
+buffers hot. **CAVEAT (latency vs throughput):** removing the lock sped TX 6.2 → 7.62 Mpps,
+which *deepened* the pipeline → median went **up** 4.0 → 4.7 µs. The lock was an accidental
+throttle; for latency you want **bounded in-flight**, not maximised CPU.
+
+### 3.4 RX cold-read stall + RX-ring overrun
+- **Cold-read:** RxThread reads each just-DMA'd packet cold → `perf -C3` IPC 0.8, L1-miss
+  6.3 %, 68 % in our RxThread. **Fix:** `rte_prefetch0` the next packet's header in
+  `tryReceive` → IPC 0.8 → **1.9**, L1-miss → 2.4 %.
+- **Overrun:** once RX is fast, the default 256-deep RX ring overruns on flat-out bursts
+  (`rx_out_of_buffer`). **Fix:** deepen `NbRxDesc` 256 → 4096 (+ `NumMbufs`) — absorbs bursts,
+  0 loss, latency-neutral (same idea as the verbs `RqDepth` 256 → 8192 fix).
+
+### 3.5 Floor reached, and what's fundamental
+TX software cost is negligible — `acquire` avg **82 ns**, `commit` avg **25 ns** (timed with
+`rte_rdtsc`); so the median is the **min-inline DMA pipeline, which is rate-bound** (lower
+offered rate → fewer DMA reads in flight → lower latency; the lock/timing throttle to
+~5 Mpps is *why* median fell to 3.7 µs). Tail (P99.999 ~9.8 µs, Max ~236 µs) is RX-burst +
+a ~1-in-10⁹ stray stall — **NOT SMIs** (`perf -e msr/smi/` = **0** under load; the custom
+kernel has no `msr` module / `turbostat`, but the perf MSR PMU works). Progression:
+**148 → 5.2 → 4.7 → 3.7 µs** flat-out via min-inline + thread-register + RX-prefetch +
+deep RX ring. Reaching verbs' ~1.7 µs *at flat-out* requires **bounding the in-flight window**
+(cap outstanding ~8 → trades throughput); verbs needs no such trade because it inlines (no
+per-packet DMA pipeline). **Ladder: verbs 1.29 µs < DPDK paced 2.24 µs < raw AF_XDP 3.32 µs <
+DPDK flat-out 3.7 µs.**
