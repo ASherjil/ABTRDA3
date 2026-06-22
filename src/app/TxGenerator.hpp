@@ -39,6 +39,10 @@ inline void run_txgen(Tx& tx, const TestConfig& cfg, std::uint32_t count, std::s
     tx.prefillRing(frameTemplate);
 
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
+    // Split the (constant) interval into whole seconds + remainder once, so the
+    // per-send timespec carry is O(1) and correct for intervals >= 1s.
+    const long          paceSec    = static_cast<long>(intervalNs / 1'000'000'000ULL);
+    const long          paceNsec   = static_cast<long>(intervalNs % 1'000'000'000ULL);
     timespec nextSend{};
     if (intervalNs > 0)
         clock_gettime(CLOCK_MONOTONIC, &nextSend);
@@ -50,8 +54,9 @@ inline void run_txgen(Tx& tx, const TestConfig& cfg, std::uint32_t count, std::s
     for (std::uint32_t i = 0; i < count && !stop.stop_requested(); ++i) {
         // Pace sends if configured
         if (intervalNs > 0) {
-            nextSend.tv_nsec += static_cast<long>(intervalNs);
-            while (nextSend.tv_nsec >= 1'000'000'000L) {
+            nextSend.tv_sec  += paceSec;
+            nextSend.tv_nsec += paceNsec;
+            if (nextSend.tv_nsec >= 1'000'000'000L) {   // both addends < 1e9 => at most one carry
                 nextSend.tv_sec  += 1;
                 nextSend.tv_nsec -= 1'000'000'000L;
             }

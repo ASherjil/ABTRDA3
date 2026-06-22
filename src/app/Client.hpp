@@ -37,6 +37,10 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
 
     // Pacing: use CLOCK_MONOTONIC absolute sleeps for drift-free timing
     const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
+    // Split the (constant) interval into whole seconds + remainder once, so the
+    // per-send timespec carry is O(1) and correct for intervals >= 1s.
+    const long          paceSec    = static_cast<long>(intervalNs / 1'000'000'000ULL);
+    const long          paceNsec   = static_cast<long>(intervalNs % 1'000'000'000ULL);
     timespec nextSend{};
     if (intervalNs > 0) {
         clock_gettime(CLOCK_MONOTONIC, &nextSend);
@@ -46,8 +50,9 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::uint32_t coun
         // Pace sends if configured (e.g. 1ms to simulate CERN WR timing signals)
         if (intervalNs > 0) {
             // Advance next send time
-            nextSend.tv_nsec += static_cast<long>(intervalNs);
-            while (nextSend.tv_nsec >= 1'000'000'000L) {
+            nextSend.tv_sec  += paceSec;
+            nextSend.tv_nsec += paceNsec;
+            if (nextSend.tv_nsec >= 1'000'000'000L) {   // both addends < 1e9 => at most one carry
                 nextSend.tv_sec  += 1;
                 nextSend.tv_nsec -= 1'000'000'000L;
             }
