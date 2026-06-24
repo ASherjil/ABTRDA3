@@ -13,6 +13,8 @@
 #include <rte_ether.h>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -59,9 +61,9 @@
 // registration wins, so prepare()'s devargs-bearing entry isn't shadowed by
 // ealInit's bare fallback. The EAL file-prefix is derived from the first BDF
 // (devargs stripped), so server+client can run as two DPDK primaries on the
-// same looped-DAC host. --force-max-simd-bitwidth=512 raises the runtime SIMD
-// cap so the i40e PMD picks its AVX-512 RX/TX path (no transition jitter for a
-// continuous busy-poll workload on Rocket Lake).
+// same looped-DAC host. The runtime SIMD cap handed to EAL is dpdk::kMaxSimdBitwidth
+// (--force-max-simd-bitwidth) — see its definition for how it picks the i40e PMD's
+// vector vs scalar RX/TX path and why scalar wins for one-packet-in-flight latency.
 //
 // mlx5 DEVARGS (all A/B-tested 2026-06-10 on ConnectX-4 Lx):
 //   txq_mem_algn=0    — disable the consecutive-TxQ-umem feature (DPDK >= 25.x,
@@ -144,6 +146,16 @@
 
 namespace dpdk {
 
+// --force-max-simd-bitwidth cap handed to EAL, which selects the i40e PMD RX/TX
+// path: 512 = AVX-512, 256 = AVX2, 128 = SSE, 64 = SCALAR. A/B on XXV710 RTT
+// (2026-06-23): AVX-512 and 64 (Scalar Simple/Bulk) gave the SAME ~9.15us median
+// — the floor is the i40e HARDWARE pipeline, not the PMD vector path, so Intel's
+// "scalar = big latency win" did NOT reproduce here. 256 (AVX2) is the default:
+// same latency as 512, keeps vector throughput headroom, and avoids AVX-512's
+// frequency/power side effects. Cold EAL startup arg (no hot-path codegen
+// impact); the startup burst-mode print verifies which path the PMD picked.
+inline constexpr unsigned kMaxSimdBitwidth = 256;
+
 inline std::vector<std::string>& allowedBdfs() {
   static std::vector<std::string> v;
   return v;
@@ -174,6 +186,20 @@ inline void addVdev(const std::string& arg) {
   v.push_back(arg);
 }
 
+// All DPDK control threads (the eal-intr-thread shown as "dpdk-intr" — it services
+// the i40e 50ms self-re-arming link/stat alarm and VFIO config-space interrupts —
+// plus the multiprocess socket handler) are parked on kControlThreadCore. DPDK
+// derives its control-thread cpuset from the CALLER's affinity at rte_eal_init
+// MINUS the dataplane lcores; the RTT server/client path pins the caller to the
+// single isolated lcore BEFORE init, so that difference is EMPTY and EAL falls
+// back to pinning the intr thread onto our poll core, where it ping-pongs with our
+// SCHED_OTHER busy-poll ~80x/s (proven via sched:sched_switch) -> RTT tail spikes.
+// ealInit narrows the caller's affinity to {kControlThreadCore} across rte_eal_init
+// so the control cpuset is exactly that core, then restores the caller's pin. Core
+// 0 is the kernel's housekeeping/IRQ core (irqaffinity=0,1) — where periodic work
+// already lives. (AF_XDP is immune: no PCI/VFIO interrupt source.)
+inline constexpr int kControlThreadCore = 0;
+
 inline bool ealInit(const std::string& bdf, int lcore) noexcept {
   static bool inited = false;
   if (inited) return true;
@@ -189,7 +215,8 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
 
   std::vector<std::string> args = {
     "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
-    "-n", "4", "--file-prefix", prefix, "--force-max-simd-bitwidth=512"
+    "-n", "4", "--file-prefix", prefix,
+    "--force-max-simd-bitwidth=" + std::to_string(kMaxSimdBitwidth)
   };
   if (!vds.empty()) {
     args.emplace_back("--no-pci");            // AF_XDP PMD is a vdev; no PCI probe
@@ -212,7 +239,27 @@ inline bool ealInit(const std::string& bdf, int lcore) noexcept {
   for (auto& a : args) argv.push_back(a.data());
   argv.push_back(nullptr);
 
-  if (rte_eal_init(static_cast<int>(args.size()), argv.data()) < 0) {
+  // Park DPDK's control threads on kControlThreadCore (see its definition): narrow
+  // our affinity to that core so EAL's control cpuset = {kControlThreadCore}, run
+  // init, then restore our own pin. Skipped if the control core IS our lcore.
+  const bool park = (kControlThreadCore != lcore);
+  cpu_set_t savedAff;
+  CPU_ZERO(&savedAff);
+  bool haveSaved = false;
+  if (park) {
+    haveSaved = (pthread_getaffinity_np(pthread_self(), sizeof(savedAff), &savedAff) == 0);
+    cpu_set_t ctrlSet;
+    CPU_ZERO(&ctrlSet);
+    CPU_SET(kControlThreadCore, &ctrlSet);
+    pthread_setaffinity_np(pthread_self(), sizeof(ctrlSet), &ctrlSet);
+  }
+
+  const int rc = rte_eal_init(static_cast<int>(args.size()), argv.data());
+
+  if (park && haveSaved)
+    pthread_setaffinity_np(pthread_self(), sizeof(savedAff), &savedAff);
+
+  if (rc < 0) {
     std::fprintf(stderr, "[DPDK] rte_eal_init failed: %s\n", rte_strerror(rte_errno));
     return false;
   }
