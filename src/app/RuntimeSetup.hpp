@@ -18,11 +18,11 @@
 // RuntimeSetup — runtime environment for the hot path
 //
 // Handles: mlockall, signal handler, watchdog, CPU pinning. The hot thread runs
-// SCHED_OTHER (busy-poll on its isolated core), NOT SCHED_FIFO: on a dedicated
-// isolated core a single polling thread already runs ~100% under SCHED_OTHER,
-// while real-time priority risks starving per-CPU kernel threads (vmstat,
-// ksoftirqd) into a lockup and incurs the kernel's 95% RT-throttle (per
-// low-latency tuning guidance). Construct AFTER NicTuner.
+// SCHED_OTHER (busy-poll on its isolated core): a single polling thread already
+// saturates a dedicated isolated core without real-time priority, and SCHED_OTHER
+// avoids the RT-throttle / per-CPU-kthread starvation risk. (Measured equal to
+// SCHED_FIFO on this rig — both NICs, quiet box — so OTHER wins on simplicity:
+// no RT-throttle dependency.) Construct AFTER NicTuner.
 //
 // The early steps print a diagnostic line before/after so that if init hangs
 // (e.g. mlockall over NFS, PMD bring-up), the last printed line localises it.
@@ -69,8 +69,8 @@ public:
             return;
         }
 
-        // Step 5 — pin the main thread to its isolated hot-path core and run
-        // SCHED_OTHER (busy-poll). No SCHED_FIFO — see the class comment.
+        // Step 5 — pin the main thread to its isolated hot-path core and run it
+        // SCHED_OTHER (busy-poll). See class comment for why not SCHED_FIFO.
         fmt::println(stderr, "[RT] step 5/5 pinning to core {} (SCHED_OTHER)…", cpuCore);
         pinToCore(cpuCore);
         setSchedOther();

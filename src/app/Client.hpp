@@ -26,11 +26,11 @@
 #include "TestConfig.hpp"
 #include "SingleRecorder.hpp"   // Shared, HistThread, pinThread, tsc, kEndSentinel,
                                 // kWarmupDiscard, frame offsets, storeU/loadU
+#include "Profiling.hpp"
 
 #include <fmt/core.h>
 
 #include <arpa/inet.h>
-#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <stop_token>
@@ -81,6 +81,15 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     std::uint64_t       timeouts = 0;
     std::uint64_t       warmup   = 0;   // successful round-trips discarded (caps at kWarmupDiscard)
     const std::uint64_t start    = tsc::now();
+    [[maybe_unused]] prof::CycleStats txStats;   // debug-only; gated, elided in release
+    [[maybe_unused]] prof::CycleStats rxStats;   // debug-only; gated, elided in release
+    // Debug-only outlier log: dump the first N round-trips above a threshold with
+    // their time-since-start, so we can see whether the spikes cluster (settling)
+    // or spread (steady-state system events). I/O only fires on the rare outlier,
+    // AFTER the sample is recorded, so it can't perturb the recorded value.
+    [[maybe_unused]] const std::uint64_t outlierThreshCyc =
+        static_cast<std::uint64_t>(sh.tscHz * 10e-6);   // 10 us
+    [[maybe_unused]] int outlierLogged = 0;
 
     while (tsc::now() - start < durationCyc && !stop.stop_requested()) {
         // Optional drift-free pacing.
@@ -94,6 +103,8 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &nextSend, nullptr);
         }
 
+        [[maybe_unused]] std::uint64_t txStart = 0;
+        if constexpr (prof::kDebugProfiling) txStart = prof::cycles();
         std::uint8_t* dst = tx.acquire(cfg.frameSize);
         if (!dst) [[unlikely]] {
             continue;
@@ -103,6 +114,9 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         storeU<std::uint32_t>(dst + kOffSeq, seqNet);
         const std::uint64_t t1 = tsc::now();          // send stamp (same core as t2)
         tx.commit();
+        if constexpr (prof::kDebugProfiling) {
+            txStats.record(prof::cycles() - txStart);
+        }
         ++sent;
 
         // Spin for the echo carrying OUR seq. Discard stale echoes / TX copies
@@ -112,6 +126,10 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         while (true) {
             if (RxFrame rxf = rx.tryReceive(); !rxf.data.empty()) [[unlikely]] {
                 const std::uint64_t t2 = tsc::now(); // take the timestamp at the earliest point
+                [[maybe_unused]] std::uint64_t rxStart = 0;
+                if constexpr (prof::kDebugProfiling) {
+                    rxStart = prof::cycles();
+                }
                 if (rxf.data.size() >= kFrameMinBytes &&
                     std::memcmp(rxf.data.data(), cfg.client.mac.data(), 6) == 0) [[likely]] {
                     const std::uint32_t rxSeq = loadU<std::uint32_t>(rxf.data.data() + kOffSeq);
@@ -124,7 +142,18 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
                                 sh.pushFailures.fetch_add(1, std::memory_order_relaxed);
                             }
                             ++recorded;
+                            if constexpr (prof::kDebugProfiling) {
+                                if ((t2 - t1) > outlierThreshCyc && outlierLogged < 64) {
+                                    fmt::print(stderr,
+                                        "[outlier] #{:<11} t={:8.1f}ms  rtt={:7.2f}us\n",
+                                        recorded,
+                                        static_cast<double>(t2 - start) * 1e3 / sh.tscHz,
+                                        static_cast<double>(t2 - t1)   * 1e6 / sh.tscHz);
+                                    ++outlierLogged;
+                                }
+                            }
                         }
+                        if constexpr (prof::kDebugProfiling) rxStats.record(prof::cycles() - rxStart);
                         received = true;
                         break;
                     }
@@ -147,6 +176,11 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     // Stop the histogram thread: in-band sentinel (FIFO drains every sample first).
     while (!sh.toHist.try_push(kEndSentinel));
     tHist.join();
+
+    if constexpr (prof::kDebugProfiling) {
+        txStats.report("client tx (acq->commit)", sh.tscHz);
+        rxStats.report("client rx-process",       sh.tscHz);
+    }
 
     fmt::print(stderr,
                "[Client] sent={} recorded={} timeouts={} warmup_discarded={} push_fail={}\n",

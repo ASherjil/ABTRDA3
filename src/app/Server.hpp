@@ -2,6 +2,7 @@
 
 #include "RingConcepts.hpp"
 #include "TestConfig.hpp"
+#include "Profiling.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,7 @@
 template<TxRing Tx, RxRing Rx>
 inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop) {
     std::uint64_t packet_count = 0;
+    [[maybe_unused]] prof::CycleStats reflectStats;   // debug-only; gated, elided in release
 
     // Outer loop checks stop token; inner loop spins tight without atomic reads
     while (true) {
@@ -19,8 +21,14 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
                 continue;
             }
 
+            // CPU-cost bracket: packet in hand -> reply posted (excludes the poll wait).
+            [[maybe_unused]] std::uint64_t reflectStart = 0;
+            if constexpr (prof::kDebugProfiling) {
+                reflectStart = prof::cycles();
+            }
+
             // Zero-copy: write directly into TX ring slot
-            auto* dst = tx.acquire(cfg.frameSize);
+            std::uint8_t* dst = tx.acquire(cfg.frameSize);
             while (!dst) {
                 if (stop.stop_requested())[[unlikely]]{
                     rx.release();
@@ -36,10 +44,18 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
 
             rx.release();  // free RX slot before TX syscall
             tx.commit();
+            if constexpr (prof::kDebugProfiling) {
+                reflectStats.record(prof::cycles() - reflectStart);
+            }
             packet_count++;
         }
-        if (stop.stop_requested()) break;
+        if (stop.stop_requested()) {
+            break;
+        }
     }
 
     std::printf("\n[Server] Reflected %lu packets.\n", packet_count);
+    if constexpr (prof::kDebugProfiling) {
+        reflectStats.report("server reflect (rx->tx)", prof::tscHz());
+    }
 }

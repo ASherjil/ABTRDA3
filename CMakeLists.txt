@@ -76,6 +76,18 @@ target_link_options(abtrda3_flags INTERFACE
     $<$<CONFIG:Release>:-flto=auto>
 )
 
+# Opt-in hot-path profiling (rdtsc CPU-cost + mlx5 RX HW-timestamp). OFF by
+# default so PRODUCTION builds carry ZERO instrumentation; the x86_64-relprof
+# preset turns it ON (Release optimisation + ABT_DEBUG_PROFILING) in its OWN
+# build dir, leaving the release binary untouched. See backends/common/Profiling.hpp.
+option(ABTRDA3_DEBUG_PROFILING "Enable hot-path rdtsc/HW-ts profiling instrumentation" OFF)
+target_compile_definitions(abtrda3_flags INTERFACE
+    $<$<BOOL:${ABTRDA3_DEBUG_PROFILING}>:ABT_DEBUG_PROFILING>
+)
+if(ABTRDA3_DEBUG_PROFILING)
+    message(STATUS "Profiling:     ON (ABT_DEBUG_PROFILING) — debug measurement build")
+endif()
+
 # =============================================================================
 # Dependencies
 # =============================================================================

@@ -27,6 +27,14 @@
       }
     },
     {
+      "name": "x86_64-relprof",
+      "displayName": "x86_64 Release + Profiling (ABT_DEBUG_PROFILING)",
+      "inherits": "x86_64-release",
+      "cacheVariables": {
+        "ABTRDA3_DEBUG_PROFILING": "ON"
+      }
+    },
+    {
       "name": "x86_64-debug",
       "displayName": "x86_64 Debug",
       "inherits": "base",
@@ -74,6 +82,10 @@
     {
       "name": "x86_64-release",
       "configurePreset": "x86_64-release"
+    },
+    {
+      "name": "x86_64-relprof",
+      "configurePreset": "x86_64-relprof"
     },
     {
       "name": "x86_64-debug",

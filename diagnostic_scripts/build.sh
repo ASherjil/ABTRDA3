@@ -18,7 +18,8 @@ read -rp "Toolchain [1/2]: " arch_choice
 echo ""
 echo "1) Debug"
 echo "2) Release"
-read -rp "Build type [1/2]: " type_choice
+echo "3) Release + Profiling  (rdtsc/HW-ts instrumentation, x86_64 only)"
+read -rp "Build type [1/2/3]: " type_choice
 
 # Resolve preset name
 case "${arch_choice}" in
@@ -30,8 +31,14 @@ esac
 case "${type_choice}" in
     1) type="debug"   ;;
     2) type="release"  ;;
+    3) type="relprof" ;;
     *) echo "Invalid build type"; exit 1 ;;
 esac
+
+# Profiling build is x86_64-only (rdtscp / x86 timestamp intrinsics in Profiling.hpp).
+if [[ "${type}" == "relprof" && "${arch}" != "x86_64" ]]; then
+    echo "Profiling (relprof) is x86_64-only — re-run and pick the x86_64 toolchain."; exit 1
+fi
 
 preset="${arch}-${type}"
 build_dir="build/${preset}"

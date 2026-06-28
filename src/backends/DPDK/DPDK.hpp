@@ -685,16 +685,7 @@ inline std::uint8_t* DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, M
 
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 inline void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::commit() noexcept requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx) {
-  // BACKPRESSURE (mirrors AF_XDP's `while (reserve != 1) completeTx()` and the
-  // verbs SQ): retry until the frame is truly queued — NEVER drop. The PMD reaps
-  // TX completions inside rte_eth_tx_burst, so spinning here frees ring slots.
-  // The old drop-on-full advanced the caller's seq for frames that never egressed,
-  // so the pipelined Tx (flat-out, decoupled from Rx) overran the TX ring and the
-  // receiver saw ~64% of sends as false "loss". Unbounded like AF_XDP; the Tx
-  // duration bound stops the run, and a live link always drains the ring.
-  while (rte_eth_tx_burst(m_port, QueueId, &m_pendingTx, 1) == 0) [[unlikely]] {
-    // ring full — spin; completions drain inside the next tx_burst
-  }
+  while (rte_eth_tx_burst(m_port, QueueId, &m_pendingTx, 1) == 0) [[unlikely]] {}
   m_pendingTx = nullptr;
 }
 

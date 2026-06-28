@@ -13,7 +13,6 @@
 #include "Verbs.hpp"
 #include "PciHelpers.hpp"   // pci::reportItr / boundToI40e (i40e ITR check)
 #include "SingleRecorder.hpp"
-#include "RuntimeSetup.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
@@ -219,6 +218,48 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
             case RunMode::Server:
             case RunMode::Client: {
                 DPDK<DpdkMode::RxTx> nic(role.interface, role.cpuCore, role.driver);
+                if (!setup(nic)) return 1;
+                dispatchMode(nic, nic, mode, cfg, count, stop);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    if (transport == "verbs") {
+        // Raw-verbs RAW_PACKET QP on mlx5 (bifurcated — kernel keeps the port, which
+        // must be admin-UP; mlx5-only, i40e/igc have no verbs provider). Same RTT
+        // dispatch as DPDK but minus the ethdev/mbuf layer — the sub-2us path, wired
+        // here to localise the DPDK-vs-verbs gap (and its max) on identical silicon.
+        // Per-role mode: TxGen->TxOnly, RxSink->RxOnly, Server/Client->RxTx (one QP
+        // both sends and reflects). driver/lcore fields are ignored (the RDMA device
+        // is resolved from the netdev name). Same Server/Client loops as every other
+        // transport, so the relprof prof brackets apply unchanged.
+        auto setup = [&](auto& nic) -> bool {
+            if (!nic.init()) {
+                fmt::println(stderr, "Error: verbs init failed on {}", role.interface);
+                return false;
+            }
+            fmt::println("[{}] Transport: verbs on {} (RAW_PACKET QP)", roleName, role.interface);
+            return true;
+        };
+
+        switch (mode) {
+            case RunMode::TxGen: {
+                Verbs<VerbsMode::TxOnly> nic(role.interface);
+                if (!setup(nic)) return 1;
+                run_txgen(nic, cfg, count, stop);
+                return 0;
+            }
+            case RunMode::RxSink: {
+                Verbs<VerbsMode::RxOnly> nic(role.interface);
+                if (!setup(nic)) return 1;
+                run_rxsink(nic, cfg, stop);
+                return 0;
+            }
+            case RunMode::Server:
+            case RunMode::Client: {
+                Verbs<VerbsMode::RxTx> nic(role.interface);
                 if (!setup(nic)) return 1;
                 dispatchMode(nic, nic, mode, cfg, count, stop);
                 return 0;
