@@ -458,7 +458,12 @@ private:
         // plot — dense in the BODY, which the percentile export cannot reconstruct.
         // Bucket values converted cycles -> us; 4 decimals (0.1 ns) preserves the
         // native bucket resolution.
-        const std::string histPath = m_outputPath + ".hist.csv";
+        // Derive the histogram name from the base (strip one trailing ".csv") so an
+        // output_path of "foo.csv" yields "foo.hist.csv", not "foo.csv.hist.csv".
+        std::string histPath = m_outputPath;
+        if (histPath.size() >= 4 && histPath.compare(histPath.size() - 4, 4, ".csv") == 0)
+            histPath.resize(histPath.size() - 4);
+        histPath += ".hist.csv";
         if (std::FILE* hf = std::fopen(histPath.c_str(), "w")) {
             std::fprintf(hf, "value_us,count\n");
             hdr_iter it;
