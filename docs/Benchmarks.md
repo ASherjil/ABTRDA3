@@ -142,10 +142,43 @@ _[24 h soak pending]_
 ![CX4 DPDK histogram](../test/latency_analysis/TBD.png)
 
 ### 3.2 AF_XDP — zero-copy + busy-poll
-_[24 h soak pending]_
 
 > mlx5 is the one NIC where one-in-flight busy-poll achieves low latency (the CQE is
 > written back promptly), so AF_XDP-ZC is viable here.
+
+To compete with DPDK, AF_XDP must run **zero-copy** (frames DMA'd straight into the
+user-space umem via the native driver — no kernel copy) and **busy-poll** (the app
+drives the NAPI inline through the socket syscall, polling the rings instead of
+waiting on interrupts). Both are **on by default** in our harness. Two tunables vary:
+
+- **NAPI hard-IRQ deferral** — `napi_defer_hard_irqs` keeps the queue serviced by
+  busy-poll for N rounds before re-arming the hardware IRQ; `gro_flush_timeout` is the
+  backstop timer (ns) that re-arms the IRQ if the app stops polling. Together they let
+  busy-poll suppress interrupts (lower jitter) — the regime the canonical AF_XDP
+  README recommends:
+  ```
+  echo 2 | sudo tee /sys/class/net/<interface>/napi_defer_hard_irqs
+  echo 200000 | sudo tee /sys/class/net/<interface>/gro_flush_timeout
+  ```
+  Reference: <https://github.com/xdp-project/bpf-examples/blob/main/AF_XDP-example/README.org>
+- **`XDP_USE_NEED_WAKEUP`** — bind flag: when set, the app kicks the kernel
+  (`sendto`/`poll`) only when the ring raises `need_wakeup`; when unset, the app
+  always kicks, driving the NAPI inline every cycle.
+
+#### Config sweep (5-min, to select the 24 h config)
+All four keep zero-copy + busy-poll on; they vary `XDP_USE_NEED_WAKEUP` × deferral:
+
+| Config | Min     | Median  | P99     | P99.9   | P99.99   | P99.999  | Max       |
+|---|---------|---------|---------|---------|----------|----------|-----------|
+| A — need_wakeup + deferral | _5.570_ | _6.294_ | _7.185_ | _7.353_ | _7.558_  | _7.689_  | _30.501_  |
+| B — need_wakeup, no deferral | _6.094_ | _7.726_ | _9.341_ | _9.699_ | _10.661_ | _15.527_ | _353.468_ |
+| C — no need_wakeup + deferral | _5.518_ | _6.237_ | _7.177_ | _7.535_ | _7.808_  | _8.026_  | _39.183_  |
+| D — no need_wakeup, no deferral | _5.966_ | _7.716_ | _9.220_ | _9.781_ | _10.560_ | _14.546_ | _345.356_ |
+
+_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _Config A due to measurably better tail latency_.**
+
+#### 24 h soak (chosen config)
+_[pending the sweep above]_
 
 | Metric | One-way (µs) |
 |---|---|
@@ -186,11 +219,27 @@ _[24 h soak pending]_
 ![XXV710 DPDK histogram](../test/latency_analysis/TBD.png)
 
 ### 4.2 AF_XDP — zero-copy + busy-poll
-_[24 h soak pending]_
 
 > On kernel 7.0, i40e one-in-flight busy-poll does **not** engage (RX descriptor
 > write-back is IRQ-gated) — AF_XDP runs interrupt-driven here. _Document the
 > stock-vs-patched finding._
+
+Same 4-config sweep as **§3.2** (zero-copy + busy-poll baseline; the deferral knobs
+and `XDP_USE_NEED_WAKEUP` flag are defined there), run on `xxv0`/`xxv1`.
+
+#### Config sweep (5-min, to select the 24 h config)
+
+| Config | Min | Median | P99 | P99.9 | P99.99 | P99.999 | Max |
+|---|---|---|---|---|---|---|---|
+| A — need_wakeup + deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| B — need_wakeup, no deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| C — no need_wakeup + deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| D — no need_wakeup, no deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+
+_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _TBD_.**
+
+#### 24 h soak (chosen config)
+_[pending the sweep above]_
 
 | Metric | One-way (µs) |
 |---|---|
