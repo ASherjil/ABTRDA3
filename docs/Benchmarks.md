@@ -229,14 +229,14 @@ and `XDP_USE_NEED_WAKEUP` flag are defined there), run on `xxv0`/`xxv1`.
 
 #### Config sweep (5-min, to select the 24 h config)
 
-| Config | Min | Median | P99 | P99.9 | P99.99 | P99.999 | Max |
-|---|---|---|---|---|---|---|---|
-| A — need_wakeup + deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| B — need_wakeup, no deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| C — no need_wakeup + deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| D — no need_wakeup, no deferral | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| Config | Min     | Median   | P99      | P99.9    | P99.99   | P99.999   | Max       |
+|---|---------|----------|----------|----------|----------|-----------|-----------|
+| A — need_wakeup + deferral | _9.485_ | _10.616_ | _11.157_ | _11.327_ | _11.530_ | _11.660_  | _35.729_  |
+| B — need_wakeup, no deferral | _9.367_ | _10.153_ | _10.838_ | _11.149_ | _11.327_ | _13.041_  | _301.256_ |
+| C — no need_wakeup + deferral | _9.413_ | _10.497_ | _11.011_ | _11.186_ | _11.344_ | _11.497_  | _34.162_  |
+| D — no need_wakeup, no deferral | _9.422_ | _10.116_ | _10.739_ | _10.904_ | _11.083_ | _200.208_ | _300.628_ |
 
-_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _TBD_.**
+_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _Config C_.**
 
 #### 24 h soak (chosen config)
 _[pending the sweep above]_
