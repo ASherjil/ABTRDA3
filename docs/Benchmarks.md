@@ -168,14 +168,14 @@ waiting on interrupts). Both are **on by default** in our harness. Two tunables 
 #### Config sweep (5-min, to select the 24 h config)
 All four keep zero-copy + busy-poll on; they vary `XDP_USE_NEED_WAKEUP` × deferral:
 
-| Config | Min     | Median  | P99     | P99.9   | P99.99   | P99.999  | Max       |
-|---|---------|---------|---------|---------|----------|----------|-----------|
-| A — need_wakeup + deferral | _5.570_ | _6.294_ | _7.185_ | _7.353_ | _7.558_  | _7.689_  | _30.501_  |
-| B — need_wakeup, no deferral | _6.094_ | _7.726_ | _9.341_ | _9.699_ | _10.661_ | _15.527_ | _353.468_ |
-| C — no need_wakeup + deferral | _5.518_ | _6.237_ | _7.177_ | _7.535_ | _7.808_  | _8.026_  | _39.183_  |
-| D — no need_wakeup, no deferral | _5.966_ | _7.716_ | _9.220_ | _9.781_ | _10.560_ | _14.546_ | _345.356_ |
+| Config | Min     | Median  | P99     | P99.9    | P99.99   | P99.999  | Max       |
+|---|---------|---------|---------|----------|----------|----------|-----------|
+| A — need_wakeup + deferral | _5.472_ | _6.298_ | _7.248_ | _7.550_  | _7.882_  | _8.031_  | _10.547_  |
+| B — need_wakeup, no deferral | _6.231_ | _8.039_ | _9.779_ | _10.574_ | _10.862_ | _12.732_ | _181.301_ |
+| C — no need_wakeup + deferral | _5.528_ | _6.232_ | _7.176_ | _7.520_  | _7.822_  | _8.009_  | _11.602_  |
+| D — no need_wakeup, no deferral | _6.284_ | _7.944_ | _9.651_ | _10.465_ | _10.831_ | _15.101_ | _175.629_ |
 
-_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _Config A due to measurably better tail latency_.**
+_(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _Config C_.**
 
 #### 24 h soak (chosen config)
 _[pending the sweep above]_
@@ -231,10 +231,10 @@ and `XDP_USE_NEED_WAKEUP` flag are defined there), run on `xxv0`/`xxv1`.
 
 | Config | Min     | Median   | P99      | P99.9    | P99.99   | P99.999   | Max       |
 |---|---------|----------|----------|----------|----------|-----------|-----------|
-| A — need_wakeup + deferral | _9.485_ | _10.616_ | _11.157_ | _11.327_ | _11.530_ | _11.660_  | _35.729_  |
-| B — need_wakeup, no deferral | _9.367_ | _10.153_ | _10.838_ | _11.149_ | _11.327_ | _13.041_  | _301.256_ |
-| C — no need_wakeup + deferral | _9.413_ | _10.497_ | _11.011_ | _11.186_ | _11.344_ | _11.497_  | _34.162_  |
-| D — no need_wakeup, no deferral | _9.422_ | _10.116_ | _10.739_ | _10.904_ | _11.083_ | _200.208_ | _300.628_ |
+| A — need_wakeup + deferral | _9.563_ | _10.480_ | _11.125_ | _11.391_ | _11.555_ | _11.702_  | _12.538_  |
+| B — need_wakeup, no deferral | _9.357_ | _10.156_ | _10.766_ | _10.985_ | _11.164_ | _13.949_  | _202.22_  |
+| C — no need_wakeup + deferral | _9.430_ | _10.517_ | _11.034_ | _11.208_ | _11.346_ | _11.498_  | _12.008_  |
+| D — no need_wakeup, no deferral | _9.365_ | _10.103_ | _10.766_ | _11.012_ | _11.233_ | _101.938_ | _302.762_ |
 
 _(all µs, one-way; 5-min runs.)_ **Chosen for 24 h: _Config C_.**
 
