@@ -84,6 +84,17 @@ code is worse." It is not:
 
 So xdpsock was never a better receive loop — just a noisier roommate on the core.
 
+**Reconfirmed via IRQ isolation — the gap can be a stray IRQ, not just a thread.** A stale
+`pin-irqs.sh` mask (`HOUSE="0-1,6-7"`, from a prior 2–5 isolation) was mis-routing WiFi IRQs
+onto the now-isolated cores 6,7 after isolation moved to 5–7 — that traffic silently supplied
+the re-arm gap, so the socket *caught* (making the strand look "fixed"). Moving all WiFi/mlx5
+IRQs off the isolated cores made the strand **reproduce at both `gro=2000` and `gro=200000`** —
+proving the gro value is irrelevant; the **gap, not the timer, is the variable**. Residual IPIs
+(`LOC`/`RES`/`CAL`, ~35/s) still hit the core yet are **not** enough — specifically **NET_RX
+device-IRQ** activity is what nudges the NAPI. **Trap:** before trusting any FIFO busy-poll
+result, confirm the isolated cores carry no device IRQs
+(`grep -E 'iwlwifi|mlx5' /proc/interrupts` → the isolated-core columns must be 0).
+
 **Evidence (numbers).**
 - Clean A/B: `ABTRDA3_RT_BYPASS=1` (SCHED_OTHER) → caught 5/5, IRQ 189 climbed;
   default FIFO+pin → 0 caught, IRQ 189 frozen. Same binary.
