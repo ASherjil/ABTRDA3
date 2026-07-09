@@ -524,15 +524,26 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
   }
   m_started = true;
 
-  if (m_driver == "i40e") {
-    const std::size_t bar0Size = pci::barSize(m_pci, 0);
-    const std::string resPath  = "/sys/bus/pci/devices/" + m_pci + "/resource0";
+  // ITR clear (i40e only) — the ~50us RX-writeback throttle that gates AF_XDP too.
+  //   * native i40e PMD: m_driver=="i40e", m_pci already resolved (vfio path).
+  //   * DPDK-over-AF_XDP on a kernel-bound i40e: m_driver=="af_xdp" and m_pci is
+  //     EMPTY (prepare() returned early on the vdev branch), so resolve the BDF from
+  //     the ifname. On the KERNEL path our data queue is ITRN(0,0)=0x30000 (ITR0(0)=
+  //     0x38000 is the misc vector) — we write BOTH, harmless. Without this the
+  //     af_xdp-on-i40e RTT is ~5x slower (ITR-gated ~50us vs ~10us). reportItr verifies.
+  std::string itrBdf;
+  if (m_driver == "i40e")                        itrBdf = m_pci;
+  else if (afxdp && pci::boundToI40e(m_ifname))  itrBdf = pci::resolveBdf(m_ifname);
+  if (!itrBdf.empty()) {
+    const std::size_t bar0Size = pci::barSize(itrBdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + itrBdf + "/resource0";
     BackendBase bar0;
     if (bar0Size > 0 && bar0.open(resPath.c_str(), 0, bar0Size)) {
       *bar0.registerPtr<std::uint32_t>(0x00038000) = 0;
       *bar0.registerPtr<std::uint32_t>(0x00030000) = 0;
-      std::fprintf(stderr, "[DPDK] %s: i40e ITR cleared (RX writeback throttling off)\n",
-                   m_ifname.c_str());
+      std::fprintf(stderr, "[DPDK] %s: i40e ITR cleared (RX writeback throttling off)%s\n",
+                   m_ifname.c_str(), (m_driver == "i40e") ? "" : " [af_xdp-on-i40e]");
+      pci::reportItr(m_ifname, "DPDK-ITR");   // verify it took (af_xdp: adaptive ITR could re-arm)
     } else {
       std::fprintf(stderr, "[DPDK] %s: WARN: %s mmap failed — ITR not cleared, "
                            "expect ~30us median RTT\n", m_ifname.c_str(), resPath.c_str());
