@@ -7,39 +7,56 @@ theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
 
 > **Status:** ConnectX-4 Lx (§3) and Intel XXV710-DA2 (§4) are **complete** — all six
 > 24 h soaks populated (verbs, DPDK, AF_XDP, and DPDK-over-AF_XDP on each NIC). Intel
-> I225-V (§5) and the Solarflare X2522 ef_vi comparison are still pending. Sections 1–2
-> (system/config/methodology) are final.
+> I225-V (§5): DPDK 24 h soak **in progress** — run at **1 GbE**, which beats the NIC's
+> native 2.5 GbE for latency (the 2.5GBASE-T PHY paradox, §5.2); AF_XDP on igc is
+> **disqualified by a driver defect** (§5.3). The Solarflare X2522 ef_vi comparison is
+> still pending. Sections 1–2 (system/config/methodology) are final.
+
+**Contents**
+
+- [Results at a glance](#results-at-a-glance--24-h-rtt-µs-one-frame-in-flight)
+- [1. System](#1-system)
+- [2. Configuration & Methodology](#2-configuration--methodology)
+- [3. ConnectX-4 Lx (mlx5)](#3-connectx-4-lx-mlx5)
+  - [3.1 Verbs & DPDK](#31-verbs--dpdk)
+  - [3.2 AF_XDP — zero-copy + busy-poll](#32-af_xdp--zero-copy--busy-poll)
+  - [3.3 DPDK over AF_XDP (AF_XDP PMD)](#33-dpdk-over-af_xdp-af_xdp-pmd)
+- [4. Intel XXV710-DA2 (i40e)](#4-intel-xxv710-da2-i40e)
+  - [4.1 DPDK — i40e PMD (vfio-pci)](#41-dpdk--i40e-pmd-vfio-pci)
+  - [4.2 AF_XDP — zero-copy + busy-poll](#42-af_xdp--zero-copy--busy-poll)
+  - [4.3 DPDK over AF_XDP (AF_XDP PMD)](#43-dpdk-over-af_xdp-af_xdp-pmd)
+- [5. Intel I225-V (igc)](#5-intel-i225-v-igc)
+  - [5.1 DPDK — igc PMD, link at 1 GbE](#51-dpdk--igc-pmd-vfio-pci-link-at-1-gbe)
+  - [5.2 The 2.5G paradox](#52-the-25g-paradox--why-this-nic-is-benchmarked-at-1-gbe)
+  - [5.3 AF_XDP — disqualified](#53-af_xdp--disqualified-the-driver-cannot-ping-pong)
+- [Hardware photos](#hardware-photos)
 
 ### Results at a glance — 24 h RTT (µs), one frame in flight
 
 | NIC | Transport | Median | P99.999 | Max | Samples |
-|---|---|---:|---:|---:|---:|
+|---|---|--:|---:|---:|---:|
 | **ConnectX-4 Lx** (mlx5) | Verbs (RAW_PACKET QP) | **2.426** | 3.272 | 6.080 | 34.0 B |
 | **ConnectX-4 Lx** (mlx5) | DPDK (mlx5 PMD) | **3.587** | 4.322 | 8.691 | 23.3 B |
-| **ConnectX-4 Lx** (mlx5) | AF_XDP (ZC + busy-poll) | **6.231** | 8.001 | 12.943 | 13.5 B |
+| **ConnectX-4 Lx** (mlx5) | AF_XDP | **6.231** | 8.001 | 12.943 | 13.5 B |
 | **ConnectX-4 Lx** (mlx5) | DPDK-over-AF_XDP PMD | **6.615** | 8.147 | 13.361 | 13.0 B |
 | **Intel XXV710-DA2** (i40e) | DPDK (i40e PMD) | **9.028** | 9.601 | 12.882 | 9.47 B |
-| **Intel XXV710-DA2** (i40e) | AF_XDP (ZC + busy-poll) | **10.529** | 11.910 | 13.569 | 8.20 B |
+| **Intel XXV710-DA2** (i40e) | AF_XDP | **10.529** | 11.910 | 13.569 | 8.20 B |
 | **Intel XXV710-DA2** (i40e) | DPDK-over-AF_XDP PMD | **10.753** | 11.857 | 13.566 | 8.05 B |
-
-_One-way ≈ RTT / 2. The bypass ladder is monotone on each NIC: the more of the kernel
-a transport replaces, the lower and tighter the latency. On mlx5, verbs < DPDK <
-AF_XDP < DPDK-over-AF_XDP; on i40e, native DPDK sits at the silicon floor with AF_XDP
-~1.5 µs above it._
+| **Intel I225-V** (igc) | DPDK (igc PMD) | | | | |
 
 ---
 
 ## 1. System
 
-| Component | Specification |
-|---|---|
-| CPU | Intel Core i9-11900K (Rocket Lake, 8C/16T) — **SMT disabled → 8 active cores** |
-| RAM | 16 GB DDR4-3200 _(channel config: TBD)_ |
-| Motherboard | ASUS ROG Strix Z590-E Gaming WiFi (BIOS 2405) |
-| Cooler | Cooler Master Atmos 360 mm AIO (≈300 W) |
-| Disk | 128 GB NVMe M.2 SSD |
-| OS | Ubuntu 26.04 |
-| Kernel | `7.0.7-hz100` — custom build, `CONFIG_HZ=100`, full `nohz_full` |
+| Component | Specification                                                                    |
+|---|----------------------------------------------------------------------------------|
+| CPU | Intel Core i9-11900K Rocket Lake 8 cores                                         |
+| RAM | 16 GB DDR4-3200                                                                  |
+| Motherboard | ASUS ROG Strix Z590-E                                                            |
+| Cooler | Cooler Master Atmos 360 mm AIO 300W TDP                                          |
+| Disk | 256 GB NVMe M.2 SSD                                                              |
+| OS | Ubuntu Server 26.04                                                              |
+| Kernel | `7.0.7-hz100` — custom build, `CONFIG_HZ=100`, full `nohz_full`                  |
 | TSC | 3.504 GHz, invariant (`tsc=reliable`) → **0.285 ns/tick** measurement resolution |
 
 ### NICs under test
@@ -48,7 +65,7 @@ AF_XDP < DPDK-over-AF_XDP; on i40e, native DPDK sits at the silicon floor with A
 |---|---|---|---|---|
 | Mellanox ConnectX-4 Lx | `mlx5_core` / `mlx5_ib` | cx0, cx1 | 2 × 25 GbE | RDMA-capable (verbs) |
 | Intel XXV710-DA2 | `i40e` | xxv0, xxv1 | 2 × 25 GbE | DPDK via `vfio-pci` |
-| Intel I225-V | `igc` | enp6s0, enp7s0 | 2.5 GbE | DPDK via `vfio-pci` |
+| Intel I225-V | `igc` | enp5s0, enp6s0 | 2 × 2.5GBASE-T (RJ45 copper) | Two single-port controllers, PCIe Gen2 ×1 each; DPDK via `vfio-pci`; benchmarked at **1 GbE** (§5.2) |
 
 > **PCIe topology (Z590-E):** the two 25G add-in NICs run on the CPU PEG bifurcated
 > **×8/×8** — ConnectX-4 Lx (×8) and XXV710-DA2 (×8), each at full bandwidth. The
@@ -144,9 +161,6 @@ sysctl.vm.stat_interval=86400
 
 ![CX4 verbs histogram](../test/latency_analysis/ConnectX_4_Lx/connectx_4_lx_verbs_rtt_hist.png)
 
-The lowest-latency path on this NIC — median **2.426 µs RTT (~1.21 µs one-way)**, and
-the tail stays inside **3.272 µs at P99.999** across 34 billion packets.
-
 #### DPDK — mlx5 PMD (bifurcated, kernel keeps the netdev)
 
 | Metric | RTT (µs) |
@@ -162,10 +176,6 @@ the tail stays inside **3.272 µs at P99.999** across 34 billion packets.
 | Samples | 23,279,093,850 |
 
 ![CX4 DPDK histogram](../test/latency_analysis/ConnectX_4_Lx/connectx_4_lx_dpdk_rtt_hist.png)
-
-~1.16 µs slower than verbs at the median (the PMD's generic mbuf datapath vs the
-hand-tuned direct CQE poll), but the **tightest tail of any transport here**:
-P99.999 4.322 µs, only 0.74 µs above the median.
 
 ### 3.2 AF_XDP — zero-copy + busy-poll
 
@@ -219,11 +229,6 @@ _(all µs, RTT; 5-min runs.)_ **Chosen for 24 h: _Config C_.**
 
 ![CX4 AF_XDP histogram](../test/latency_analysis/ConnectX_4_Lx/connectx_4_lx_af_xdp_rtt_hist.png)
 
-The 24 h soak lands right on the Config C sweep (median 6.231 vs 6.232) — busy-poll
-zero-copy holds its shape over 13.5 billion packets. **~2.6 µs slower than DPDK**: the
-cost of driving the NAPI through the AF_XDP socket layer rather than owning the ring
-in userspace.
-
 ### 3.3 DPDK over AF_XDP (AF_XDP PMD)
 
 > DPDK's `net_af_xdp` vdev PMD — the DPDK API layered on top of the kernel AF_XDP
@@ -243,11 +248,6 @@ in userspace.
 | Samples | 13,027,086,306 |
 
 ![CX4 DPDK-AF_XDP histogram](../test/latency_analysis/ConnectX_4_Lx/connectx_4_lx_dpdk_af_xdp_rtt_hist.png)
-
-**+0.38 µs over native AF_XDP** at the median (6.615 vs 6.231) — the PMD's extra mbuf
-alloc/copy on each side of the socket. The tail tracks native AF_XDP closely (P99.999
-8.147 vs 8.001). So on mlx5 the ladder is complete and monotone:
-**verbs 2.43 < DPDK 3.59 < AF_XDP 6.23 < DPDK-over-AF_XDP 6.62 µs.**
 
 ---
 
@@ -272,21 +272,23 @@ alloc/copy on each side of the socket. The tail tracks native AF_XDP closely (P9
 
 ![XXV710 DPDK histogram](../test/latency_analysis/XXV710_DA2/xxv710_da2_dpdk_rtt_hist.png)
 
-The determinism headline of the whole campaign: median **9.028 µs** and **P99.999
-9.601 µs** — a **0.57 µs spread across five nines over 9.5 billion packets.** This is
-the "software *is* real-time" data point; the entire distribution is silicon + wire,
-not the stack. Software is ~180 ns of the path.
-
 ### 4.2 AF_XDP — zero-copy + busy-poll
-
-> On i40e, one-in-flight RX descriptor write-back is ITR-gated (~50 µs adaptive), so
-> our AF_XDP path clears the ITR register directly via a BAR0 mmap to reach ~10.5 µs
-> RTT, and runs **SCHED_OTHER** to avoid the FIFO busy-poll / NAPI-deferral strand
-> (see `Known_driver_issues.md` §1.2). Kernel 7.0 i40e has no in-driver busy-poll —
-> the `netif_napi_add_config` path exists only in `ice` (E810), not `i40e`.
 
 Same 4-config sweep as **§3.2** (zero-copy + busy-poll baseline; the deferral knobs
 and `XDP_USE_NEED_WAKEUP` flag are defined there), run on `xxv0`/`xxv1`.
+
+Getting AF_XDP to work on this NIC at all required clearing two i40e-specific driver
+issues, both reproduced with the kernel's own `xdpsock` before trusting the diagnosis:
+
+1. **Stock i40e silently disables busy-poll.** The driver never registers a NAPI id
+   on its RX queues, so `SO_BUSY_POLL` becomes a no-op and every "busy-poll" run is
+   secretly interrupt-driven. A one-line driver patch fixes it (igc and mlx5 work
+   stock). See `Known_driver_issues.md` §1.1.
+2. **A gapless SCHED_FIFO busy-poll can strand RX entirely.** With hard-IRQ deferral
+   active on a truly clean isolated core, a FIFO-priority poll loop never yields the
+   gap the driver needs to re-arm its interrupt — a single in-flight frame is then
+   never delivered. All published runs use SCHED_OTHER, which avoids it. See
+   `Known_driver_issues.md` §1.2.
 
 #### Config sweep (5-min, to select the 24 h config)
 
@@ -315,17 +317,7 @@ _(all µs, RTT; 5-min runs.)_ **Chosen for 24 h: _Config C_.**
 
 ![XXV710 AF_XDP histogram](../test/latency_analysis/XXV710_DA2/xxv710_da2_af_xdp_rtt_hist.png)
 
-**~1.5 µs above native DPDK** (10.529 vs 9.028) — on i40e the AF_XDP socket path can't
-reach the vfio PMD's floor even with the ITR cleared. The tail is well-behaved
-(P99.999 11.910, max 13.569 over 8.2 billion packets).
-
 ### 4.3 DPDK over AF_XDP (AF_XDP PMD)
-
-> DPDK's `net_af_xdp` PMD on i40e. **The stock PMD does not clear the i40e ITR**, so
-> out of the box it runs at **~51 µs median RTT** (adaptive-ITR RX-writeback
-> throttling). We added the same BAR0 ITR-clear the native paths use — resolving the
-> BDF from the ifname when the `af_xdp` vdev is bound to i40e — and with it the PMD
-> converges to the native AF_XDP floor. Both numbers below are with the fix.
 
 | Metric | RTT (µs) |
 |---|---|
@@ -341,16 +333,24 @@ reach the vfio PMD's floor even with the ITR cleared. The tail is well-behaved
 
 ![XXV710 DPDK-AF_XDP histogram](../test/latency_analysis/XXV710_DA2/xxv710_da2_dpdk_af_xdp_rtt_hist.png)
 
-**Stock ~51 µs → ITR-cleared 10.753 µs.** With the fix it sits **+0.22 µs over native
-AF_XDP** (10.753 vs 10.529) — the same small PMD mbuf tax seen on mlx5 (+0.38 µs),
-confirming the 51 µs was pure ITR throttling and not the PMD itself.
-
 ---
 
 ## 5. Intel I225-V (igc)
 
-### 5.1 DPDK — igc PMD (vfio-pci)
-_[24 h soak pending]_
+The consumer outlier in the lineup: a gaming-motherboard-class 2.5GBASE-T copper NIC
+(two single-port I225-V controllers, RJ45 Cat-cable loop, PCIe Gen2 ×1 each), driven by
+the igc PMD over `vfio-pci`. It produced the two most surprising findings of the
+campaign:
+
+1. **It is *faster* at 1 GbE than at its native 2.5 GbE** — the 802.3bz 2.5GBASE-T PHY
+   carries ~2.4 µs more *fixed* pipeline latency per wire traversal than plain
+   1000BASE-T (§5.2).
+2. **AF_XDP is disqualified outright** — the igc driver never services the XSK
+   zero-copy TX ring from its own NAPI path, so a one-frame-in-flight RTT deadlocks
+   after the first frame. Not slow: *unmeasurable* (§5.3).
+
+### 5.1 DPDK — igc PMD (vfio-pci), link at 1 GbE
+_[24 h soak in progress]_
 
 | Metric | RTT (µs) |
 |---|---|
@@ -366,34 +366,40 @@ _[24 h soak pending]_
 
 ![I225-V DPDK histogram](../test/latency_analysis/TBD.png)
 
-### 5.2 AF_XDP — zero-copy + busy-poll
-_[24 h soak pending]_
+### 5.2 The 2.5G paradox — why this NIC is benchmarked at 1 GbE
 
-> igc busy-poll works for throughput but stalls the one-in-flight RTT (Intel-wide
-> RX write-back starvation, same class as i40e). _Confirm latency-mode behaviour._
+Link-speed A/B, same box, same build, one frame in flight, 5-minute runs (the only
+change is the autoneg advertisement):
 
-| Metric | RTT (µs) |
-|---|---|
-| Min | _TBD_ |
-| Median | _TBD_ |
-| P99 | _TBD_ |
-| P99.9 | _TBD_ |
-| P99.99 | _TBD_ |
-| P99.999 | _TBD_ |
-| Max | _TBD_ |
-| Mean | _TBD_ |
-| Samples | _TBD_ |
+| Metric (RTT, µs) | 2.5 GbE | 1 GbE |
+|---|---:|---:|
+| Min | _re-capture pending_ | 12.630 |
+| Median | **17.108** | **13.388** |
+| P99.999 | 17.79 | 14.022 |
+| Max | 17.882 | 14.080 |
+| Mean | _re-capture pending_ | 13.427 |
+| Samples | 1.9 M | 1.65 M |
 
-![I225-V AF_XDP histogram](../test/latency_analysis/TBD.png)
+Downgrading the link cut the median by **3.72 µs** — and the total spread at 1 GbE is
+1.45 µs over 1.65 M samples with zero loss. The mechanism is the PHY itself, and Intel
+documents it in its own driver: the igc driver's PTP timestamp-correction constants
+(`igc.h`, applied per link speed in `igc_ptp.c`) state the fixed MAC+PHY pipeline
+latency of the i225:
 
----
+| Link speed | TX latency (ns) | RX latency (ns) | Per wire traversal |
+|---|---:|---:|---:|
+| 2500 | 1325 | 1485 | **2.81 µs** |
+| 1000 | 80 | 300 | **0.38 µs** |
 
-## Appendix — reproduction
+### 5.3 AF_XDP — disqualified: the driver cannot ping-pong
 
-- Toolchain / build: `diagnostic_scripts/build.sh` (x86_64 Release).
-- Run: `diagnostic_scripts/rtt_run.sh <config.toml>` per NIC/transport.
-- Plot: `python3 test/latency_analysis/plot_latency_hist.py <name>.hist.csv --title "..."`.
-- Raw data: `test/latency_analysis/*.csv` (+ `*.hist.csv`).
+igc never services the XSK zero-copy TX ring from its own NAPI path: `sendto` kicks
+are no-ops, and frames only leave when unrelated kernel traffic happens to run the TX
+queue's NAPI. A one-frame-in-flight RTT therefore deadlocks after the first hop — the
+kernel's own `xdpsock -l` freezes at rx=1/tx=1 on igc, while the identical procedure
+bounces >1 M hops on i40e and mlx5. Not slow: *unmeasurable*. This also rules out the
+DPDK-over-AF_XDP PMD here (it rides the same `igc.ko` zero-copy path). Full mechanism,
+the 3-NIC proof, and the false trails: `Known_driver_issues.md` §2.
 
 ---
 

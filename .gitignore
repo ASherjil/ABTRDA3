@@ -15,3 +15,7 @@ xdpsock.c
 
 # Latency analysis — track plots and scripts, not raw data
 test/latency_analysis/*.txt
+
+# Coding guides — working notes, kept on disk, not versioned
+docs/AF_XDP_coding_guide.md
+docs/ef_vi_coding_guide_C_++.md

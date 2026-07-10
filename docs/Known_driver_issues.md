@@ -1,15 +1,16 @@
-# AF_XDP Known Driver Issues
+# Known Driver Issues (AF_XDP & DPDK PMDs)
 
-Driver-level problems found while building ultra-low-latency AF_XDP-ZC transports on
-the `rtserver` test bench (kernel `7.0.7-hz100`). Each issue is stated as
-**symptom → mechanism → evidence → fix/status**. The recurring theme: AF_XDP keeps
-the in-tree kernel driver in the datapath, so its latency and reliability are
-inherited from each driver's NAPI / zero-copy maturity (i40e < mlx5 sound; igc
-buggy). Every anomaly below was localised against **xdpsock** (the kernel's own
-reference AF_XDP app) — if xdpsock fails too, the fault is in the driver, not our code.
+Driver-level problems found while building ultra-low-latency transports on the
+`rtserver` test bench (kernel `7.0.7-hz100`). Each issue is stated as
+**symptom → mechanism → evidence → fix/status**. The recurring theme for AF_XDP: it
+keeps the in-tree kernel driver in the datapath, so its latency and reliability are
+inherited from each driver's NAPI / zero-copy maturity (i40e, mlx5 sound; igc
+broken). Every AF_XDP anomaly below was localised against **xdpsock** (the kernel's
+own reference AF_XDP app) — if xdpsock fails too, the fault is in the driver, not our
+code.
 
-NICs covered: Intel XXV710 (i40e), Intel I225-V (igc). ConnectX-4 Lx (mlx5) — §3, which
-is **DPDK PMD** (not AF_XDP) latency findings from the single-frame campaign.
+Coverage: §1 i40e AF_XDP, §2 igc AF_XDP (the disqualification), §3 igc **DPDK PMD**
+quirks.
 
 ---
 
@@ -121,56 +122,79 @@ longer a blocker on this kernel. Noted for completeness only.
 
 ---
 
-## 2. Intel I225-V — `igc` (netdevs `enp6s0` / `enp7s0`)
+## 2. Intel I225-V — `igc` (netdevs `enp5s0` / `enp6s0`)
 
-igc's zero-copy support is newer and noticeably less robust than i40e's. On igc the
-**TX** side is the fragile one, and the driver breaks *readily* under xdpsock — the
-opposite asymmetry from i40e, and the clearest sign the faults are driver-level.
+**Final verdict (2026-07-10, after a multi-day investigation):** the igc driver has
+**no self-service pump for the XSK zero-copy TX ring**. Everything below — the
+"wedges", the "modprobe fixes", the works-then-doesn't behaviour — turned out to be
+one root cause wearing different disguises. AF_XDP on igc is disqualified for
+one-frame-in-flight latency measurement; the NIC is DPDK-only in this campaign.
 
-### 2.1 Zero-copy TX engine wedges under XDP attach/detach churn
+### 2.1 Root cause: ZC TX is only serviced from a NAPI path that nothing drives
 
-**Symptom.** After repeated XDP attach/detach cycles and/or runs killed mid-TX, the
-igc ZC TX engine hangs: `tx` count freezes at **exactly the TX ring depth (2048)**,
-**zero completions** ever return, and the app spins **millions of futile `sendto`
-kicks/sec** (`tx wakeup sendtos` in the millions). The ring fills, `outstanding_tx`
-never drops, no slot frees, and it spins forever.
+In the igc source, `igc_xdp_xmit_zc()` — the only function that moves XSK TX
+descriptors to the hardware ring — is invoked *exclusively* from `igc_clean_tx_irq()`,
+i.e. from the **TX queue-vector's interrupt/NAPI handler**. The `need_wakeup` flag is
+likewise only ever set inside that same handler. Two facts make this fatal:
 
-**Evidence it's the driver, not us.** **xdpsock hangs identically** — same freeze at
-2048, same kick storm, RX side sees nothing. The kernel's reference app cannot get a
-frame onto the wire, so the fault is below userspace.
+- With `combined=1` (mandatory for xdpsock-style single-queue tests) the i225 runs
+  **unpaired** `rx-0` / `tx-0` MSI-X vectors — `igc_set_flag_queue_pairs()` only pairs
+  RX and TX onto one vector when more than half the max queues (4) are in use.
+  i40e, by contrast, always uses paired `TxRx` vectors: its RX poll services TX
+  completions in the same NAPI pass, which is why i40e honours the AF_XDP contract.
+- Both busy-polling and `sendto()` kicks drive the **RX** NAPI only. On igc a kick
+  returns having done nothing; `need_wakeup` on/off is behaviourally identical
+  (verified: unconditional-kick builds change nothing).
 
-**Fix.** Full driver reset (re-inits rings + DMA on both ports; `ip link down/up`
-alone does **not** clear it):
+So a userspace ZC application **cannot cause its own TX descriptors to be
+transmitted**. Frames leave only when *unrelated kernel traffic* (IPv6 housekeeping,
+ARP, anything addressed to the port) runs the TX vector's NAPI — a **donor pump**.
+Streaming tests mask this (interrupts are always in flight); a ping-pong exposes it:
+after the first hop there is no donor, and the exchange deadlocks. The kernel's own
+`xdpsock -l` (l2fwd) cannot ping-pong on igc — in zero-copy mode it deliberately
+issues no kicks (the source comments "Tx is driven by the NAPI loop"; the kick is
+gated on `XDP_COPY`).
 
-```
-sudo pkill -9 xdpsock; sudo pkill -9 abtrda3_test
-sudo ip link set dev enp6s0 xdp off; sudo ip link set dev enp7s0 xdp off
-sudo modprobe -r igc && sudo modprobe igc
-```
+**The controlled proof (3-NIC manual A/B, chatter deliberately left ON):** l2fwd
+reflectors on both ports of each NIC, one seeded frame injected. mlx5: bounces
+indefinitely. i40e: **1,035,345 hops/side** (≈12.3 µs/RTT). igc: **freezes at
+rx=1 / tx=1** — while a unidirectional xdpsock Tx→Rx on the very same ports ran fine
+*simultaneously* (RX path healthy; TX pump absent). Same binaries, same procedure,
+one variable: the driver.
 
-**Rule.** Any data collected while the NIC is wedging is **void**. Re-baseline after a
-reset with `xdpsock` TX 100 k → `ethtool -S enp7s0 | grep rx_packets:` before trusting
-any TX result.
+### 2.2 The false trails this produced (kept as a methodology warning)
 
-### 2.2 Zero-copy datapath fragility (the i40e contrast)
+Before the root cause was isolated, the symptom set supported several wrong theories,
+each briefly convincing:
 
-**Observation.** On i40e, reproducing an AF_XDP anomaly in xdpsock took deliberate
-effort (strip the incidental scheduling gap, §1.2) and even then it was a *scheduling*
-interaction, not a datapath defect — the driver was sound. On igc, xdpsock breaks with
-**no special effort** (TX wedge, delivery loss). This qualitative asymmetry localises
-the igc faults in the i225 ZC datapath itself.
+- **"ZC TX engine wedges under XDP attach/detach churn."** The freeze at exactly ring
+  depth (2048), zero completions, and millions of futile `sendto` kicks/sec looked
+  like a wedged DMA engine. It is simply the unserviced ring filling up.
+- **"`modprobe -r igc && modprobe igc` fixes it."** The reload never repaired
+  anything — it **restored the donor**: a fresh driver bind brings the ports up,
+  IPv6/DAD/MLD chatter fires, and that traffic services the TX queue for a while.
+- **"Control-plane ops (addr flush, flag changes) wedge TX."** They *silence the
+  donor* (a port with no addresses generates no kernel traffic), which kills ZC TX at
+  the next quiet moment. i40e survives identical ops because it never needed a donor.
+- **"It works when I test it, fails in the app."** Tests run right after
+  setup — while link-up chatter is still flowing. The app runs on a quiesced port.
 
-**Implication.** igc/i225 AF_XDP-ZC is **not** a publication-grade low-latency
-transport without driver-side workarounds. The driver-quirk-immune path for igc is a
-**native DPDK PMD over vfio-pci** (`net_igc`), which takes the kernel driver out of the
-loop entirely. (Note: a `net_af_xdp` DPDK vdev does **not** count — it rides the same
-`igc.ko` ZC path and shares these quirks.)
+**Rule that survives:** on igc, any ZC TX result is only valid if you can account for
+*what serviced the TX queue*. Cross-check `ethtool -S` on **both** ports against the
+app's own counters; igc's `imissed`/MPC is never populated and hides drops.
+
+**Implication.** igc/i225 AF_XDP-ZC is not a measurable low-latency transport, with
+or without workarounds — the defect is architectural in the driver's NAPI wiring, not
+a tuning issue. The driver-quirk-immune path for igc is a **native DPDK PMD over
+vfio-pci** (`net_igc`), which takes `igc.ko` out of the loop entirely. (A `net_af_xdp`
+DPDK vdev does **not** count — it rides the same `igc.ko` ZC path.) An upstream
+report to intel-wired-lan is planned.
 
 ### 2.3 Link/PHY warmup loss on cold bursts
 
 **Symptom.** At the *front* of a transmit burst, the first frames are lost.
 
-**Evidence.** Healthy NIC, `xdpsock` TX 100 k `enp6s0` → `enp7s0` hardware
+**Evidence.** Healthy NIC, `xdpsock` TX 100 k `enp5s0` → `enp6s0` hardware
 `rx_packets` delta = **99 767** (≈233 lost); a separate clean run lost 218. The loss
 is at the front (xdpsock drains its tail), ~220–230 frames at ~3 M pps ≈ **~75 µs** —
 consistent with i225 PHY/LPI wake latency after idle.
@@ -190,69 +214,56 @@ the ring. xdpsock avoids this with `complete_tx_only_all()` (loop kick+reap unti
 `outstanding_tx == 0`); DPDK does an equivalent drain on port-stop.
 
 **Driver interaction.** i40e completes promptly enough that a one-shot path tolerated
-the missing drain; igc's later completion makes it fatal for small bursts. The correct
-idiom on *any* driver is to **drive the doorbell yourself and drain until
-`outstanding_tx == 0` before teardown** — teardown-only, zero hot-path cost, and
-irrelevant to RTT (where the RX busy-poll drives the same NAPI).
+the missing drain; on igc completion waits for the donor pump (§2.1), so an undrained
+teardown is near-guaranteed to strand frames. The correct idiom on *any* driver is to
+**drive the doorbell yourself and drain until `outstanding_tx == 0` before teardown**
+— teardown-only, zero hot-path cost. (On i40e the RX busy-poll drives the same paired
+NAPI, so RTT is unaffected; on igc nothing drives it — see §2.1.)
 
 ---
 
-## 3. ConnectX-4 Lx — DPDK `mlx5` PMD (netdevs `cx0` / `cx1`)
+## 3. Intel I225-V — DPDK `igc` PMD quirks
 
-Not AF_XDP — these are **native DPDK mlx5 PMD** (bifurcated, no vfio) latency traps found
-with the single-frame SingleRecorder (Tx core 2, Rx core 3, **one packet per `tx_burst`**).
-All are **CX4 Lx specific** (no eMPW, forced inline; CX5+ default inline-0 and would differ).
-**Headline: raw verbs beats the DPDK PMD on the same silicon — the gap is PMD software,
-not the NIC.** Probe knobs below live in the working tree (to be git-restored); the
-production sub-2 µs answer on mlx5 is **verbs**.
+Not defects on the scale of §2 — the igc PMD is sound and is the transport we publish
+for this NIC — but three behaviours cost real debugging time and one of them silently
+voids results.
 
-### 3.1 Flat-out single-frame TX balloons to ~148 µs — full-inline deep-buffering
-**Symptom.** Flat-out (`send_interval_us=0`) → median **148 µs** (min 142 µs — every frame
-parked behind a deep queue), 0 loss. Paced (1 Mpps) → **1.73 µs**.
-**Mechanism.** With full inline (`txqs_min_inline=0`, the reuse-path default) the PMD copies
-all 64 B into the WQE; mlx5 accepts these into a deep internal TX FIFO faster than it
-egresses (doorbell-bound ~6 Mpps) → ~900 in flight. HW-timestamps put RX-side at only 1.3 µs,
-so the 148 µs is **TX-side**. Ruled out by controlled test: completion coalescing
-(`MLX5_TX_COMP_THRESH=1` rebuild → no change), our reuse code (fresh-mbuf → same 148 µs),
-MPW (`txq_mpw_en=1` engaged "Legacy MPW", no change — can't pack at `tx_burst(...,1)`).
-**Fix.** Minimal inline — devarg **`txq_inline_max=18`** (CX4-forced 18 B header inlined,
-**DMA the body**) + fresh-mbuf (DMA needs a stable buffer): median **148 → ~4 µs**. The DMA
-read acts as a natural throttle that keeps the TX pipeline shallow.
+### 3.1 `dev_configure(nb_txq=0)` silently breaks RX
 
-### 3.2 It's the PMD, not the NIC (verbs proves it)
-Same NIC, same flat-out single-frame: **verbs (raw RAW_PACKET QP) = 8.17 Mpps / 1.29 µs,
-shallow SQ**; DPDK PMD = 6.2 Mpps / deep / 148 µs. The silicon drains single-frame fine;
-the PMD TX path is the cost (`perf -C2`: 79 % in `mlx5_tx_burst_i` + `mlx5_tx_handle_completion`).
-Parallels raw-AF_XDP beating DPDK's af_xdp PMD — raw datapaths beat the general PMD for ULL.
+**Symptom.** An RX-only port (our SingleRecorder receiver) configures cleanly and
+starts, the NIC receives every frame (`ipackets` climbs), but `rte_eth_rx_burst()`
+returns 0 forever — and `imissed` stays 0.
+**Mechanism.** Unlike mlx5/i40e, the igc PMD does not tolerate an asymmetric
+queue count: configuring 0 TX queues succeeds but leaves RX descriptor write-back
+dead.
+**Fix.** Always configure ≥1 queue in *both* directions on igc, even for
+unidirectional roles (`bothQueues` in `DPDK.hpp`).
 
-### 3.3 mempool MC-ring lock — Tx/Rx threads aren't EAL lcores
-**Symptom.** `perf -C2`: **48 % in `common_ring_mc_dequeue`** (`lock cmpxchg`) — heavy locking
-where a single-producer path should have none.
-**Mechanism.** Our Tx/Rx are `std::thread`s on isolated cores, **not registered EAL lcores**
-→ `rte_lcore_id()` invalid → the per-lcore mempool **cache is bypassed** → every alloc/free
-hits the shared MC ring atomically.
-**Fix.** `rte_thread_register()` once per hot-path thread → cache on, lock gone, LIFO keeps
-buffers hot. **CAVEAT (latency vs throughput):** removing the lock sped TX 6.2 → 7.62 Mpps,
-which *deepened* the pipeline → median went **up** 4.0 → 4.7 µs. The lock was an accidental
-throttle; for latency you want **bounded in-flight**, not maximised CPU.
+### 3.2 RX `WTHRESH=0` stops descriptor write-back entirely — and `imissed` lies
 
-### 3.4 RX cold-read stall + RX-ring overrun
-- **Cold-read:** RxThread reads each just-DMA'd packet cold → `perf -C3` IPC 0.8, L1-miss
-  6.3 %, 68 % in our RxThread. **Fix:** `rte_prefetch0` the next packet's header in
-  `tryReceive` → IPC 0.8 → **1.9**, L1-miss → 2.4 %.
-- **Overrun:** once RX is fast, the default 256-deep RX ring overruns on flat-out bursts
-  (`rx_out_of_buffer`). **Fix:** deepen `NbRxDesc` 256 → 4096 (+ `NumMbufs`) — absorbs bursts,
-  0 loss, latency-neutral (same idea as the verbs `RqDepth` 256 → 8192 fix).
+**Symptom.** Setting `rxconf.rx_thresh.wthresh = 0` (attempting immediate
+per-descriptor write-back, a valid idiom on other Intel parts): TX port
+`opackets=300000`, RX port `ipackets=300000`, app `recorded=0`, `imissed=0`.
+**Mechanism.** On i225 the write-back threshold must be non-zero; with 0 the
+write-back engine has no trigger and never posts a DD bit. The PMD's `imissed` is
+never populated (the MPC counter isn't wired up), so the loss is invisible to the
+standard stats.
+**Rule.** Keep the PMD default (4) — a full audit showed it costs nothing at one
+frame in flight because EITR sits at its post-reset default of 0 (no moderation
+timer delaying partial write-back flushes). And on igc, never trust `imissed`:
+cross-check `opackets` (TX port) vs `ipackets` (RX port) vs the app's own count.
 
-### 3.5 Floor reached, and what's fundamental
-TX software cost is negligible — `acquire` avg **82 ns**, `commit` avg **25 ns** (timed with
-`rte_rdtsc`); so the median is the **min-inline DMA pipeline, which is rate-bound** (lower
-offered rate → fewer DMA reads in flight → lower latency; the lock/timing throttle to
-~5 Mpps is *why* median fell to 3.7 µs). Tail (P99.999 ~9.8 µs, Max ~236 µs) is RX-burst +
-a ~1-in-10⁹ stray stall — **NOT SMIs** (`perf -e msr/smi/` = **0** under load; the custom
-kernel has no `msr` module / `turbostat`, but the perf MSR PMU works). Progression:
-**148 → 5.2 → 4.7 → 3.7 µs** flat-out via min-inline + thread-register + RX-prefetch +
-deep RX ring. Reaching verbs' ~1.7 µs *at flat-out* requires **bounding the in-flight window**
-(cap outstanding ~8 → trades throughput); verbs needs no such trade because it inlines (no
-per-packet DMA pipeline). **Ladder: verbs 1.29 µs < DPDK paced 2.24 µs < raw AF_XDP 3.32 µs <
-DPDK flat-out 3.7 µs.**
+### 3.3 Nothing else to tune — the audit trail
+
+A register-level audit of the PMD (DPDK 25.11) and the kernel driver, done before
+committing to the 24 h soak, so nobody repeats it: EITR is never written by the PMD
+and the init-time `CTRL.RST` returns it to 0 (moderation off — optimal); EEE/LPI is
+actively disabled by the PMD's own base init (and i225 has no 802.3az support anyway
+— that's i226-only); DMA coalescing is never enabled; the TX doorbell is written
+immediately per burst with RS on every descriptor; flow control defaults to
+`fc_full` (pause advertised — harmless at one frame in flight); PCIe ASPM was
+verified disabled on both ports. The igc PMD has **no devargs at all**. The only
+latency lever that exists is the link speed (Benchmarks.md §5.2): the 2.5GBASE-T PHY
+carries ~2.4 µs/traversal more fixed pipeline latency than 1000BASE-T, so the
+campaign runs this NIC at 1 GbE via autoneg-advertisement restriction
+(`IGC_ADVERTISE_1G_ONLY` in `DPDK.hpp`; the PMD rejects forced speed).

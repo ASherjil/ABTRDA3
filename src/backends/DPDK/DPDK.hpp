@@ -278,6 +278,13 @@ class DPDK {
 
   static constexpr bool          HAS_RX          = (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
   static constexpr bool          HAS_TX          = (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
+  // igc runs at 1 GbE: the 2.5GBASE-T PHY carries ~2.4 µs/traversal of fixed pipeline
+  // latency (measured A/B: 17.108 -> 13.388 µs RTT). The PMD rejects forced speed, so
+  // this restricts the autoneg advertisement instead. See docs/Benchmarks.md §5.2.
+  static constexpr bool          IGC_ADVERTISE_1G_ONLY = true;
+  // igc RX write-back threshold, A/B use only: 0 = keep the PMD default (4, optimal).
+  // Never write hardware 0 — that kills write-back (docs/Known_driver_issues.md §3.2).
+  static constexpr std::uint8_t  IGC_RX_WTHRESH  = 0;
   static constexpr std::uint32_t MBUF_CACHE      = 250;
   static constexpr std::uint32_t INLINE_SAFE_LEN = 128;
   static constexpr std::uint16_t REFCNT_LOW      = 0x2000;
@@ -481,15 +488,24 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
   conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
   if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+  if constexpr (IGC_ADVERTISE_1G_ONLY) {
+    if (m_driver == "igc") {
+      conf.link_speeds = RTE_ETH_LINK_SPEED_1G;
+      std::fprintf(stderr, "[DPDK] %s: igc advertising 1G ONLY (2.5G PHY-pipeline A/B)\n",
+                   m_ifname.c_str());
+    }
+  }
 
-  // The net_af_xdp PMD requires nb_rx_queues == nb_tx_queues (it pairs an XSK
-  // rx+tx per queue). Our single-recorder uses asymmetric TxOnly/RxOnly ports,
-  // which mlx5/i40e accept but af_xdp rejects with -EINVAL. So in af_xdp mode
-  // configure BOTH directions (1 each) regardless of mode — the unused side is
-  // set up only to satisfy the pairing; the hot path still drives one direction.
-  const bool afxdp = (m_driver.find("af_xdp") != std::string::npos);
-  const std::uint16_t nb_rxq = (HAS_RX || afxdp) ? 1 : 0;
-  const std::uint16_t nb_txq = (HAS_TX || afxdp) ? 1 : 0;
+  // net_af_xdp requires nb_rx_queues == nb_tx_queues (it pairs an XSK rx+tx per
+  // queue), and igc silently breaks RX when configured with nb_txq=0
+  // (docs/Known_driver_issues.md §3.1). On both, configure one queue in each
+  // direction regardless of mode — the unused side only satisfies the driver; the
+  // hot path still drives one direction. m_pool is created unconditionally above,
+  // so a TxOnly port always has a pool for its unused RX queue.
+  const bool afxdp     = (m_driver.find("af_xdp") != std::string::npos);
+  const bool bothQueues = afxdp || (m_driver == "igc");
+  const std::uint16_t nb_rxq = (HAS_RX || bothQueues) ? 1 : 0;
+  const std::uint16_t nb_txq = (HAS_TX || bothQueues) ? 1 : 0;
   if (rte_eth_dev_configure(m_port, nb_rxq, nb_txq, &conf) != 0) {
     std::fprintf(stderr, "[DPDK] dev_configure failed (port %u)\n", m_port);
     return false;
@@ -501,15 +517,25 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
     return false;
   }
 
-  if (HAS_RX || afxdp) {
+  if (HAS_RX || bothQueues) {
     rte_eth_rxconf rxconf = info.default_rxconf;
     rxconf.offloads = conf.rxmode.offloads;
+    // igc: never set rx_thresh.wthresh = 0 — descriptor write-back stops entirely
+    // and imissed hides the loss (docs/Known_driver_issues.md §3.2). The PMD
+    // default (4) is optimal; the override below exists for A/B falsification only.
+    if constexpr (IGC_RX_WTHRESH != 0) {
+      if (m_driver == "igc") {
+        rxconf.rx_thresh.wthresh = IGC_RX_WTHRESH;
+        std::fprintf(stderr, "[DPDK] %s: igc RX WTHRESH override -> %u\n",
+                     m_ifname.c_str(), unsigned{IGC_RX_WTHRESH});
+      }
+    }
     if (rte_eth_rx_queue_setup(m_port, QueueId, nb_rxd, sid, &rxconf, m_pool) < 0) {
       std::fprintf(stderr, "[DPDK] rx_queue_setup failed\n");
       return false;
     }
   }
-  if (HAS_TX || afxdp) {
+  if (HAS_TX || bothQueues) {
     rte_eth_txconf txconf = info.default_txconf;
     txconf.offloads = conf.txmode.offloads;
     if (rte_eth_tx_queue_setup(m_port, QueueId, nb_txd, sid, &txconf) < 0) {
@@ -547,6 +573,27 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
     } else {
       std::fprintf(stderr, "[DPDK] %s: WARN: %s mmap failed — ITR not cleared, "
                            "expect ~30us median RTT\n", m_ifname.c_str(), resPath.c_str());
+    }
+  }
+
+  // EEE/LPI belt-and-braces (igc only): clear E1000_EEER (0x0E30) LPI-enable bits via
+  // BAR0 mmap. The later PMD audit showed this is REDUNDANT — the igc PMD's base init
+  // already disables EEE, and i225 has no 802.3az support anyway (Known_driver_issues.md
+  // §3.3). Kept because the published soak binaries ran with it; it verifiably no-ops
+  // (always logs EEER 0x00000000 -> 0x00000000).
+  if (m_driver == "igc" && !m_pci.empty()) {
+    const std::size_t bar0Size = pci::barSize(m_pci, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + m_pci + "/resource0";
+    BackendBase bar0;
+    if (bar0Size >= 0x00000E34 && bar0.open(resPath.c_str(), 0, bar0Size)) {
+      auto* eeer = bar0.registerPtr<std::uint32_t>(0x00000E30);
+      const std::uint32_t before = *eeer;
+      *eeer = before & ~0x00030000u;   // clear TX_LPI_EN(0x10000) | RX_LPI_EN(0x20000)
+      std::fprintf(stderr, "[DPDK] %s: igc EEE/LPI disabled (EEER 0x%08x -> 0x%08x)\n",
+                   m_ifname.c_str(), before, *eeer);
+    } else {
+      std::fprintf(stderr, "[DPDK] %s: WARN: igc EEER mmap failed — EEE left enabled\n",
+                   m_ifname.c_str());
     }
   }
 
