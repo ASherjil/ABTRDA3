@@ -180,4 +180,76 @@ inline bool reportItr(std::string_view ifname, const char* tag) {
   return rxThrottleOff;
 }
 
+// ── Driver-specific BAR0 fixes (applied by the DISPATCH layer) ───────────────
+//
+// The DPDK transport is PMD-agnostic — every driver-specific register poke lives
+// here, and TransportDispatch (which knows the TOML driver name) applies it
+// AFTER the port is started (a device reset during start would wipe the write).
+// The BDF must be resolved from the port name BEFORE a vfio unbind removes the
+// netdev (renamed interfaces like "xxv0" cannot be re-derived afterwards).
+// All best-effort: log + return false, never abort.
+
+// i40e: zero the per-vector Interrupt Throttle Rate. The XXV710 silicon honors
+// ITR even in pure polling mode — it gates when completed RX descriptors are
+// written back to host RAM. DPDK 25.11 leaves the firmware default and exposes
+// NO public API to change it (no devarg, nothing in rte_pmd_i40e.h). Proof it is
+// the lever (2026-05-26, packet_mmap A/B with ethtool -C): rx-usecs 50 -> median
+// 49.81us; rx-usecs 0 -> 11.88us. Under the DPDK PMD, queue 0 rides the "zero"
+// vector -> ITR0(0); on the kernel path (DPDK-over-AF_XDP) it is ITRN(0,0). Both
+// are written — harmless — and both are read back to verify (the kernel path's
+// adaptive ITR could re-arm). Without this the i40e RTT is ~5x slower
+// (ITR-gated ~50us vs ~10us).
+inline bool i40eClearItr(const std::string& bdf, std::string_view ifname) noexcept {
+  if (bdf.empty()) {
+    fmt::print(stderr, "[PCI] {}: no BDF — i40e ITR not cleared, expect ~30us+ median RTT\n",
+               ifname);
+    return false;
+  }
+  const std::size_t bar0Size = barSize(bdf, 0);
+  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+  BackendBase bar0;
+  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — i40e ITR not cleared, "
+                       "expect ~30us+ median RTT\n", ifname, bdf);
+    return false;
+  }
+  *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0)   = 0;
+  *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0) = 0;
+  const std::uint32_t itr0 = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
+  const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
+  const bool off = ((itr0 | itrn) & I40E_ITR_INTERVAL_MASK) == 0;
+  fmt::print(stderr, "[PCI] {} ({}): i40e ITR cleared (ITR0=0x{:08x} ITRN=0x{:08x}) "
+                     "=> RX write-back {}\n",
+             ifname, bdf, itr0, itrn, off ? "UNTHROTTLED" : "STILL THROTTLED!");
+  return off;
+}
+
+// igc (i225): clear the EEE/LPI enable bits in EEER (0x0E30). VERIFIED REDUNDANT
+// (2026-07-10): the igc PMD's base init already disables EEE, and the i225 has no
+// 802.3az support at all (i226-only) — this always logs 0x0 -> 0x0. Kept as
+// belt-and-braces for parity with the published soak binaries; see
+// docs/Known_driver_issues.md §3.3.
+inline bool igcDisableEee(const std::string& bdf, std::string_view ifname) noexcept {
+  constexpr std::size_t   kEeer      = 0x00000E30;
+  constexpr std::uint32_t kLpiEnable = 0x00030000;   // TX_LPI_EN | RX_LPI_EN
+  if (bdf.empty()) {
+    fmt::print(stderr, "[PCI] {}: no BDF — igc EEE left as-is\n", ifname);
+    return false;
+  }
+  const std::size_t bar0Size = barSize(bdf, 0);
+  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+  BackendBase bar0;
+  if (bar0Size < kEeer + 4 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — igc EEE left as-is\n",
+               ifname, bdf);
+    return false;
+  }
+  auto* eeer = bar0.registerPtr<std::uint32_t>(kEeer);
+  const std::uint32_t before = *eeer;
+  *eeer = before & ~kLpiEnable;
+  fmt::print(stderr, "[PCI] {} ({}): igc EEE/LPI disabled (EEER 0x{:08x} -> 0x{:08x})\n",
+             ifname, bdf, before, *eeer);
+  return true;
+}
+
 }  // namespace pci

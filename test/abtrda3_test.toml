@@ -25,10 +25,13 @@ output           = "single_latency.csv"  # SingleRecorder writes <output> + <out
 [client]
 transport    = "af_xdp"
 interface    = "xxv0"                 # XXV710 port 0, i40e, PCI 02:00.0
-driver       = ""                     # DPDK only: kernel driver to unbind for vfio (i40e/igc); "" otherwise
+driver       = ""                     # DPDK only: the port's kernel driver name (i40e/igc/mlx5_core); "" otherwise
 mac          = "40:a6:b7:02:b3:10"
 cpu_core     = 3                      # RTT --client hot (ping-pong) core; --single uses [single_recorder] cores
 xdp_queue_id = 0
+# DPDK binding model — EXPLICIT, mutually exclusive, both false = vfio-pci pass-through:
+dpdk_bifurcated = false               # keep the kernel driver (mlx5-class); no vfio unbind
+dpdk_afxdp_pmd  = false               # DPDK-over-AF_XDP via the net_af_xdp vdev
 count         = 1000                  # --txgen burst length (overridable with --count); --client is time-based
 duration_sec  = 60                    # --client RTT run length: 60 = smoke, 86400 = 24 h soak (+ ~warmup margin)
 recorder_core = 4                     # --client histogram thread core; MUST differ from cpu_core
@@ -41,6 +44,8 @@ driver       = ""
 mac          = "40:a6:b7:02:b3:11"
 cpu_core     = 2
 xdp_queue_id = 0
+dpdk_bifurcated = false               # see [client] — same two DPDK binding-model flags
+dpdk_afxdp_pmd  = false
 
 # ── SingleRecorder (--single) ───────────────────────────────────────────────
 # Three DISTINCT isolated cores (rtserver: isolcpus=2-4). Run is time-bounded:
@@ -75,7 +80,9 @@ block_number = 512
 #
 # Transport notes:
 #   af_xdp  — Intel (i40e/igc) + mlx5. i40e busy-poll needs the patched driver.
-#   dpdk    — set driver = "i40e" | "igc" (vfio unbind) | "mlx5_core" (bifurcated, no vfio).
+#   dpdk    — driver = kernel driver name; binding model is EXPLICIT per role:
+#             default = vfio unbind (i40e/igc), dpdk_bifurcated = true (mlx5, no
+#             vfio), dpdk_afxdp_pmd = true (DPDK-over-AF_XDP vdev).
 #   verbs   — mlx5 only (cx0/cx1); Intel NICs have no verbs provider.
 #
 # Cores: rtserver isolcpus=2-4, nohz_full=2-4, rcu_nocbs=2-4, irqaffinity=0,1.

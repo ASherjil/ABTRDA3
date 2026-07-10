@@ -50,123 +50,11 @@
 #define SOL_XDP 283
 #endif
 
-// =============================================================================
-// AFXDP — unified xdpsock-derived AF_XDP transport.
-//
-// One class template owns the whole stack: UMEM mmap, FILL/COMP/RX/TX rings,
-// the XDP program, the socket, AND the hot-path TX/RX. Cheap constructor stores
-// config; init() does the cold bring-up and returns bool; shutdown() (dtor and
-// move-assign) tears down. Satisfies the TxRing/RxRing concepts (tryReceive/
-// release + acquire/commit/send/prefillRing). The ring/UMEM state lives in the
-// SAME two structs xdpsock.c uses (xsk_umem_info / xsk_socket_info) so the hot
-// path reads 1:1 with the example. Everything latency-relevant is a
-// compile-time constant: FrameSize -> shift, TX-pool wrap -> mask (no
-// division), NeedWakeup -> kickTx() branches compiled out.
-//
-// UMEM PARTITION: TX owns frames [0 .. NumTxFrames), RX/FILL owns the rest.
-// The pools are DISJOINT — our API copies into a dedicated TX frame (unlike
-// xdpsock l2fwd's in-place reflect), so a TX frame is never an RX/FILL frame.
-// Completed TX frames return implicitly as m_txFrameNb wraps (xdpsock txonly
-// model); reapTx() must NOT donate them to FILL (that would merge the pools).
-// prefillRing() stamps the TX pool only — RX frames are kernel-owned (in FILL)
-// and touching them would race inbound DMA. FILL carries xdpsock's 2x headroom.
-//
-// INIT ORDER (each step earned the hard way):
-//   0. RLIMIT_MEMLOCK -> infinity (xdpsock main()'s first step; UMEM pins pages
-//      against it). Best-effort on modern memcg-accounted kernels.
-//   1. Detach stale XDP programs from previous runs.
-//   1.5 steerAllTrafficToQueue() — collapse the NIC to ONE combined channel so
-//      all RX lands on queue 0 (== `ethtool -L <if> combined 1`). MUST run
-//      BEFORE the XDP attach and the socket bind: changing the channel count is
-//      a NIC queue reprogram (PF reset on i40e, link down ~2.5-3s) that would
-//      tear down a live ZC bind, re-arm the HW RX ring from a drained FILL, and
-//      can drop the attached program. If already combined=1 it is NOT re-set
-//      (re-applying an unchanged value still bounces the link). After a real
-//      change, waitForCarrier() blocks until the link returns.
-//   2. Load + attach our redirect-all BPF (af_xdp_kern.o), RX modes only — a
-//      TxOnly socket is not in the XSKMAP and a redirect prog on a TX-only port
-//      would steal inbound frames into a dead map.
-//   3-4. UMEM mmap + xsk_umem__create (FILL/COMP rings).
-//   4.5 Pre-load FILL BEFORE the bind (CRITICAL on i40e ZC): the driver arms
-//      its HW RX ring from FILL at bind time (i40e_alloc_rx_buffers_zc); an
-//      empty FILL leaves the HW ring without DMA targets — silent drops +
-//      "Failed to allocate some buffers on AF_XDP ZC" in dmesg.
-//   5-6. Bind with the xdpsock fallback chain (ZC -> native-copy -> generic),
-//      XDP_USE_NEED_WAKEUP per the NeedWakeup template param. The bind label
-//      only reflects accepted flags — the AUTHORITATIVE zero-copy check is
-//      getsockopt(XDP_OPTIONS) afterwards (kernel reports what it granted).
-//   7. SO_PREFER_BUSY_POLL + SO_BUSY_POLL + budget, RX modes ONLY. Busy-poll is
-//      an RX mechanism (recvfrom runs the NAPI poll INLINE instead of the
-//      ksoftirqd path — ~17us vs ~96us median on igc). On a TX-only socket it
-//      is meaningless and on igc actively harmful: it makes
-//      igc_xsk_wakeup(XDP_WAKEUP_TX) a NOP when the shared queue-pair NAPI is
-//      "already running", so TX stalls after a few packets. RxTx keeps it
-//      (low-latency choice) with the always-kick mitigation below.
-//   7.5 Per-NAPI knobs via netdev-genl (SO_INCOMING_NAPI_ID is valid after
-//      bind). CRITICAL kernel fact (net/core/dev.c busy_poll_stop): NAPI
-//      deferral is only RE-ARMED if defer_hard_irqs AND gro_flush_timeout are
-//      BOTH nonzero — if both are 0, the hardware IRQ fires after each
-//      busy-poll and NAPI falls back to the softirq/IRQ path (measured: 79us
-//      on igc). Two regimes:
-//        * CLASSIC BUSY-POLL (init enableDeferral=true): small defer +
-//          small gro-flush, irq-suspend=0. Keeps busy-poll owning the NAPI
-//          WITHOUT the kernel-6.13 irq-suspend hrtimer/APIC machinery that
-//          perf showed wastes ~12% of the hot loop (native_write_msr,
-//          lapic_next_deadline, hrtimer_start) on this always-hot
-//          one-in-flight workload.
-//        * IRQ-SUSPEND (init enableIrqSuspend=true, kernel 6.13+): adds
-//          irq-suspend-timeout — good for bursty/idle-cycling server loads,
-//          not a saturated ping-pong.
-//   8. Insert the socket fd into the XSKMAP (key = queue id, matching
-//      rx_queue_index), RX modes with our custom BPF only.
-//   EVERY applied mode is READ BACK like a register write (XDP_OPTIONS,
-//   bpf_xdp_query, XDP_MMAP_OFFSETS, getsockopt busy-poll trio, NAPI_GET) —
-//   the bind ladder keeps the transport generic, the readback prints what the
-//   kernel ACTUALLY granted ("kernel confirms:" lines; grep before a soak).
-//
-// RX HOT PATH: peek EXACTLY one descriptor (peeking more than release() frees
-// would desync cached_cons and silently drop frames 2..N). On an empty peek
-// with NeedWakeup, recvfrom() drives the NAPI poll inline and then RE-PEEKS so
-// a frame the poll just delivered is returned in THIS call — A/B-proven tail
-// win on igc (skipping the re-peek worsened P99.99 25->48us, P99.999 40->94us,
-// Max ~4x). release() returns the buffer to FILL BEFORE releasing the RX slot
-// (xdpsock rx_drop order); on the rare FILL-full it kicks and retries, and
-// always frees the RX slot (never leaks it).
-//
-// TX KICK POLICY (kickTx — one sendto -> ndo_xsk_wakeup(TX)):
-//   * RxTx: kick UNCONDITIONALLY. After a busy-poll recvfrom() the TX
-//     needs_wakeup flag reads CLEAR, so a gated kick is skipped and the
-//     just-submitted descriptor is NEVER transmitted (the recvfrom-driven NAPI
-//     services RX but does not pull the ZC TX ring on igc/i40e). Proven by
-//     cross-transport A/B: AF_XDP client/server TX delivered 0 packets while a
-//     packet_mmap peer delivered fine.
-//   * TxOnly on igc/i40e: needs_wakeup-GATED kick (xdpsock-faithful) — verified
-//     clean on igc (separate Tx/Rx ports = separate NAPIs; same latency, fewer
-//     syscalls).
-//   * TxOnly on mlx5 (m_txKickAlways, set by an init() driver sniff): kick
-//     UNCONDITIONALLY. mlx5's flag dynamics differ: ~100 rounds in (when its
-//     NAPI busy window first expires) the gated kick races the NAPI-idle
-//     transition — the submit lands after the driver's final ring check but
-//     the flag read still said "no kick needed" -> that descriptor is never
-//     transmitted -> permanent hang. Proven 2026-06-10 on ConnectX-4 Lx: two
-//     runs froze at ~85/~103 rounds with tx_xsk_xmit == tx_xsk_cqes ==
-//     app-posted-minus-one; always-kick fixed it outright.
-//   XDP_USE_NEED_WAKEUP stays set at bind regardless (required on i40e ZC —
-//   NeedWakeup=false hangs the kernel there); the policy chooses when to USE
-//   the hint, not whether it exists.
-//
-// TEARDOWN: shutdown() first dumps the kernel's cumulative XDP_STATISTICS —
-// rx_fill_empty > 0 means the driver ran out of FILL buffers (the i40e ZC
-// "Failed to allocate" symptom); rx_ring_full means userspace didn't drain;
-// tx_ring_empty means a kick found nothing queued. Then socket -> umem ->
-// munmap -> program detach.
-//
-// MOVE SEMANTICS: the ring structs hold pointers into the transferred mmap'd
-// ring memory, so copying them by value keeps them valid; the source's owning
-// handles are nulled so its shutdown() is a no-op.
-// =============================================================================
-
-enum class AFXDPMode : std::uint8_t { RxOnly, TxOnly, RxTx };
+enum class AFXDPMode : std::uint8_t {
+  RxOnly,
+  TxOnly,
+  RxTx
+};
 
 struct xsk_umem_info {
   xsk_ring_prod fq{};
@@ -214,8 +102,10 @@ class AFXDP {
   // NAPI deferral / irq-suspend VALUES. WHICH of them is applied is chosen at
   // runtime by init(enableDeferral, enableIrqSuspend) -> resolved into
   // m_napiDefer/m_napiGro/m_napiSusp (both flags off => all 0 = deferral OFF).
-  static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = 2;
-  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = 200'000;
+  // defer/gro are the canonical shared values (napi::) so the DPDK net_af_xdp
+  // path applies the identical regime.
+  static constexpr std::uint32_t NAPI_DEFER_HARD_IRQS = napi::kDeferHardIrqs;
+  static constexpr std::uint64_t NAPI_GRO_FLUSH_NS    = napi::kGroFlushTimeoutNs;
   static constexpr std::uint64_t NAPI_IRQ_SUSPEND_NS  = 20'000'000;
 
 public:
@@ -413,31 +303,14 @@ bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::init(bool enable
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
 void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::applyNapiDeferralSysfs() const noexcept {
-  // The netdev-wide NAPI deferral knobs (napi_defer_hard_irqs, gro_flush_timeout)
-  // PERSIST across runs and are inherited by newly-created NAPIs — so a prior run
-  // that enabled deferral leaves them set. (Re)write them on every init, BEFORE the
-  // steer/bind recreates the NAPI, so the chosen regime is deterministic and a stale
-  // enable cannot silently survive. Both flags off => 0/0 (deferral OFF). The
-  // irq-suspend-timeout has no netdev-wide sysfs (netlink/per-NAPI only) and is
-  // applied in the NAPI_SET block.
-  const auto writeKnob = [this](const char* knob, std::uint64_t value) {
-    char path[128];
-    std::snprintf(path, sizeof(path), "/sys/class/net/%s/%s", m_interface, knob);
-    const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-      fmt::print(stderr, "[AFXDP] WARN: open {}: {}\n", path, std::strerror(errno));
-      return;
-    }
-    char val[24];
-    const int n = std::snprintf(val, sizeof(val), "%llu",
-                                static_cast<unsigned long long>(value));
-    if (::write(fd, val, static_cast<std::size_t>(n)) != n)
-      fmt::print(stderr, "[AFXDP] WARN: write {}={}: {}\n", path, value, std::strerror(errno));
-    ::close(fd);
-  };
-
-  writeKnob("napi_defer_hard_irqs", m_napiDefer);
-  writeKnob("gro_flush_timeout",    m_napiGro);
+  // The netdev-wide NAPI deferral knobs PERSIST across runs and are inherited
+  // by newly-created NAPIs — so a prior run that enabled deferral leaves them
+  // set. (Re)write them on every init (napi::applyDeferralSysfs), BEFORE the
+  // steer/bind recreates the NAPI, so the chosen regime is deterministic and a
+  // stale enable cannot silently survive. Both flags off => 0/0 (deferral OFF).
+  // The irq-suspend-timeout has no netdev-wide sysfs (netlink/per-NAPI only)
+  // and is applied in the NAPI_SET block.
+  napi::applyDeferralSysfs(m_interface, m_napiDefer, m_napiGro, "AFXDP");
 
   fmt::print(stderr,
              "[AFXDP] {}: NAPI sysfs napi_defer_hard_irqs={} gro_flush_timeout={}ns ({})\n",
@@ -598,52 +471,8 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::steerAllTrafficT
                m_queueId, m_queueId);
     return;
   }
-  int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) {
-    fmt::print(stderr, "[AFXDP] WARN: steering socket: {}\n", std::strerror(errno));
-    return;
-  }
-  auto ethtoolIoctl = [&](void* cmd) {
-    ifreq ifr{};
-    std::strncpy(ifr.ifr_name, m_interface, IFNAMSIZ - 1);
-    ifr.ifr_data = static_cast<char*>(cmd);
-    return ::ioctl(fd, SIOCETHTOOL, &ifr) == 0;
-  };
-
-  ethtool_channels ch{};
-  ch.cmd = ETHTOOL_GCHANNELS;
-  if (!ethtoolIoctl(&ch) || ch.max_combined == 0) {
-    fmt::print(stderr, "[AFXDP] WARN: {} has no combined channels (driver lacks `ethtool -L`); "
-                       "cannot guarantee single-queue steering\n", m_interface);
-    ::close(fd);
-    return;
-  }
-
-  if (ch.combined_count == 1) {
-    fmt::print(stderr, "[AFXDP] OK: {} already at 1 RX queue (combined=1) — no change, no link bounce\n",
-               m_interface);
-    ::close(fd);
-    return;
-  }
-
-  ch.cmd            = ETHTOOL_SCHANNELS;
-  ch.combined_count = 1;
-  ethtoolIoctl(&ch);
-
-  ethtool_channels rb{};
-  rb.cmd = ETHTOOL_GCHANNELS;
-  const bool ok = ethtoolIoctl(&rb) && rb.combined_count == 1;
-  ::close(fd);
-
-  if (!ok) {
-    fmt::print(stderr, "[AFXDP] FAIL: {} combined={} (want 1) — RX may not reach the XSK; "
-                       "run: sudo ethtool -L {} combined 1\n",
-               m_interface, rb.combined_count, m_interface);
-    return;
-  }
-  fmt::print(stderr, "[AFXDP] {} steered to 1 RX queue (combined=1) — link bounced, waiting for carrier...\n",
-             m_interface);
-  waitForCarrier();
+  if (napi::ensureCombinedOne(m_interface, "AFXDP") == napi::CombinedResult::Changed)
+    waitForCarrier();
 }
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
@@ -769,23 +598,19 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::applySetSockOpt(
     fmt::print(stderr, "[AFXDP] WARN: SO_BUSY_POLL_BUDGET: {}\n", std::strerror(errno));
 
   // READBACK: a clean setsockopt only means the kernel parsed the option;
-  // ask what values the socket is actually holding. SO_BUSY_POLL_BUDGET is
-  // SET-ONLY in the kernel (no getsockopt case) — it cannot be read back.
-  int rPrefer = -1, rUsecs = -1;
-  socklen_t rl = sizeof(rPrefer);
-  (void)::getsockopt(m_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &rPrefer, &rl);
-  rl = sizeof(rUsecs);
-  (void)::getsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &rUsecs, &rl);
-  if (rPrefer == on && rUsecs == usecs) {
+  // ask what values the socket is actually holding (napi::readXskModes;
+  // SO_BUSY_POLL_BUDGET is SET-ONLY in the kernel and cannot be read back).
+  const napi::XskModes rb = napi::readXskModes(m_fd);
+  if (rb.preferBusyPoll == on && rb.busyPollUs == usecs) {
     fmt::print(stderr, "[AFXDP] kernel confirms: busy-poll ACTIVE "
                        "(prefer={} usecs={}; budget={} write-only, "
                        "set call returned clean)\n",
-               rPrefer, rUsecs, budget);
+               rb.preferBusyPoll, rb.busyPollUs, budget);
   }
   else {
     fmt::print(stderr, "[AFXDP] WARN: busy-poll readback MISMATCH — wrote "
                        "prefer={} usecs={}, kernel holds prefer={} usecs={}\n",
-               on, usecs, rPrefer, rUsecs);
+               on, usecs, rb.preferBusyPoll, rb.busyPollUs);
   }
 }
 
@@ -823,10 +648,9 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::verifyConfig() {
 
   const bool ladderZc = (std::strcmp(m_bindMode.c_str(), "zero-copy") == 0);
   bool zc = !m_copyMode;
-  xdp_options xopts{};
-  socklen_t olen = sizeof(xopts);
-  if (::getsockopt(m_fd, SOL_XDP, XDP_OPTIONS, &xopts, &olen) == 0) {
-    zc         = (xopts.flags & XDP_OPTIONS_ZEROCOPY) != 0;
+  const napi::XskModes modes = napi::readXskModes(m_fd);
+  if (modes.valid) {
+    zc         = modes.zeroCopy;
     m_copyMode = !zc;   // the kernel's answer overrides the ladder's label
   } else {
     fmt::print(stderr, "[AFXDP] WARN: getsockopt(XDP_OPTIONS): {} — cannot "
@@ -855,7 +679,8 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::verifyConfig() {
     }
   }
   fmt::print(stderr, "[AFXDP] kernel confirms: {} | XDP attach: {} "
-                     "(XDP_OPTIONS=0x{:x})\n", zc ? "ZERO-COPY" : "COPY-mode", attach, xopts.flags);
+                     "(XDP_OPTIONS=0x{:x})\n", zc ? "ZERO-COPY" : "COPY-mode", attach,
+             modes.xdpOptionsFlags);
 
   if constexpr (NeedWakeup) {
     xdp_mmap_offsets moff{};
@@ -932,15 +757,10 @@ inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::kickTx() 
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
 void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::clearXdpProgram() noexcept {
-  // `ip link set dev <iface> xdp off` in C: detach whatever XDP program is on the
-  // interface so a leftover dispatcher/prog can't block our attach or mis-route RX.
-  // Try every mode (the stale one could be in any); best-effort, errors are expected
-  // when nothing — or a different mode — is attached.
-  bpf_xdp_detach(m_ifindex, XDP_FLAGS_DRV_MODE, nullptr);
-  bpf_xdp_detach(m_ifindex, XDP_FLAGS_SKB_MODE, nullptr);
-  bpf_xdp_detach(m_ifindex, 0, nullptr);
-  fmt::print(stderr, "[AFXDP] {}: cleared any pre-existing XDP program (ip link xdp off)\n",
-             m_interface);
+  // Detach whatever XDP program is on the interface so a leftover
+  // dispatcher/prog can't block our attach or mis-route RX. Shared rtnetlink
+  // implementation (napi::) — same sweep the DPDK net_af_xdp path runs.
+  napi::detachXdpProgram(m_interface, "AFXDP");
 }
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>

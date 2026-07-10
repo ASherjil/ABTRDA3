@@ -237,7 +237,7 @@ returns 0 forever — and `imissed` stays 0.
 queue count: configuring 0 TX queues succeeds but leaves RX descriptor write-back
 dead.
 **Fix.** Always configure ≥1 queue in *both* directions on igc, even for
-unidirectional roles (`bothQueues` in `DPDK.hpp`).
+unidirectional roles (dispatch calls `setSymmetricQueues(true)` for igc — driver policy lives in `TransportDispatch.hpp`).
 
 ### 3.2 RX `WTHRESH=0` stops descriptor write-back entirely — and `imissed` lies
 
@@ -266,4 +266,4 @@ verified disabled on both ports. The igc PMD has **no devargs at all**. The only
 latency lever that exists is the link speed (Benchmarks.md §5.2): the 2.5GBASE-T PHY
 carries ~2.4 µs/traversal more fixed pipeline latency than 1000BASE-T, so the
 campaign runs this NIC at 1 GbE via autoneg-advertisement restriction
-(`IGC_ADVERTISE_1G_ONLY` in `DPDK.hpp`; the PMD rejects forced speed).
+(`kIgcAdvertise1GOnly` in `src/app/TransportDispatch.hpp` -> `setLinkSpeeds`; the PMD rejects forced speed).

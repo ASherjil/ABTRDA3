@@ -11,7 +11,7 @@
 #include "AFXDP.hpp"
 #include "DPDK.hpp"
 #include "Verbs.hpp"
-#include "PciHelpers.hpp"   // pci::reportItr / boundToI40e (i40e ITR check)
+#include "PciHelpers.hpp"   // pci:: BDF resolution + driver-specific BAR0 fixes (dpdkPreInit/dpdkPostInitFixes)
 #include "SingleRecorder.hpp"
 #include "common/HugePageHelpers.hpp"
 #include "Intel_I210.hpp"
@@ -56,6 +56,59 @@ void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
         case RunMode::TxGen:  run_txgen(tx, cfg, count, stop);         break;
         case RunMode::RxSink: run_rxsink(rx, cfg, stop);               break;
     }
+}
+
+// ── DPDK driver-specific policy ──────────────────────────────────────────────
+// The DPDK transport class is PMD-agnostic. Everything a SPECIFIC NIC needs —
+// generic knobs before init, BAR0 register fixes after — is decided HERE, from
+// the TOML driver name.
+
+// igc (i225): advertise 1 GbE only. The 2.5GBASE-T PHY carries ~2.4 µs/traversal
+// of FIXED pipeline latency (802.3bz = quarter-clocked 10GBASE-T; Intel's own
+// PTP constants). Measured A/B: 17.108 -> 13.388 µs RTT. Flip to false + rebuild
+// for a native-2.5G run. See docs/Benchmarks.md §5.2.
+inline constexpr bool kIgcAdvertise1GOnly = true;
+
+// mlx5 latency devargs (all A/B-tested on ConnectX-4 Lx):
+//   txq_mem_algn=0    — legacy per-queue TxQ allocation (the consecutive-umem
+//                       feature fails on the 2nd single-queue port in-process)
+//   txqs_min_inline=0 — FULL Tx inlining at 1 queue: the whole small frame rides
+//                       inside the WQE, no payload DMA read (-520ns uniform)
+//   rxq_cqe_comp_en=0 — plain 64B CQEs, no RX decompression (neutral at one
+//                       frame in flight; zero cost)
+// Full inlining is also what makes the transport's single-mbuf TX-reuse fast
+// path valid (the PMD copies the frame inside tx_burst; buffer free on return).
+inline constexpr const char* kMlx5LatencyDevargs =
+    "txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0";
+
+// Before init()/prepare(): apply the driver's generic knobs and resolve the BDF
+// while the netdev still exists (the vfio unbind removes it, and renamed ports
+// like "xxv0" cannot be re-derived afterwards). Returns the BDF for
+// dpdkPostInitFixes(). Must run BEFORE prepare() — setDevargs feeds the BDF
+// registration.
+template<typename Nic>
+[[nodiscard]] inline std::string dpdkPreInit(Nic& nic, const RoleConfig& role) {
+    const std::string bdf = pci::resolveBdf(role.interface);
+    if (role.driver == "igc" && !role.dpdkAfxdpPmd) {
+        if (kIgcAdvertise1GOnly) nic.setLinkSpeeds(RTE_ETH_LINK_SPEED_1G);
+        nic.setSymmetricQueues(true);   // nb_txq=0 silently breaks igc RX (KDI §3.1)
+    }
+    if (role.driver.find("mlx5") != std::string::npos && !role.dpdkAfxdpPmd) {
+        nic.setDevargs(kMlx5LatencyDevargs);
+        nic.setTxInlineReuse(true);
+    }
+    return bdf;
+}
+
+// After init() (port started — a reset during start would wipe register fixes):
+// the BAR0 pokes. driver == "i40e" covers BOTH the vfio-pci PMD and
+// DPDK-over-AF_XDP on a kernel-bound i40e — same silicon, same write-back
+// throttle. Both helpers read back and log what actually landed.
+inline void dpdkPostInitFixes(const std::string& bdf, const RoleConfig& role) {
+    if (role.driver == "i40e")
+        pci::i40eClearItr(bdf, role.interface);
+    if (role.driver == "igc" && !role.dpdkAfxdpPmd)
+        pci::igcDisableEee(bdf, role.interface);
 }
 
 // ── Spawn a low-priority thread that runs a TapBridge ──────────────────────
@@ -181,22 +234,22 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role,
 
     if (transport == "dpdk") {
         // Configured by interface NAME + kernel DRIVER (like the other transports).
-        // DPDK init() resolves the name -> PCI BDF, then for Intel (i40e/igc) unbinds
-        // the kernel driver onto vfio-pci, or for mlx5 (driver name contains "mlx5")
-        // leaves it on the kernel driver (bifurcated). Poll-mode = no interrupts, so
-        // no coalescing/NicTuner tuning is needed. lcore = role.cpuCore (must match
-        // RuntimeSetup's pin). Per-role mode: TxGen->TxOnly, RxSink->RxOnly,
-        // Server/Client->RxTx.
+        // The binding model is EXPLICIT per-role TOML (no driver-name sniffing):
+        // default = vfio-pci pass-through (Intel i40e/igc), dpdk_bifurcated = keep
+        // the kernel driver (mlx5-class), dpdk_afxdp_pmd = DPDK-over-AF_XDP vdev
+        // (pre-conditioned + validated like the native AF_XDP transport; the
+        // [af_xdp] enable_deferral toggle applies to it too). Poll-mode = no
+        // interrupts, so no coalescing/NicTuner tuning is needed. lcore =
+        // role.cpuCore (must match RuntimeSetup's pin). Per-role mode:
+        // TxGen->TxOnly, RxSink->RxOnly, Server/Client->RxTx.
         auto setup = [&](auto& nic) -> bool {
-            if (!nic.init()) {
+            const std::string bdf = dpdkPreInit(nic, role);   // knobs + BDF, pre-unbind
+            if (!nic.init(true, role.dpdkBifurcated, role.dpdkAfxdpPmd,
+                          cfg.afxdpEnableDeferral)) {
                 fmt::println(stderr, "Error: DPDK init failed on {}", role.interface);
                 return false;
             }
-            // STEP 1 verification: confirm DPDK init()'s BAR0 ITR write actually
-            // landed (device is on vfio-pci now -> bdfFromName resolves it). Read-
-            // only; i40e only. Expect CLEARED here; if NONZERO the write missed.
-            if (role.driver == "i40e")
-                pci::reportItr(role.interface, "DPDK-ITR");
+            dpdkPostInitFixes(bdf, role);   // i40e ITR clear / igc EEE (readback-logged)
             fmt::println("[{}] Transport: dpdk on {} (driver={}, lcore {})",
                          roleName, role.interface, role.driver, role.cpuCore);
             return true;
@@ -426,15 +479,32 @@ inline int runSingleRecorder(const TestConfig& cfg, std::stop_token stop) {
         // (the one thread that polls both ports).
         DPDK<DpdkMode::TxOnly> tx(cfg.client.interface, cfg.recHotPathCore, cfg.client.driver);
         DPDK<DpdkMode::RxOnly> rx(cfg.server.interface, cfg.recHotPathCore, cfg.server.driver);
-        if (!tx.prepare() || !rx.prepare()) {
+        // Driver knobs + BDF resolution BEFORE prepare (setDevargs feeds the BDF
+        // registration, and prepare's vfio unbind removes the netdev).
+        const std::string txBdf = dpdkPreInit(tx, cfg.client);
+        const std::string rxBdf = dpdkPreInit(rx, cfg.server);
+        if (!tx.prepare(cfg.client.dpdkBifurcated, cfg.client.dpdkAfxdpPmd) ||
+            !rx.prepare(cfg.server.dpdkBifurcated, cfg.server.dpdkAfxdpPmd)) {
             fmt::println(stderr, "Error: DPDK prepare (vfio bind) failed");
             return 1;
         }
         // Loopback pair (port0 TX <-> port1 RX on one card): START BOTH ports
         // (init(false) = no link wait) BEFORE waiting EITHER link, because a
         // loopback link only comes up once both PHYs are up. Then wait both.
-        if (!tx.init(false)) { fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface); return 1; }
-        if (!rx.init(false)) { fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface); return 1; }
+        // (prepare() already ran, so init()'s flag copies are ignored — only
+        // applyDeferral is consumed here.)
+        if (!tx.init(false, cfg.client.dpdkBifurcated, cfg.client.dpdkAfxdpPmd,
+                     cfg.afxdpEnableDeferral)) {
+            fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface);
+            return 1;
+        }
+        if (!rx.init(false, cfg.server.dpdkBifurcated, cfg.server.dpdkAfxdpPmd,
+                     cfg.afxdpEnableDeferral)) {
+            fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface);
+            return 1;
+        }
+        dpdkPostInitFixes(txBdf, cfg.client);
+        dpdkPostInitFixes(rxBdf, cfg.server);
         if (!tx.waitLink()) { fmt::println(stderr, "Error: Tx DPDK link down on {}", cfg.client.interface); return 1; }
         if (!rx.waitLink()) { fmt::println(stderr, "Error: Rx DPDK link down on {}", cfg.server.interface); return 1; }
         driveSingleRecorder(tx, rx, cfg, stop);

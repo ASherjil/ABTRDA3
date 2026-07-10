@@ -20,6 +20,11 @@ struct RoleConfig {
     std::array<std::uint8_t, 6> mac{};
     int                         cpuCore{};
     std::uint32_t               xdpQueueId = 0;
+
+    // DPDK binding model (transport = "dpdk" only) — EXPLICIT, no driver-name
+    // sniffing. Exactly one may be true; both false = vfio-pci pass-through.
+    bool dpdkBifurcated = false;   // [role] dpdk_bifurcated: keep the kernel driver (mlx5-class)
+    bool dpdkAfxdpPmd   = false;   // [role] dpdk_afxdp_pmd: DPDK-over-AF_XDP via the net_af_xdp vdev
 };
 
 struct TestConfig {
@@ -86,6 +91,10 @@ inline RoleConfig loadRole(const toml::table& tbl, const char* role) {
     rc.mac        = parseMac(tbl[role]["mac"].value_or(""s));
     rc.cpuCore    = tbl[role]["cpu_core"].value_or(4);
     rc.xdpQueueId = static_cast<std::uint32_t>(tbl[role]["xdp_queue_id"].value_or(0));
+    rc.dpdkBifurcated = tbl[role]["dpdk_bifurcated"].value_or(false);
+    rc.dpdkAfxdpPmd   = tbl[role]["dpdk_afxdp_pmd"].value_or(false);
+    if (rc.dpdkBifurcated && rc.dpdkAfxdpPmd)
+        throw std::runtime_error("dpdk_bifurcated and dpdk_afxdp_pmd are mutually exclusive");
     return rc;
 }
 
