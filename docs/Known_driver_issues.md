@@ -10,7 +10,8 @@ own reference AF_XDP app) — if xdpsock fails too, the fault is in the driver, 
 code.
 
 Coverage: §1 i40e AF_XDP, §2 igc AF_XDP (the disqualification), §3 igc **DPDK PMD**
-quirks.
+quirks, §4 **DPDK EAL** traps (control-thread placement, process-global init, SIMD,
+teardown) — these hit every PMD.
 
 ---
 
@@ -267,3 +268,71 @@ latency lever that exists is the link speed (Benchmarks.md §5.2): the 2.5GBASE-
 carries ~2.4 µs/traversal more fixed pipeline latency than 1000BASE-T, so the
 campaign runs this NIC at 1 GbE via autoneg-advertisement restriction
 (`kIgcAdvertise1GOnly` in `src/app/TransportDispatch.hpp` -> `setLinkSpeeds`; the PMD rejects forced speed).
+
+---
+
+## 4. DPDK EAL — the control thread lands on the poll core (all PMDs)
+
+**Symptom.** RTT tail spikes on the isolated hot core, with no NIC or app cause.
+The `dpdk-intr` thread (EAL's control thread — it services the i40e 50 ms
+self-re-arming link/stat alarm and VFIO config-space interrupts, plus the
+multiprocess socket handler) ping-pongs with our busy-poll loop ~80×/s (proven via
+`perf record -e sched:sched_switch`).
+
+**Mechanism.** EAL derives its control-thread cpuset from **the caller's affinity at
+`rte_eal_init` MINUS the dataplane lcores**. Our RTT server/client pins the caller to
+its single isolated lcore *before* init, so that difference is **empty** — and EAL
+falls back to pinning the control thread onto our poll core.
+
+**Fix** (`DpdkEal::ealInit`, `DPDK.hpp`). Narrow the caller's affinity to
+`{kControlThreadCore}` across the `rte_eal_init` call, then restore the caller's own
+pin. The control cpuset then resolves to exactly that core. Core **0** is the kernel's
+housekeeping/IRQ core (`irqaffinity=0,1`), where periodic work already lives.
+
+**Scope.** Affects every PCI/vfio PMD. The AF_XDP PMD is immune (no PCI/VFIO interrupt
+source), but the fix is unconditional and harmless there.
+
+### 4.1 Process-global EAL — why `prepare()` and `init()` are separate
+
+EAL initialises **once per process**, and its `-a` allowlist fixes which PCI devices
+exist for the **whole** process. The single-recorder owns BOTH loopback ports in one
+process, so both BDFs (or both `--vdev` strings) must be registered *before* the first
+`init()` triggers that one EAL init — hence the `prepare()` / `init()` split, and the
+process-wide (non-template) `DpdkEal` base that holds the lists. A static inside the
+class *template* would be duplicated per specialization (`DPDK<TxOnly>` vs
+`DPDK<RxOnly>`) and double-init EAL.
+
+Two allowlist rules worth knowing: entries may carry devargs (`<bdf>,key=val`) and
+dedup compares only the BDF part, **first registration wins** (so a devargs-bearing
+entry from `prepare()` is never shadowed by `ealInit`'s bare fallback); and the
+AF_XDP vdev path additionally needs `--no-pci` plus `--in-memory` (no
+`/var/run/dpdk/<prefix>` files) so two AF_XDP primaries — RTT server + client — can
+run on one host without colliding on the lock.
+
+### 4.2 SIMD width and the i40e vector path
+
+`--force-max-simd-bitwidth` selects the i40e PMD's RX/TX path (512 = AVX-512, 256 =
+AVX2, 128 = SSE, 64 = scalar). **A/B on XXV710 RTT (2026-06-23): AVX-512 and scalar
+gave the SAME ~9.15 µs median** — the floor is the i40e hardware pipeline, not the PMD
+vector path, so Intel's "scalar = big latency win" guidance did **not** reproduce here.
+We ship **256** (AVX2): same latency as 512, keeps vector throughput headroom, and
+avoids AVX-512's frequency/power side effects. It is a cold EAL startup arg (no
+hot-path codegen impact); the startup burst-mode print (`rte_eth_{rx,tx}_burst_mode_get`)
+verifies which path the PMD actually picked — the cheap way to confirm any devarg took.
+
+### 4.3 Teardown: `dev_stop` only, never `dev_close`
+
+`shutdown()` calls `rte_eth_dev_stop` and nothing else. `dev_stop` disables
+queues/DMA/MSI-X and cancels the periodic alarm, so a device on vfio cannot keep
+running unattended and contend on PCIe with the next run's NIC — an earlier
+no-`dev_stop` version left the **igc DMA-ing during a subsequent XXV710 run**, producing
+a fat tail. We deliberately do **not** `set_link_up` or `dev_close`: `dev_stop` parks the
+PHY (i40e), so the next run's `dev_start` re-syncs from parked (~4.7 ms, ~85 ms in) —
+absorbed by the recorder's 500 k-packet warmup. The next process re-probes;
+`i40e_pf_reset()` cleans the stopped state.
+
+Also note the **bind-once** rule: `shutdown()` does not restore the kernel driver.
+Restoring it in the destructor **hangs** (the sysfs unbind blocks until vfio releases
+the device, but EAL still holds it — we never call `rte_eal_cleanup`). Re-runs resolve
+the BDF from the predictable name (`pci::bdfFromName`) since the netdev is gone.
+Recovery if ever needed: `dpdk-devbind --bind=i40e <bdf>`, or reboot.

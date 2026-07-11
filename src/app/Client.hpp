@@ -24,8 +24,8 @@
 
 #include "RingConcepts.hpp"
 #include "TestConfig.hpp"
-#include "SingleRecorder.hpp"   // Shared, HistThread, pinThread, tsc, kEndSentinel,
-                                // kWarmupDiscard, frame offsets, storeU/loadU
+#include "HistThread.hpp"       // Shared, HistThread, kEndSentinel — the recorder side
+#include "SingleRecorder.hpp"   // pinThread, kWarmupDiscard, frame offsets, storeU/loadU
 #include "Profiling.hpp"
 
 #include <fmt/core.h>

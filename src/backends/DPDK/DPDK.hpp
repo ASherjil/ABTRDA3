@@ -1,19 +1,15 @@
 #pragma once
 
+#include "DPDKEal.hpp"
 #include "RxFrame.hpp"
 #include "PciHelpers.hpp"
 #include "NapiConfig.hpp"
-#include <rte_eal.h>
 #include <rte_cycles.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ether.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -22,7 +18,35 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
+
+// =============================================================================
+// DPDK — one PMD-AGNOSTIC transport for every NIC, through rte_ethdev. Satisfies
+// the TxRing/RxRing concepts (tryReceive/release + acquire/commit/send); the hot
+// path is identical across PMDs. Everything fixable at compile time is a template
+// param; only ifname/lcore/driver are runtime (from the TOML).
+//
+// NO DRIVER-SPECIFIC LOGIC LIVES HERE. Which NIC needs which knob (link speed,
+// symmetric queues, devargs, TX inline reuse) and the post-start BAR0 register
+// fixes (i40e ITR clear, igc EEE) are decided in TransportDispatch, which knows
+// the TOML driver name. Driver traps: docs/Known_driver_issues.md.
+//
+// Binding models, chosen by EXPLICIT per-role TOML flags (never by sniffing the
+// driver name), both false = default:
+//   default          PCI pass-through — prepare() unbinds the kernel driver onto
+//                    vfio-pci (needs intel_iommu=on iommu=pt). BIND-ONCE: shutdown()
+//                    does NOT restore the kernel driver (it would hang; KDI §4.3).
+//   bifurcated=true  mlx5-class — stays on the kernel driver, DPDK drives alongside.
+//   afxdpPMD=true    DPDK-over-AF_XDP via a net_af_xdp vdev; the port is preconditioned
+//                    and its granted modes (ZC / busy-poll / deferral) read back.
+//
+// prepare()/init() are SPLIT because EAL is process-global: every port must be
+// registered before the first init() triggers the one rte_eal_init (KDI §4.1).
+// init(doWaitLink=false) starts a port without waiting — a loopback link only comes
+// up once BOTH PHYs are up, so dispatch starts both, then waitLink()s both.
+// RING SIZES: 256 (not 1024) — at one frame in flight the rings are pure cache
+// footprint; 256 keeps CQ+SQ hot in L1/L2. adjust_nb_rx_tx_desc rounds up if a PMD
+// needs more. Promiscuous mode is NOT enabled (both ends know the peer MAC).
+// =============================================================================
 
 enum class DpdkMode : std::uint8_t {
   RxOnly,
@@ -30,155 +54,18 @@ enum class DpdkMode : std::uint8_t {
   RxTx
 };
 
-// Process-global EAL state + cold-path helpers, shared by EVERY DPDK<Mode, ...>
-// specialization through this NON-TEMPLATE base class. EAL initialises once per
-// process and its -a allowlist fixes which PCI devices exist for the WHOLE
-// process, so this state must have exactly ONE copy — a static inside the class
-// template would be duplicated per specialization and double-init EAL. Private
-// inheritance keeps it an implementation detail of DPDK<>; everything is inline
-// static (no virtuals, empty base, zero cost), and hoisting the non-dependent
-// helpers here also stops them being stamped out once per specialization.
-class DpdkEal {
-protected:
-  DpdkEal() noexcept = default;
-
-  static constexpr unsigned kMaxSimdBitwidth = 256;
-
-  // All DPDK control threads (the eal-intr-thread shown as "dpdk-intr" — it services
-  // the i40e 50ms self-re-arming link/stat alarm and VFIO config-space interrupts —
-  // plus the multiprocess socket handler) are parked on kControlThreadCore. DPDK
-  // derives its control-thread cpuset from the CALLER's affinity at rte_eal_init
-  // MINUS the dataplane lcores; the RTT server/client path pins the caller to the
-  // single isolated lcore BEFORE init, so that difference is EMPTY and EAL falls
-  // back to pinning the intr thread onto our poll core, where it ping-pongs with our
-  // SCHED_OTHER busy-poll ~80x/s (proven via sched:sched_switch) -> RTT tail spikes.
-  // ealInit narrows the caller's affinity to {kControlThreadCore} across rte_eal_init
-  // so the control cpuset is exactly that core, then restores the caller's pin. Core
-  // 0 is the kernel's housekeeping/IRQ core (irqaffinity=0,1) — where periodic work
-  // already lives. (AF_XDP is immune: no PCI/VFIO interrupt source.)
-  static constexpr int kControlThreadCore = 0;
-
-  // PCI -a allowlist, registered by prepare() BEFORE the single EAL init (the
-  // single-recorder owns BOTH loopback ports in one process, so both BDFs must
-  // be known first — hence the prepare()/init() split). Entries may carry
-  // devargs ("<bdf>,key=val"); dedup compares the BDF part only and the FIRST
-  // registration wins, so a devargs-bearing entry isn't shadowed by ealInit's
-  // bare fallback.
-  inline static std::vector<std::string> s_allowedBdfs{};
-
-  // DPDK-over-AF_XDP: each entry is a full --vdev string
-  // ("net_af_xdpN,iface=cx0,start_queue=0,queue_count=1,mode=drv,busy_budget=64").
-  // Same prepare()-before-init() registration model as the BDF allowlist so both
-  // loopback ports are known before the single EAL init. Dedup on the vdev name.
-  inline static std::vector<std::string> s_vdevs{};
-
-  inline static bool s_ealInited{false};
-
-  static void addAllowedBdf(const std::string& bdf) {
-    const auto key = bdf.substr(0, bdf.find(','));
-    for (const auto& e : s_allowedBdfs)
-      if (e.substr(0, e.find(',')) == key) return;
-    s_allowedBdfs.push_back(bdf);
-  }
-
-  static void addVdev(const std::string& arg) {
-    const auto key = arg.substr(0, arg.find(','));
-    for (const auto& e : s_vdevs)
-      if (e.substr(0, e.find(',')) == key) return;
-    s_vdevs.push_back(arg);
-  }
-
-  static bool ealInit(const std::string& bdf, int lcore) noexcept {
-    if (s_ealInited) return true;
-
-    if (s_vdevs.empty()) addAllowedBdf(bdf);   // BDF mode only; AF_XDP regs in prepare()
-
-    const std::string& base = !s_vdevs.empty() ? s_vdevs.front() : s_allowedBdfs.front();
-    std::string prefix = "abtrda3_" + base.substr(0, base.find(','));
-    for (char& c : prefix) if (c == ':' || c == '.' || c == ',') c = '_';
-    std::string lcoreStr = std::to_string(lcore);
-
-    std::vector<std::string> args = {
-      "abtrda3", "-l", lcoreStr, "--main-lcore", lcoreStr,
-      "-n", "4", "--file-prefix", prefix,
-      "--force-max-simd-bitwidth=" + std::to_string(kMaxSimdBitwidth)
-    };
-    if (!s_vdevs.empty()) {
-      args.emplace_back("--no-pci");            // AF_XDP PMD is a vdev; no PCI probe
-      args.emplace_back("--in-memory");         // no /var/run/dpdk/<prefix> files => two
-                                                // af_xdp primaries (RTT server+client) on
-                                                // one host don't collide on the lock
-      for (const auto& v : s_vdevs) {
-        args.emplace_back("--vdev");
-        args.emplace_back(v);
-      }
-    } else {
-      for (const auto& b : s_allowedBdfs) {
-        args.emplace_back("-a");
-        args.emplace_back(b);
-      }
-    }
-
-    std::vector<char*> argv;
-    argv.reserve(args.size() + 1);
-    for (auto& a : args) argv.push_back(a.data());
-    argv.push_back(nullptr);
-
-    // Park DPDK's control threads on kControlThreadCore (see its definition): narrow
-    // our affinity to that core so EAL's control cpuset = {kControlThreadCore}, run
-    // init, then restore our own pin. Skipped if the control core IS our lcore.
-    const bool park = (kControlThreadCore != lcore);
-    cpu_set_t savedAff;
-    CPU_ZERO(&savedAff);
-    bool haveSaved = false;
-    if (park) {
-      haveSaved = (pthread_getaffinity_np(pthread_self(), sizeof(savedAff), &savedAff) == 0);
-      cpu_set_t ctrlSet;
-      CPU_ZERO(&ctrlSet);
-      CPU_SET(kControlThreadCore, &ctrlSet);
-      pthread_setaffinity_np(pthread_self(), sizeof(ctrlSet), &ctrlSet);
-    }
-
-    const int rc = rte_eal_init(static_cast<int>(args.size()), argv.data());
-
-    if (park && haveSaved)
-      pthread_setaffinity_np(pthread_self(), sizeof(savedAff), &savedAff);
-
-    if (rc < 0) {
-      std::fprintf(stderr, "[DPDK] rte_eal_init failed: %s\n", rte_strerror(rte_errno));
-      return false;
-    }
-    s_ealInited = true;
-    return true;
-  }
-
-  static bool writeSysfs(const std::string& path, std::string_view val) noexcept {
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    const ssize_t n = ::write(fd, val.data(), val.size());
-    ::close(fd);
-    return n == static_cast<ssize_t>(val.size());
-  }
-
-  static bool bindToVfio(const std::string& bdf) noexcept {
-    if (::access("/sys/bus/pci/drivers/vfio-pci", F_OK) != 0)
-      (void)std::system("modprobe vfio-pci");
-    if (pci::currentDriver(bdf) == "vfio-pci") return true;
-    const std::string dev = "/sys/bus/pci/devices/" + bdf;
-    writeSysfs(dev + "/driver_override", "vfio-pci");
-    writeSysfs(dev + "/driver/unbind", bdf);
-    return writeSysfs("/sys/bus/pci/drivers_probe", bdf);
-  }
-};
-
 template<DpdkMode M, std::uint16_t QueueId = 0, std::uint16_t NbRxDesc = 256, std::uint16_t NbTxDesc = 256, std::uint16_t BurstSize = 32, std::uint32_t NumMbufs = 8191, std::uint16_t MaxFrame = RTE_MBUF_DEFAULT_DATAROOM>
-class DPDK : private DpdkEal {
+class DPDK : private DPDKEal {
   static_assert(BurstSize >= 1, "BurstSize must be >= 1");
   static_assert(NumMbufs > BurstSize, "NumMbufs must exceed BurstSize");
 
   static constexpr bool          HAS_RX          = (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
   static constexpr bool          HAS_TX          = (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
   static constexpr std::uint32_t MBUF_CACHE      = 250;
+  // TX inline-reuse (setTxInlineReuse): the PMD still decrements the reused mbuf's
+  // refcnt once per send when it reaps completions, so top it back up whenever it dips
+  // below REFCNT_LOW (decrements lag sends by <= NbTxDesc << REFCNT_LOW => never 0).
+  // Gated to frames <= INLINE_SAFE_LEN (mlx5 default inlen_send = 290B; 128 = margin).
   static constexpr std::uint32_t INLINE_SAFE_LEN = 128;
   static constexpr std::uint16_t REFCNT_LOW      = 0x2000;
   static constexpr std::uint16_t REFCNT_TOPUP    = 0x4000;
@@ -197,25 +84,13 @@ public:
   [[nodiscard]] bool waitLink() noexcept;
   void shutdown() noexcept;
 
-  // Generic pre-init knobs. This class is PMD-agnostic — all DRIVER-SPECIFIC
-  // policy (which NIC needs which knob, plus post-start BAR0 register fixes)
-  // lives in TransportDispatch, which knows the TOML driver name.
-  //   setLinkSpeeds — RTE_ETH_LINK_SPEED_* mask for dev_configure (0 = full
-  //     autoneg). PMDs may reject RTE_ETH_LINK_SPEED_FIXED; a bare mask
-  //     restricts the autoneg ADVERTISEMENT (both looped ends get the same
-  //     conf, so the link resolves at the restricted speed).
-  //   setSymmetricQueues — force nb_rxq == nb_txq == 1 even for unidirectional
-  //     roles (some PMDs break asymmetric configs; the AF_XDP PMD requires
-  //     pairing and forces this internally).
-  //   setDevargs — extra PMD devargs appended to this port's -a allowlist entry
-  //     ("key=val,key=val"); must be called BEFORE prepare() registers the BDF.
-  //   setTxInlineReuse — enable the single-mbuf full-inline TX fast path. ONLY
-  //     valid when the PMD copies the whole frame inside tx_burst itself (e.g.
-  //     mlx5 with txqs_min_inline=0), making the buffer reusable on return.
-  void setLinkSpeeds(std::uint32_t speedsMask) noexcept { m_linkSpeeds = speedsMask; }
-  void setSymmetricQueues(bool on) noexcept { m_symmetricQueues = on; }
-  void setDevargs(std::string_view devargs) noexcept { m_devargs = devargs; }
-  void setTxInlineReuse(bool on) noexcept { m_txReuseInline = on; }
+  // Generic pre-init knobs — this class is PMD-agnostic; WHICH driver needs which
+  // knob is decided in TransportDispatch (it knows the TOML driver name).
+  // All four must be called BEFORE prepare()/init().
+  void setLinkSpeeds(std::uint32_t speedsMask) noexcept;   // RTE_ETH_LINK_SPEED_* mask; 0 = full autoneg
+  void setSymmetricQueues(bool on) noexcept;               // force nb_rxq == nb_txq == 1
+  void setDevargs(std::string_view devargs) noexcept;      // "key=val,..." appended to the -a entry
+  void setTxInlineReuse(bool on) noexcept;                 // single-mbuf full-inline TX fast path
 
   [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept;
 
@@ -333,14 +208,18 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::prepar
   m_bifurcated = bifurcated;
   m_afxdpPmd   = afxdpPMD;
 
+  // DPDK-over-AF_XDP: a net_af_xdp vdev on the kernel netdev — no BDF, no vfio bind.
+  // Precondition the port exactly like the native AFXDP backend (a stale XDP program
+  // blocks the PMD's attach; the PMD binds queue 0 only). mode=drv + busy_budget, no
+  // force_copy => zero-copy negotiated; all of it VERIFIED by readback in init().
   if (m_afxdpPmd) {
     napi::detachXdpProgram(m_ifname.c_str(), "DPDK");
-    napi::ensureCombinedOne(m_ifname.c_str(), "DPDK");   // bounce absorbed by waitLink
-    const std::string vname = "net_af_xdp" + std::to_string(s_vdevs.size());
+    napi::ensureCombinedOne(m_ifname.c_str(), "DPDK");   // link bounce absorbed by waitLink
+    const std::string vname = "net_af_xdp" + std::to_string(vdevCount());
     addVdev(vname + ",iface=" + m_ifname +
             ",start_queue=0,queue_count=1,mode=drv,busy_budget=64");
-    m_pci           = vname;
-    m_txReuseInline = false;   // full-inline reuse is N/A for the AF_XDP PMD
+    m_pci           = vname;   // init() resolves the port by this name
+    m_txReuseInline = false;   // full-inline reuse is N/A here
     m_prepared      = true;
     std::fprintf(stderr, "[DPDK] %s: AF_XDP PMD via vdev %s (busy-poll, zero-copy)\n",
                  m_ifname.c_str(), vname.c_str());
@@ -416,12 +295,9 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
                          "(link_speeds mask 0x%x)\n", m_ifname.c_str(), m_linkSpeeds);
   }
 
-  // The AF_XDP PMD requires nb_rx_queues == nb_tx_queues (it pairs an XSK rx+tx
-  // per queue); dispatch requests the same via setSymmetricQueues for PMDs that
-  // break asymmetric configs (igc: docs/Known_driver_issues.md §3.1). The unused
-  // side only satisfies the driver; the hot path still drives one direction.
-  // m_pool is created unconditionally above, so a TxOnly port always has a pool
-  // for its unused RX queue.
+  // The unused direction is configured only to satisfy the driver (AF_XDP PMD pairs
+  // rx+tx per queue; setSymmetricQueues covers PMDs that break otherwise). The hot
+  // path still drives one direction; m_pool above always backs the unused RX queue.
   const bool bothQueues = m_afxdpPmd || m_symmetricQueues;
   const std::uint16_t nb_rxq = (HAS_RX || bothQueues) ? 1 : 0;
   const std::uint16_t nb_txq = (HAS_TX || bothQueues) ? 1 : 0;
@@ -437,9 +313,8 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
   }
 
   if (HAS_RX || bothQueues) {
-    // PMD-default thresholds throughout — audited optimal for one-in-flight on
-    // every campaign NIC (and on igc, never write rx wthresh=0: it kills
-    // descriptor write-back outright — docs/Known_driver_issues.md §3.2).
+    // PMD-default thresholds: audited optimal at one-in-flight on every campaign NIC
+    // (never override rx wthresh to 0 on igc — it kills write-back; KDI §3.2).
     rte_eth_rxconf rxconf = info.default_rxconf;
     rxconf.offloads = conf.rxmode.offloads;
     if (rte_eth_rx_queue_setup(m_port, QueueId, nb_rxd, sid, &rxconf, m_pool) < 0) {
@@ -462,14 +337,12 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
   }
   m_started = true;
 
-  // Driver-specific post-start register fixes (i40e ITR clear, igc EEE clear)
-  // are NOT done here — this transport is PMD-agnostic. TransportDispatch
-  // applies them via pci::i40eClearItr / pci::igcDisableEee after init().
+  // NB: driver-specific post-start register fixes (i40e ITR clear, igc EEE) live in
+  // TransportDispatch — pci::i40eClearItr / pci::igcDisableEee, called after init().
 
-  // DPDK-over-AF_XDP: apply (or deterministically CLEAR) the NAPI deferral
-  // regime, then read back what the kernel actually granted the PMD's XSK —
-  // zero-copy and busy-poll are negotiated silently, so verify like a register
-  // write. Shared napi:: helpers, identical to the native AFXDP backend.
+  // Apply (or deterministically ZERO) the NAPI deferral regime, then read back what
+  // the kernel actually granted the PMD's XSK — zero-copy and busy-poll are negotiated
+  // SILENTLY, so verify like a register write. Same napi:: helpers as native AF_XDP.
   if (m_afxdpPmd) {
     if (m_applyDeferral)
       napi::applyDeferralSysfs(m_ifname.c_str(), napi::kDeferHardIrqs,
@@ -523,12 +396,10 @@ template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_
 void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::shutdown() noexcept {
   if (!m_started) return;
 
-  // DIAGNOSTIC: dump the NIC's OWN packet counters before teardown. This is the
-  // wire truth, independent of our hot-path bookkeeping — the discriminator for the
-  // "recorded >> sent" DPDK bug: compare TX opackets vs RX ipackets vs the app's
-  // recorded. ipackets ~= recorded (>> sent) => wire/PMD genuinely duplicates;
-  // ipackets ~= sent but recorded >> sent => our tryReceive/release re-reads buffers.
-  // imissed = RX-ring overrun (no descriptor); rx_nombuf = mempool exhausted.
+  // Wire truth before teardown, independent of our own bookkeeping: TX opackets vs RX
+  // ipackets vs the app's recorded count. (ipackets ~= recorded >> sent => the PMD
+  // duplicates; ipackets ~= sent but recorded >> sent => we re-read buffers. imissed =
+  // RX-ring overrun; rx_nombuf = mempool exhausted. On igc imissed always reads 0.)
   {
     rte_eth_stats st{};
     if (rte_eth_stats_get(m_port, &st) == 0) {
@@ -551,10 +422,11 @@ void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::shutdo
     rte_pktmbuf_free(m_pendingRx);
     m_pendingRx = nullptr;
   }
+  // dev_stop ONLY — no set_link_up, no dev_close, no kernel-driver restore (KDI §4.3).
   rte_eth_dev_stop(m_port);
   if constexpr (HAS_TX) {
     if (m_txReuse) {
-      rte_mbuf_refcnt_set(m_txReuse, 1);
+      rte_mbuf_refcnt_set(m_txReuse, 1);   // PMD decrements are done; let the free land
       rte_pktmbuf_free(m_txReuse);
       m_txReuse = nullptr;
     }
@@ -636,5 +508,34 @@ inline bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>:
   std::memcpy(buf, frame.data(), frame.size());
   commit();
   return true;
+}
+
+// PMDs may reject RTE_ETH_LINK_SPEED_FIXED; a bare mask restricts the autoneg
+// ADVERTISEMENT instead (both looped ends share the conf, so the link resolves there).
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setLinkSpeeds(std::uint32_t speedsMask) noexcept {
+  m_linkSpeeds = speedsMask;
+}
+
+// For PMDs that break on an asymmetric queue config (igc: nb_txq=0 silently kills RX
+// — docs/Known_driver_issues.md §3.1). The AF_XDP PMD forces this internally.
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setSymmetricQueues(bool on) noexcept {
+  m_symmetricQueues = on;
+}
+
+// Appended to this port's -a allowlist entry, so it must land before prepare()
+// registers the BDF (first registration wins).
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setDevargs(std::string_view devargs) noexcept {
+  m_devargs = devargs;
+}
+
+// ONLY valid when the PMD copies the whole frame into the descriptor inside tx_burst
+// (mlx5 + txqs_min_inline=0): the buffer is then reusable the moment commit() returns,
+// so one mbuf is re-sent forever — no per-round alloc/free. See acquire().
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setTxInlineReuse(bool on) noexcept {
+  m_txReuseInline = on;
 }
 

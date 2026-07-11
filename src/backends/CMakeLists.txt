@@ -11,6 +11,10 @@ add_library(abtrda3 STATIC
         PacketMmap/PacketMmapRx.cpp
         PacketMmap/PacketMmapTx.cpp
 
+    # DPDK transport: the hot path is header-only (DPDK.hpp, a template), but the
+    # process-global EAL base is a plain class -> compiled ONCE here.
+        DPDK/DPDKEal.cpp
+
     # AF_XDP transport is header-only (AFXDP.hpp); no .cpp here.
 )
 
