@@ -5,12 +5,13 @@ Closed-loop round-trip latency on identical silicon across three NICs:
 The goal is the comparison asked for constantly online and answered only with
 theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
 
-> **Status:** ConnectX-4 Lx (§3) and Intel XXV710-DA2 (§4) are **complete** — all six
-> 24 h soaks populated (verbs, DPDK, AF_XDP, and DPDK-over-AF_XDP on each NIC). Intel
-> I225-V (§5): DPDK 24 h soak **in progress** — run at **1 GbE**, which beats the NIC's
-> native 2.5 GbE for latency (the 2.5GBASE-T PHY paradox, §5.2); AF_XDP on igc is
-> **disqualified by a driver defect** (§5.3). The Solarflare X2522 ef_vi comparison is
-> still pending. Sections 1–2 (system/config/methodology) are final.
+> **Status:** ConnectX-4 Lx (§3), Intel XXV710-DA2 (§4) and Intel I225-V (§5) are
+> **complete** — all seven 24 h soaks populated (verbs, DPDK, AF_XDP and
+> DPDK-over-AF_XDP on each 25 G NIC; DPDK on the I225-V). The I225-V is run at
+> **1 GbE**, which beats the NIC's native 2.5 GbE for latency (the 2.5GBASE-T PHY
+> paradox, §5.2); AF_XDP on igc is **disqualified by a driver defect** (§5.3). The
+> Solarflare X2522 ef_vi comparison is still pending. Sections 1–2
+> (system/config/methodology) are final.
 
 **Contents**
 
@@ -42,7 +43,8 @@ theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
 | **Intel XXV710-DA2** (i40e) | DPDK (i40e PMD) | **9.028** | 9.601 | 12.882 | 9.47 B |
 | **Intel XXV710-DA2** (i40e) | AF_XDP | **10.529** | 11.910 | 13.569 | 8.20 B |
 | **Intel XXV710-DA2** (i40e) | DPDK-over-AF_XDP PMD | **10.753** | 11.857 | 13.566 | 8.05 B |
-| **Intel I225-V** (igc) | DPDK (igc PMD) | | | | |
+| **Intel I225-V** (igc) | DPDK (igc PMD), link at 1 GbE | **13.397** | 13.960 | 18.898 | 6.39 B |
+| **Intel I225-V** (igc) | AF_XDP | \_disqualified — driver defect (§5.3)\_ | | | |
 
 ---
 
@@ -350,46 +352,94 @@ campaign:
    after the first frame. Not slow: *unmeasurable* (§5.3).
 
 ### 5.1 DPDK — igc PMD (vfio-pci), link at 1 GbE
-_[24 h soak in progress]_
 
 | Metric | RTT (µs) |
 |---|---|
-| Min | _TBD_ |
-| Median | _TBD_ |
-| P99 | _TBD_ |
-| P99.9 | _TBD_ |
-| P99.99 | _TBD_ |
-| P99.999 | _TBD_ |
-| Max | _TBD_ |
-| Mean | _TBD_ |
-| Samples | _TBD_ |
+| Min | 12.450 |
+| Median | 13.397 |
+| P99 | 13.773 |
+| P99.9 | 13.835 |
+| P99.99 | 13.902 |
+| P99.999 | 13.960 |
+| Max | 18.898 |
+| Mean | 13.434 |
+| Samples | 6,390,422,581 |
 
-![I225-V DPDK histogram](../test/latency_analysis/TBD.png)
+![I225-V DPDK histogram](../test/latency_analysis/Intel_I225_V/i225_v_1GbE_dpdk_rtt_hist.png)
+
+_(Log-y — on a linear axis this distribution is so tight that the entire tail past
+14 µs is invisible.)_
+
+The tail is the story. **P99.999 lands 563 ns above the median**, over 6.39 billion round
+trips with zero loss — statistically a dead heat with the XXV710's DPDK soak (573 ns) and,
+in relative terms, the flattest distribution in the whole campaign (4.20 % of the median,
+against 6.35 % for the XXV710 and 20.5 % for the ConnectX-4 Lx). The entire 24 h produced
+one 18.898 µs outlier and nothing else above 17.6 µs.
+
+That is the genuinely surprising result: a consumer gaming-motherboard controller is not
+merely *usable* for deterministic work — its **jitter is indistinguishable from a 25 G
+server NIC's**. What disqualifies the I225-V is the ~13 µs *offset*, not the spread, and
+that offset is silicon (§5.2), not software. Determinism, it turns out, is far cheaper to
+buy than latency.
+
+Register-level tuning contributed almost nothing here. A full audit of the igc PMD
+(`Known_driver_issues.md` §3.3) found the link speed to be the **only** lever that
+exists: interrupt moderation is already off after reset, EEE/LPI is already disabled by
+the PMD's base init (and the i225 has no 802.3az anyway — that is i226), DMA coalescing
+is never enabled, and the PMD exposes no devargs at all. The one knob that looks like a
+free win — RX `WTHRESH = 0` for immediate descriptor write-back — instead stops
+write-back dead, silently dropping every frame while `imissed` reports zero
+(§3.2 of the same document).
 
 ### 5.2 The 2.5G paradox — why this NIC is benchmarked at 1 GbE
 
-Link-speed A/B, same box, same build, one frame in flight, 5-minute runs (the only
-change is the autoneg advertisement):
+The I225-V is **slower at its native 2.5 GbE than at 1 GbE**. Same box, same build, same
+one-frame-in-flight loop — the only change is the autoneg advertisement:
 
-| Metric (RTT, µs) | 2.5 GbE | 1 GbE |
-|---|---:|---:|
-| Min | _re-capture pending_ | 12.630 |
-| Median | **17.108** | **13.388** |
-| P99.999 | 17.79 | 14.022 |
-| Max | 17.882 | 14.080 |
-| Mean | _re-capture pending_ | 13.427 |
-| Samples | 1.9 M | 1.65 M |
+#### 2.5 GbE — DPDK, igc PMD (5-minute run)
 
-Downgrading the link cut the median by **3.72 µs** — and the total spread at 1 GbE is
-1.45 µs over 1.65 M samples with zero loss. The mechanism is the PHY itself, and Intel
-documents it in its own driver: the igc driver's PTP timestamp-correction constants
-(`igc.h`, applied per link speed in `igc_ptp.c`) state the fixed MAC+PHY pipeline
-latency of the i225:
+| Metric | RTT (µs) |
+|---|---|
+| Min | 16.362 |
+| Median | 17.143 |
+| P99 | 17.657 |
+| P99.9 | 17.725 |
+| P99.99 | 17.759 |
+| P99.999 | 17.788 |
+| Max | 22.866 |
+| Mean | 17.171 |
+| Samples | 16,714,295 |
 
-| Link speed | TX latency (ns) | RX latency (ns) | Per wire traversal |
-|---|---:|---:|---:|
-| 2500 | 1325 | 1485 | **2.81 µs** |
-| 1000 | 80 | 300 | **0.38 µs** |
+_(Both ports' copper autoneg outlasted the PMD's ~20 s link-wait, and 3 frames of 17.2 M
+were lost in that window — all inside the discarded 500 k-sample warm-up. Zero timeouts and
+zero loss thereafter; `Known_driver_issues.md` §2.3.)_
+
+Against the 1 GbE results in §5.1, dropping the link speed is worth **3.75 µs of median
+RTT** (17.143 → 13.397) — the *slower* link is 22 % faster end to end. That is not a
+tuning artefact and not noise: the 1 GbE figure was reproduced over a 24 h soak of 6.39
+billion samples, and the 2.5 G distribution here is itself tight (P99.999 sits 645 ns
+above the median), so the two populations do not come close to overlapping. The penalty
+is a clean, fixed offset — exactly the signature of a pipeline cost rather than a
+scheduling or contention effect.
+
+The mechanism is the PHY, and Intel documents it in its own driver. The igc PTP
+timestamp-correction constants (`igc.h`, applied per link speed in `igc_ptp.c`) record the
+i225's *fixed* MAC+PHY pipeline latency: at 2500 Mbit/s it is **1325 ns TX + 1485 ns RX =
+2.81 µs per wire traversal**, against **80 ns TX + 300 ns RX = 0.38 µs** at 1000 Mbit/s.
+An RTT crosses the wire twice, so 2.5GBASE-T carries ~5.6 µs of unavoidable PHY latency
+where 1000BASE-T carries ~0.76 µs — a ~4.9 µs structural penalty, against which 1 GbE's
+slower serialisation of a 64-byte frame costs only ~0.7 µs. The faster link loses. That
+model predicts a ~4.2 µs net win for 1 GbE and we measured 3.75 µs, so Intel's published
+constants are, if anything, slightly pessimistic — but they identify the mechanism, and
+nothing else in the stack moves a number of this size.
+
+This is inherent to 802.3bz, not to Intel: 2.5GBASE-T is a quarter-clocked 10GBASE-T, so
+the LDPC codeword that occupies 320 ns at 10 G takes 1.28 µs to fill at 2.5 G and must be
+buffered whole before it can be decoded — which is almost exactly the 1485 ns RX constant
+above. The IEEE task force's own delay budget (802.3bz D2.0, Table 125-5) permits up to
+25 pause-quanta ≈ 5.12 µs of TX+RX PHY delay; the i225's 2.81 µs sits at ~55 % of that
+ceiling, i.e. it is a *sane* implementation of an inherently high-latency line code. No
+register setting reaches it. **The only lever is to not use it.**
 
 ### 5.3 AF_XDP — disqualified: the driver cannot ping-pong
 
