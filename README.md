@@ -34,13 +34,13 @@ transfers between them.
 ABTRDA3 does the ritual for you and hands back one interface:
 
 ```
-                       ┌─────────────────────────────────────┐
-   your packet loop ── │  acquire / commit  +  tryReceive / release  │
-                       └─────────────────────────────────────┘
-                                        │  C++20 concepts, all inlined
-              ┌──────────────┬──────────┴──────┬──────────────┐
-            DPDK          AF_XDP          PACKET_MMAP       verbs
-        (i40e/igc/mlx5)  (zero-copy)      (no deps)      (RAW_PACKET QP)
+                      ┌────────────────────────────────────────────┐
+   your packet loop ──│  acquire / commit  +  tryReceive / release  │
+                      └────────────────────┬───────────────────────┘
+                                           │  C++20 concepts, all inlined
+              ┌────────────────┬───────────┴────────┬────────────────┐
+            DPDK             AF_XDP            PACKET_MMAP         verbs
+      (i40e/igc/mlx5)     (zero-copy)           (no deps)      (RAW_PACKET QP)
 ```
 
 - **Zero-cost.** The transport is a template parameter, not a virtual base. Every hot-path
