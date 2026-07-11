@@ -188,8 +188,17 @@ inline constexpr bool kIgcAdvertise1GOnly = true;
 // (consecutive-umem fails on the 2nd single-queue port in-process); FULL Tx inlining at
 // 1 queue — the frame rides inside the WQE, no payload DMA read (-520ns uniform, and it
 // is what makes setTxInlineReuse valid); plain 64B CQEs, no RX decompression.
+// sq_db_nc=0 (WC doorbell mapping) was A/B'd and is a NULL: median moved 1ns. The cost is
+// the NIC's DMA read-back of the WQE (BlueFlame), not how the CPU writes the doorbell.
 inline constexpr const char* kMlx5LatencyDevargs =
     "txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0";
+
+// mlx5 RX ring: 64, not the 256 default. mlx5 bulk-refills min(64, NbRxDesc>>2) mbufs at the
+// TOP of rx_burst, so a 256 ring pays a 64-mbuf refill INSIDE a poll while the echo is in
+// flight; 64 cuts that to 16. Measured (30s A/B, CX4): P99.9 3.793 -> 3.648us (-145ns),
+// median UNMOVED at 3.379, Vector SSE retained. mlx5 ONLY — i40e's vector rearm threshold is
+// a compile-time 64, so a 64-entry ring would leave it no headroom.
+inline constexpr std::uint16_t kMlx5NbRxDesc = 64;
 
 // BEFORE prepare(): set the knobs and resolve the BDF while the netdev still exists (the
 // vfio unbind removes it, and renamed ports like "xxv0" cannot be re-derived after).
@@ -204,6 +213,7 @@ template<class Nic>
     if (role.driver.find("mlx5") != std::string::npos && !role.dpdkAfxdpPmd) {
         nic.setDevargs(kMlx5LatencyDevargs);
         nic.setTxInlineReuse(true);
+        nic.setNbRxDesc(kMlx5NbRxDesc);      // shrinks the in-poll refill burst 64 -> 16
     }
     return bdf;
 }

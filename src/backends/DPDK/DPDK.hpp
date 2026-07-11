@@ -89,6 +89,7 @@ public:
   // All four must be called BEFORE prepare()/init().
   void setLinkSpeeds(std::uint32_t speedsMask) noexcept;   // RTE_ETH_LINK_SPEED_* mask; 0 = full autoneg
   void setSymmetricQueues(bool on) noexcept;               // force nb_rxq == nb_txq == 1
+  void setNbRxDesc(std::uint16_t n) noexcept;              // override NbRxDesc (shrinks the PMD refill burst)
   void setDevargs(std::string_view devargs) noexcept;      // "key=val,..." appended to the -a entry
   void setTxInlineReuse(bool on) noexcept;                 // single-mbuf full-inline TX fast path
 
@@ -144,6 +145,7 @@ private:
   bool                               m_applyDeferral{false};
   std::uint32_t                      m_linkSpeeds{0};
   bool                               m_symmetricQueues{false};
+  std::uint16_t                      m_nbRxDesc{NbRxDesc};
   std::string                        m_devargs;
 
   rte_mbuf*                          m_txReuse{nullptr};
@@ -170,7 +172,7 @@ DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::DPDK(DPDK&&
     m_prepared{o.m_prepared}, m_started{std::exchange(o.m_started, false)},
     m_bifurcated{o.m_bifurcated}, m_afxdpPmd{o.m_afxdpPmd},
     m_applyDeferral{o.m_applyDeferral},
-    m_linkSpeeds{o.m_linkSpeeds}, m_symmetricQueues{o.m_symmetricQueues},
+    m_linkSpeeds{o.m_linkSpeeds}, m_symmetricQueues{o.m_symmetricQueues}, m_nbRxDesc{o.m_nbRxDesc},
     m_devargs{std::move(o.m_devargs)},
     m_txReuse{std::exchange(o.m_txReuse, nullptr)},
     m_txReuseInline{o.m_txReuseInline} {}
@@ -195,6 +197,7 @@ DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>& DPDK<M, Que
     m_applyDeferral   = o.m_applyDeferral;
     m_linkSpeeds      = o.m_linkSpeeds;
     m_symmetricQueues = o.m_symmetricQueues;
+    m_nbRxDesc        = o.m_nbRxDesc;
     m_devargs         = std::move(o.m_devargs);
     m_txReuse         = std::exchange(o.m_txReuse, nullptr);
     m_txReuseInline   = o.m_txReuseInline;
@@ -306,7 +309,7 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
     return false;
   }
 
-  std::uint16_t nb_rxd = NbRxDesc, nb_txd = NbTxDesc;
+  std::uint16_t nb_rxd = m_nbRxDesc, nb_txd = NbTxDesc;
   if (rte_eth_dev_adjust_nb_rx_tx_desc(m_port, &nb_rxd, &nb_txd) != 0) {
     std::fprintf(stderr, "[DPDK] adjust_nb_rx_tx_desc failed (port %u)\n", m_port);
     return false;
@@ -372,8 +375,8 @@ template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_
 bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::waitLink() noexcept {
   rte_eth_link link{};
   for (int i = 0; i < 200; ++i) {
-    rte_eth_link_get_nowait(m_port, &link);
-    if (link.link_status == RTE_ETH_LINK_UP) break;
+    // A failed query leaves `link` stale — only trust link_status when the call succeeded.
+    if (rte_eth_link_get_nowait(m_port, &link) == 0 && link.link_status == RTE_ETH_LINK_UP) break;
     if (i == 20 || (i > 20 && (i % 30) == 0)) {
       int e = rte_eth_dev_set_link_up(m_port);
       if (e != 0 && e != -ENOTSUP)
@@ -522,6 +525,16 @@ void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setLin
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setSymmetricQueues(bool on) noexcept {
   m_symmetricQueues = on;
+}
+
+// Both PMDs bulk-refill mbufs at the TOP of rx_burst, so a large ring pays a big refill
+// INSIDE a poll while the echo is in flight. mlx5 refills min(64, NbRxDesc>>2): 256 -> 64
+// mbufs, 64 -> 16. Measured on CX4 (30s A/B): P99.9 3.793 -> 3.648us, median UNMOVED.
+// Per-PMD, not global — i40e's rearm threshold is a compile-time 64 and a 64-entry ring
+// would leave no headroom. rte_eth_dev_adjust_nb_rx_tx_desc still clamps to PMD limits.
+template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
+void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setNbRxDesc(std::uint16_t n) noexcept {
+  m_nbRxDesc = n;
 }
 
 // Appended to this port's -a allowlist entry, so it must land before prepare()
