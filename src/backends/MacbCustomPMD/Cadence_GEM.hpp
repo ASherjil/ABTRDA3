@@ -97,8 +97,9 @@ public:
             const int fd = ::open(path.c_str(), O_RDONLY);
             if (fd < 0) return 0;
             char buf[32]{};
-            (void)::read(fd, buf, sizeof(buf) - 1);
+            const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);   // buf stays NUL-filled
             ::close(fd);
+            if (n <= 0) return 0;
             return std::strtoull(buf, nullptr, 0);
         };
         m_paddr = readNumber("addr");
@@ -759,7 +760,8 @@ private:
         FILE* f = std::fopen("/proc/net/route", "r");
         if (f) {
             char line[256];
-            std::fgets(line, sizeof(line), f); // skip header
+            const char* header = std::fgets(line, sizeof(line), f);   // skip it
+            (void)header;                                             // empty file -> loop just ends
             while (std::fgets(line, sizeof(line), f)) {
                 char iface[32]{};
                 unsigned long dest = 1, gw = 0;

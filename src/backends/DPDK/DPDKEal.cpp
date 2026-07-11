@@ -118,8 +118,13 @@ bool DPDKEal::writeSysfs(const std::string& path, std::string_view val) noexcept
 
 // driver_override + drivers_probe, exactly as dpdk-devbind does it.
 bool DPDKEal::bindToVfio(const std::string& bdf) noexcept {
-  if (::access("/sys/bus/pci/drivers/vfio-pci", F_OK) != 0)
-    (void)std::system("modprobe vfio-pci");
+  if (::access("/sys/bus/pci/drivers/vfio-pci", F_OK) != 0) {
+    // Best-effort: the module may be built-in, or modprobe may be absent. The real
+    // verdict is the drivers_probe below, so the exit status is only logged.
+    const int rc = std::system("modprobe vfio-pci");
+    if (rc != 0)
+      std::fprintf(stderr, "[DPDK] modprobe vfio-pci returned %d (continuing)\n", rc);
+  }
   if (pci::currentDriver(bdf) == "vfio-pci") return true;
   const std::string dev = "/sys/bus/pci/devices/" + bdf;
   (void)writeSysfs(dev + "/driver_override", "vfio-pci");

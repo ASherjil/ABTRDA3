@@ -747,7 +747,7 @@ template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std:
 inline void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::kickTx() noexcept requires (M != AFXDPMode::RxOnly) {
   // Faithful xdpsock kick_tx(): one sendto wakes the kernel TX NAPI. Success or
   // a benign "busy/again" errno is fine; anything else is a real fault.
-  int ret = ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+  const ssize_t ret = ::sendto(m_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
   if (ret >= 0 || errno == ENOBUFS || errno == EAGAIN || errno == EBUSY || errno == ENETDOWN) {
     return;
   }
@@ -767,8 +767,9 @@ template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std:
 void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::loadXdpProgram(const char* path) {
 
   m_xdpProg = xdp_program__open_file(path, nullptr, nullptr);
-  if (int err = libxdp_get_error(m_xdpProg)) {
-    fmt::print(stderr, "[AFXDP] BPF load failed ({}): {}\n", path, std::strerror(-err));
+  if (const long err = libxdp_get_error(m_xdpProg)) {   // libxdp returns a long errno
+    fmt::print(stderr, "[AFXDP] BPF load failed ({}): {}\n",
+               path, std::strerror(static_cast<int>(-err)));
     m_xdpProg = nullptr;
     return;
   }

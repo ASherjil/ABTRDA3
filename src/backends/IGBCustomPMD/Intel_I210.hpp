@@ -343,8 +343,10 @@ private:
         off_t off = capPtr + 0x10;
         if (::pread(fd, &linkCtl, sizeof(linkCtl), off) == sizeof(linkCtl)) {
           linkCtl &= static_cast<std::uint16_t>(~0x0003);
-          ::pwrite(fd, &linkCtl, sizeof(linkCtl), off);
-          std::fprintf(stderr, "[I210] PCIe ASPM disabled\n");
+          const ssize_t w = ::pwrite(fd, &linkCtl, sizeof(linkCtl), off);
+          std::fprintf(stderr, w == static_cast<ssize_t>(sizeof(linkCtl))
+                                   ? "[I210] PCIe ASPM disabled\n"
+                                   : "[I210] WARN: PCIe ASPM disable write FAILED\n");
         }
         break;
       }
@@ -406,11 +408,13 @@ private:
     constexpr std::uint16_t MMD_EEE_DEV  = 7;
     constexpr std::uint16_t MMD_EEE_ADDR = 60;   // EEE Advertisement register
     constexpr std::uint16_t MMD_FUNC_DATA = 0x4000;
-    writePhy(13, MMD_EEE_DEV);                    // Select device 7
-    writePhy(14, MMD_EEE_ADDR);                   // Select register 60
-    writePhy(13, MMD_FUNC_DATA | MMD_EEE_DEV);    // Switch to data mode
-    std::uint16_t eeeAdv = readPhy(14);            // Read EEE advertisement
-    writePhy(13, 0);                               // Release MMD
+    // Best-effort MMD walk (this is the diagnostic path): a failed write just means
+    // the readback below reports a stale/zero advertisement, which the check handles.
+    (void)writePhy(13, MMD_EEE_DEV);                    // Select device 7
+    (void)writePhy(14, MMD_EEE_ADDR);                   // Select register 60
+    (void)writePhy(13, MMD_FUNC_DATA | MMD_EEE_DEV);    // Switch to data mode
+    std::uint16_t eeeAdv = readPhy(14);                 // Read EEE advertisement
+    (void)writePhy(13, 0);                              // Release MMD
     if (eeeAdv & 0x0006) {  // bit 1 = 100M EEE, bit 2 = 1G EEE
       std::fprintf(stderr, "[I210] WARN: PHY EEE advertisement=0x%04x (should be 0)\n", eeeAdv);
       warnings++;
@@ -601,15 +605,18 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    // Advertise + restart autoneg. Results deliberately ignored: a failed MDIC write
+    // leaves the PHY on its previous (working) advertisement, and the link check that
+    // follows init() is what actually gates the run.
     // 3. Advertise 10/100 Mbps modes
-    writePhy(PHY_ANAR, ANAR_SELECTOR | ANAR_10_HD | ANAR_10_FD
-                     | ANAR_100_HD | ANAR_100_FD);
+    (void)writePhy(PHY_ANAR, ANAR_SELECTOR | ANAR_10_HD | ANAR_10_FD
+                           | ANAR_100_HD | ANAR_100_FD);
 
     // 4. Advertise 1000 Mbps full duplex
-    writePhy(PHY_GBCR, GBCR_1000_FD);
+    (void)writePhy(PHY_GBCR, GBCR_1000_FD);
 
     // 5. Enable auto-negotiation and restart it
-    writePhy(PHY_BMCR, BMCR_ANE | BMCR_RESTART_AN);
+    (void)writePhy(PHY_BMCR, BMCR_ANE | BMCR_RESTART_AN);
 
     std::fprintf(stderr, "[I210] PHY initialised: auto-negotiation restarted\n");
     return true;
@@ -619,12 +626,12 @@ private:
     std::uint32_t ral = readReg(RAL0);
     std::uint32_t rah = readReg(RAH0);
 
-    m_mac[0] = ral & 0xFF;
-    m_mac[1] = (ral >> 8) & 0xFF;
-    m_mac[2] = (ral >> 16) & 0xFF;
-    m_mac[3] = (ral >> 24) & 0xFF;
-    m_mac[4] = rah & 0xFF;
-    m_mac[5] = (rah >> 8) & 0xFF;
+    m_mac[0] = static_cast<std::uint8_t>(ral & 0xFF);
+    m_mac[1] = static_cast<std::uint8_t>((ral >> 8) & 0xFF);
+    m_mac[2] = static_cast<std::uint8_t>((ral >> 16) & 0xFF);
+    m_mac[3] = static_cast<std::uint8_t>((ral >> 24) & 0xFF);
+    m_mac[4] = static_cast<std::uint8_t>(rah & 0xFF);
+    m_mac[5] = static_cast<std::uint8_t>((rah >> 8) & 0xFF);
 
     std::fprintf(stderr, "[I210] MAC: %02x:%02x:%02x:%02x:%02x:%02x \n",
         m_mac[0], m_mac[1], m_mac[2], m_mac[3], m_mac[4], m_mac[5]);

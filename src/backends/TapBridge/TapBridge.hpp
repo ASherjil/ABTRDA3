@@ -132,9 +132,13 @@ public:
     while (!stop.stop_requested()) {
       bool activity{};
 
-      // RX: NIC queue -> TAP fd packets destined for the kernel
+      // RX: NIC queue -> TAP fd packets destined for the kernel. Best-effort by design:
+      // a short/failed write means the kernel dropped a housekeeping frame (NFS/SSH
+      // retransmit), and the bridge must never stall the NIC queue for it — so the
+      // frame is released regardless. Result consumed only to satisfy warn_unused_result.
       if (RxFrame rxf = m_rx.tryReceive(); !rxf.data.empty()) {
-        ::write(m_fd, rxf.data.data(), rxf.data.size());
+        const ssize_t written = ::write(m_fd, rxf.data.data(), rxf.data.size());
+        (void)written;
         m_rx.release();
         m_rxCount++;
         activity = true;

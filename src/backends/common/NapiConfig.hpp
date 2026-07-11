@@ -129,7 +129,7 @@ inline std::uint16_t resolveFamily(int fd, const char* name) {
     auto* attr = reinterpret_cast<nlattr*>(
         reinterpret_cast<char*>(NLMSG_DATA(rh)) + GENL_HDRLEN);
     int rem = static_cast<int>(rh->nlmsg_len) -
-              static_cast<int>(NLMSG_HDRLEN) - GENL_HDRLEN;
+              static_cast<int>(NLMSG_HDRLEN) - static_cast<int>(GENL_HDRLEN);
     for (; rem >= static_cast<int>(NLA_HDRLEN) && rem >= attr->nla_len;
          rem -= NLA_ALIGN(attr->nla_len),
          attr = reinterpret_cast<nlattr*>(reinterpret_cast<char*>(attr) +
@@ -279,7 +279,7 @@ inline NapiParams getBusyPoll(std::uint32_t napiId, const char* tag = "AFXDP") {
     auto* attr = reinterpret_cast<nlattr*>(
         reinterpret_cast<char*>(NLMSG_DATA(rh)) + GENL_HDRLEN);
     int rem = static_cast<int>(rh->nlmsg_len) -
-              static_cast<int>(NLMSG_HDRLEN) - GENL_HDRLEN;
+              static_cast<int>(NLMSG_HDRLEN) - static_cast<int>(GENL_HDRLEN);
     for (; rem >= static_cast<int>(NLA_HDRLEN) && rem >= attr->nla_len;
          rem -= NLA_ALIGN(attr->nla_len),
          attr = reinterpret_cast<nlattr*>(reinterpret_cast<char*>(attr) +

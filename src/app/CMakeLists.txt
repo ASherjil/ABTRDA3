@@ -15,6 +15,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(SPSCQueue)
 
+# Treat SPSCQueue's headers as SYSTEM: it uses std::hardware_destructive_interference_size,
+# which GCC warns about (-Winterference-size: the value can change with -mtune, so it is
+# unstable across a public ABI). It is a header-only dependency compiled into this binary
+# only, so the ABI concern does not apply — and marking it SYSTEM silences ITS warnings
+# without weakening -Wall/-Wextra/-Wconversion on our own code.
+get_target_property(SPSCQUEUE_INC SPSCQueue INTERFACE_INCLUDE_DIRECTORIES)
+set_target_properties(SPSCQueue PROPERTIES
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${SPSCQUEUE_INC}")
+
 # HdrHistogram_c — fixed-memory high-dynamic-range latency histogram. Records
 # every sample (billions) into ~1.5 MB so a 24 h soak needs no GB-scale storage.
 set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)

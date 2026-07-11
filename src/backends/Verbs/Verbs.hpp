@@ -473,7 +473,7 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
 }
 
 template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::rxSlot(std::uint16_t s) const noexcept {
+inline std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::rxSlot(std::uint16_t s) const noexcept {
   return m_buf + static_cast<std::size_t>(MaxFrame) * (1 + s);
 }
 
