@@ -383,7 +383,7 @@ that offset is silicon (§5.2), not software. Determinism, it turns out, is far 
 buy than latency.
 
 Register-level tuning contributed almost nothing here. A full audit of the igc PMD
-(`Known_driver_issues.md` §3.3) found the link speed to be the **only** lever that
+(`Known_driver_issues.md` §2.4) found the link speed to be the **only** lever that
 exists: interrupt moderation is already off after reset, EEE/LPI is already disabled by
 the PMD's base init (and the i225 has no 802.3az anyway — that is i226), DMA coalescing
 is never enabled, and the PMD exposes no devargs at all. The one knob that looks like a
@@ -412,7 +412,7 @@ one-frame-in-flight loop — the only change is the autoneg advertisement:
 
 _(Both ports' copper autoneg outlasted the PMD's ~20 s link-wait, and 3 frames of 17.2 M
 were lost in that window — all inside the discarded 500 k-sample warm-up. Zero timeouts and
-zero loss thereafter; `Known_driver_issues.md` §2.3.)_
+zero loss thereafter.)_
 
 Against the 1 GbE results in §5.1, dropping the link speed is worth **3.75 µs of median
 RTT** (17.143 → 13.397) — the *slower* link is 22 % faster end to end. That is not a
@@ -448,8 +448,8 @@ are no-ops, and frames only leave when unrelated kernel traffic happens to run t
 queue's NAPI. A one-frame-in-flight RTT therefore deadlocks after the first hop — the
 kernel's own `xdpsock -l` freezes at rx=1/tx=1 on igc, while the identical procedure
 bounces >1 M hops on i40e and mlx5. Not slow: *unmeasurable*. This also rules out the
-DPDK-over-AF_XDP PMD here (it rides the same `igc.ko` zero-copy path). Full mechanism,
-the 3-NIC proof, and the false trails: `Known_driver_issues.md` §2.
+DPDK-over-AF_XDP PMD here (it rides the same `igc.ko` zero-copy path). Full mechanism and
+the 3-NIC xdpsock proof: `Known_driver_issues.md` §2.1.
 
 ---
 

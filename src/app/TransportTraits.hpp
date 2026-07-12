@@ -266,7 +266,7 @@ template<class Nic>
     const std::string bdf = pci::resolveBdf(role.interface);
     if (role.driver == "igc" && !role.dpdkAfxdpPmd) {
         if (kIgcAdvertise1GOnly) nic.setLinkSpeeds(RTE_ETH_LINK_SPEED_1G);
-        nic.setSymmetricQueues(true);        // nb_txq=0 silently breaks igc RX (KDI §3.1)
+        nic.setSymmetricQueues(true);        // nb_txq=0 silently breaks igc RX (KDI §2.2)
     }
     if (role.driver.find("mlx5") != std::string::npos && !role.dpdkAfxdpPmd) {
         nic.setDevargs(kMlx5LatencyDevargs);
@@ -321,7 +321,7 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
     // DPDK needs its OWN --single lifecycle: EAL is process-global, so BOTH ports must be
     // registered (prepare) before the first init() triggers the one rte_eal_init; and a
     // loopback link only comes up once BOTH PHYs are up, so start both (init(false) = no
-    // link wait), then wait both. One hot-path core drives both ports. KDI §4.1.
+    // link wait), then wait both. One hot-path core drives both ports. KDI §3.
     template<class Fn>
     static int withSinglePair(const TestConfig& cfg, Fn&& fn) {
         TxOnly tx(cfg.client.interface, cfg.recHotPathCore, cfg.client.driver);

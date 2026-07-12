@@ -1,37 +1,60 @@
-# Known Driver Issues (AF_XDP & DPDK PMDs)
+# Known Driver Issues
 
-Driver-level problems found while building ultra-low-latency transports on the
-`rtserver` test bench (kernel `7.0.7-hz100`). Each issue is stated as
-**symptom → mechanism → evidence → fix/status**. The recurring theme for AF_XDP: it
-keeps the in-tree kernel driver in the datapath, so its latency and reliability are
-inherited from each driver's NAPI / zero-copy maturity (i40e, mlx5 sound; igc
-broken). Every AF_XDP anomaly below was localised against **xdpsock** (the kernel's
-own reference AF_XDP app) — if xdpsock fails too, the fault is in the driver, not our
-code.
+Driver-level problems found while building ultra-low-latency transports on the `rtserver`
+bench (kernel `7.0.7-hz100`). Each is stated as **symptom → mechanism → evidence → fix**,
+and every claim below is backed by a measurement or a source line. Where a fix is a
+register write, the register is read back and printed at startup.
 
-Coverage: §1 i40e AF_XDP, §2 igc AF_XDP (the disqualification), §3 igc **DPDK PMD**
-quirks, §4 **DPDK EAL** traps (control-thread placement, process-global init, SIMD,
-teardown) — these hit every PMD.
+The recurring theme for AF_XDP: it keeps the in-tree kernel driver in the datapath, so its
+latency and reliability are inherited from that driver's NAPI and zero-copy maturity. Every
+AF_XDP anomaly here was reproduced with **xdpsock**, the kernel's own reference AF_XDP app —
+if xdpsock fails too, the fault is in the driver, not in our code.
+
+## Contents
+
+- [1. Intel XXV710-DA2 — `i40e`](#1-intel-xxv710-da2--i40e)
+  - [1.1 AF_XDP: busy-poll is a silent no-op on the stock driver](#11-af_xdp-busy-poll-is-a-silent-no-op-on-the-stock-driver)
+  - [1.2 AF_XDP: a gapless busy-poll strands RX](#12-af_xdp-a-gapless-busy-poll-strands-rx)
+  - [1.3 DPDK: RX write-back is ITR-gated — fixed with NoITR](#13-dpdk-rx-write-back-is-itr-gated--fixed-with-noitr)
+- [2. Intel I225-V — `igc`](#2-intel-i225-v--igc)
+  - [2.1 AF_XDP: zero-copy TX has no pump — disqualified](#21-af_xdp-zero-copy-tx-has-no-pump--disqualified)
+  - [2.2 DPDK: `nb_txq = 0` silently breaks RX](#22-dpdk-nb_txq--0-silently-breaks-rx)
+  - [2.3 DPDK: RX `WTHRESH = 0` stops write-back, and `imissed` lies](#23-dpdk-rx-wthresh--0-stops-write-back-and-imissed-lies)
+  - [2.4 DPDK: the 2.5G PHY is slower than 1G — run the link at 1 GbE](#24-dpdk-the-25g-phy-is-slower-than-1g--run-the-link-at-1-gbe)
+- [3. DPDK EAL — affects every PMD](#3-dpdk-eal--affects-every-pmd)
 
 ---
 
-## 1. Intel XXV710-DA2 — `i40e` (netdevs `xxv0` / `xxv1`)
+## 1. Intel XXV710-DA2 — `i40e`
 
-### 1.1 Busy-poll is silently disabled on the stock driver — requires a patch
+### 1.1 AF_XDP: busy-poll is a silent no-op on the stock driver
 
-**Symptom.** `setsockopt(SO_BUSY_POLL / SO_PREFER_BUSY_POLL)` succeeds, but the XSK
-socket never actually busy-polls; RX falls back to interrupt latency. No error is
-reported.
+**Symptom.** `setsockopt(SO_BUSY_POLL / SO_PREFER_BUSY_POLL)` succeeds and reads back as
+enabled, but the socket never busy-polls — RX runs at interrupt latency. Nothing errors.
 
-**Mechanism.** The kernel busy-poll path (`sk_busy_loop`, `net/xdp/xsk.c`) needs a
-**nonzero `napi_id`** on the bound RX queue to know which NAPI instance to spin on.
-Stock i40e never calls `netif_queue_set_napi()` for its RX queues, so the XSK socket
-gets `napi_id = 0` → `sk_can_busy_loop()` is false → busy-poll is inert. (igc and
-mlx5 do this association in-tree, so they don't need a patch.)
+**Mechanism.** The kernel busy-poll path (`sk_busy_loop`, `net/xdp/xsk.c`) needs a **nonzero
+`napi_id`** on the bound RX queue to know which NAPI to spin on. Stock i40e never calls
+`netif_queue_set_napi()` for its RX queues, so the XSK socket gets `napi_id = 0`,
+`sk_can_busy_loop()` is false, and busy-poll is inert. igc and mlx5 do this association
+in-tree and need no patch.
 
-**Patch** (`patches/i40e-afxdp-busypoll.patch`) — wire each RX queue to its
-q_vector's NAPI in `i40e_napi_enable_all()` (cleared in disable), mirroring
-`igc_set_queue_napi()`:
+**Verify it — `getsockopt` is NOT proof.** It only echoes the socket option back; it never looks
+at `napi_id`. (Our own `busy-poll ACTIVE` log line has the same weakness.) Check the queue:
+
+```bash
+# stock i40e.ko: 0 hits. Patched: 1.
+nm -D /lib/modules/$(uname -r)/kernel/drivers/net/ethernet/intel/i40e/i40e.ko \
+  | grep -c netif_queue_set_napi
+
+# every RX queue must show a NONZERO napi-id (TX queues have none — the patch is RX-only)
+sudo ynl --family netdev --do queue-get --json '{"ifindex":'$(cat /sys/class/net/xxv0/ifindex)'}'
+```
+
+On the patched driver every `xxv0`/`xxv1` RX queue reports a nonzero `napi-id` (8210–8217 /
+8218–8225). On stock, all zero.
+
+**Fix.** `patches/i40e-afxdp-busypoll.patch` — wire each RX ring to its q_vector's NAPI in
+`i40e_napi_enable_all()` (and clear it in disable), mirroring `igc_set_queue_napi()`:
 
 ```c
 /* in i40e_napi_enable_all() */
@@ -40,299 +63,366 @@ i40e_for_each_ring(ring, q_vector->rx)
                              NETDEV_QUEUE_TYPE_RX, &q_vector->napi);
 ```
 
-**Evidence.**
-- Symbol: loaded `i40e.ko` references `netif_queue_set_napi` (`nm … | grep -c` → 1);
-  the stock backup `i40e.ko.jun10bak` → 0.
-- Runtime: `ynl queue-get` shows `xxv0`/`xxv1` RX queues 0–7 each with a nonzero
-  `napi-id` (8210–8217 / 8218–8225); TX queues have none (patch is RX-only — correct).
-- `getsockopt` is **not** proof: our `[AFXDP] busy-poll ACTIVE` log only reads the
-  socket option back, not `napi_id`. Verify engagement with the `ynl` napi-id check.
+All published i40e AF_XDP numbers were taken on this patched driver, so they are real
+busy-poll and not interrupt-driven.
 
-**Status.** Patched driver built and **loaded/active** on `rtserver`
-(`/sys/module/i40e/srcversion` == on-disk `i40e.ko`). All i40e busy-poll/RTT numbers
-were taken on the patched driver — they are real busy-poll, not interrupt-driven.
+### 1.2 AF_XDP: a gapless busy-poll strands RX
 
-### 1.2 NAPI deferral strands the hardirq under a gapless FIFO busy-poll
+**Symptom.** With NAPI deferral on (`napi_defer_hard_irqs=2`, `gro_flush_timeout` nonzero), a
+**SCHED_FIFO** busy-poll loop on a cleanly isolated core never receives sparse / request-reply
+traffic. The frame reaches the NIC — `port.rx_unicast` increments — but `rx_packets` stays 0
+and the app never sees it.
 
-**Symptom.** With NAPI deferral on (`napi_defer_hard_irqs=2`,
-`gro_flush_timeout=2000ns`) a SCHED_FIFO busy-poll loop pinned to an isolated core
-**drops sparse / idle / request-reply RX entirely** — the frame reaches the NIC
-(`port.rx_unicast` increments) but `rx_packets` stays 0 and the app never sees it.
+**Mechanism.** Under deferral the hardirq stays masked during busy-poll and re-arms only when
+the NAPI *completes* (`napi_complete_done`, once the defer counter decays). Completion needs a
+**gap in the polling**: an interval where the app is not calling `recvfrom`, so the gro timer
+can fire. Every `recvfrom` runs `busy_poll_stop`, which **resets** the counter. A never-yielding
+FIFO loop on a dedicated core resets it forever → NAPI never completes → the hardirq never
+re-arms → the packet is stranded. It is a property of the **gap**, not of the poll rate.
 
-**Mechanism.** Under deferral the i40e hardirq stays masked during busy-poll and
-re-arms only when the NAPI *completes* (`napi_complete_done`, after the defer counter
-decays to 0). Completion requires a **gap in the polling** — a ≥ ~4 µs (2× gro)
-pause where the app isn't calling `recvfrom`, so the gro-timer softirq can decay the
-counter. Every `recvfrom` runs `busy_poll_stop`, which **resets** the counter. A
-never-yielding FIFO loop on a dedicated isolated core resets it forever → NAPI never
-completes → hardirq never re-arms → the packet is stranded. It is a **timing/gap**
-property, not a poll-rate property.
+**Reproduce it with xdpsock.** The whole trick is `-Q`: it suppresses xdpsock's own per-second
+stats thread. **That thread is the bug's camouflage** — it preempts xdpsock's poll loop
+~5×/10 s, and that incidental gap is the only reason stock xdpsock re-arms the IRQ and appears
+healthy.
 
-**How we broke xdpsock** (proof it's the driver/scheduling, not our code). Under the
-*identical* stack (isolated cmdline, deferral 2/2000, `-B`, FIFO:49, `taskset -c 2`),
-xdpsock *caught* the lone packets while our rxsink stranded — at first glance "our
-code is worse." It is not:
-- `recvfrom` rate was equal (ours ~1.481 M/s vs xdpsock ~1.455 M/s) → not over-polling.
-- `/proc/<pid>/status`: both had **0 voluntary** context switches; xdpsock had ~5
-  *involuntary* preemptions / 10 s, ours had **0**.
-- `perf record -e sched:sched_switch -C 2`: the preemptions were **xdpsock→xdpsock** —
-  its main thread being preempted by its own **SCHED_OTHER stats-poller thread** (run
-  via RT-throttling, `sched_rt_runtime_us=950000/1000000`, ~1/s). That incidental gap
-  is the *only* reason xdpsock re-armed the IRQ.
-- Negative control: `xdpsock -Q` (gates out the poller) → xdpsock **strands** exactly
-  like us. Positive control: a co-located FIFO:50 dummy ("GAP_MAKER") or a hog on the
-  core → our app **catches**. (`bpftrace` was unusable here — malformed `btf_vmlinux`;
-  used `/proc/status` + `perf` instead.)
+```bash
+# 1. deferral ON  (the regime under test)
+echo 2      | sudo tee /sys/class/net/xxv1/napi_defer_hard_irqs
+echo 200000 | sudo tee /sys/class/net/xxv1/gro_flush_timeout
 
-So xdpsock was never a better receive loop — just a noisier roommate on the core.
+# 2. RX: zero-copy, busy-poll, gapless FIFO on an isolated core.
+#    -Q = no stats thread  => a TRULY gapless loop. Drop -Q and the bug hides.
+sudo taskset -c 6 ./xdpsock -i xxv1 -q 0 -r -z -B -b 1 -W FIFO -U 49 -Q &
 
-**Reconfirmed via IRQ isolation — the gap can be a stray IRQ, not just a thread.** A stale
-`pin-irqs.sh` mask (`HOUSE="0-1,6-7"`, from a prior 2–5 isolation) was mis-routing WiFi IRQs
-onto the now-isolated cores 6,7 after isolation moved to 5–7 — that traffic silently supplied
-the re-arm gap, so the socket *caught* (making the strand look "fixed"). Moving all WiFi/mlx5
-IRQs off the isolated cores made the strand **reproduce at both `gro=2000` and `gro=200000`** —
-proving the gro value is irrelevant; the **gap, not the timer, is the variable**. Residual IPIs
-(`LOC`/`RES`/`CAL`, ~35/s) still hit the core yet are **not** enough — specifically **NET_RX
-device-IRQ** activity is what nudges the NAPI. **Trap:** before trusting any FIFO busy-poll
-result, confirm the isolated cores carry no device IRQs
-(`grep -E 'iwlwifi|mlx5' /proc/interrupts` → the isolated-core columns must be 0).
+# 3. TX: inject exactly ONE frame from the other port  (-C 1)
+sudo taskset -c 5 ./xdpsock -i xxv0 -q 0 -t -z -B -b 1 -C 1 \
+     -G 40:a6:b7:02:b3:11 -H 40:a6:b7:02:b3:10
 
-**Evidence (numbers).**
-- Clean A/B: `ABTRDA3_RT_BYPASS=1` (SCHED_OTHER) → caught 5/5, IRQ 189 climbed;
-  default FIFO+pin → 0 caught, IRQ 189 frozen. Same binary.
-- GAP_MAKER + deferral: first working deferred RTT, but median **1011 µs ≈ the
-  1.01 ms gap period** — RTT is gated by the re-arm cadence (replies land in ~10 µs,
-  the min, then wait for the next gap). Shrinking the gap to ~10 µs burns ~50% of the
-  core. The deferred path is structurally unfit for low latency.
+# 4. did the hardirq ever re-arm?
+grep i40e-xxv1 /proc/interrupts     # frozen => stranded
+```
 
-**Fix.** Run **without deferral**: `napi_defer_hard_irqs=0`, `gro_flush_timeout=0`
-(`AFXDP.hpp` `NAPI_DEFER_HARD_IRQS=0` / `NAPI_GRO_FLUSH_NS=0`). `busy_poll_stop` then
-calls `napi_complete_done` after every empty poll → the inline poll catches the
-descriptor each iteration and the hardirq stays armed as a backstop, **no gap
-required**. Result (i40e, `xxv0↔xxv1`, 10 k RTT): median **10.38 µs** (5.19 µs
-one-way), P99 10.97 µs. Cost: continuous ~34 k IRQ/s, but only on housekeeping cores
-(0–1,6–7), never the hot core → no jitter, CPU/power only. Under pure FIFO busy-poll
-there is no middle ground — `defer>0` stalls, `defer=0` storms; `0` is the only
-workable value. (Open: ~0.1% tail to ~200 µs at P99.9 — separate tail-cliff work.)
+| xdpsock RX | Result |
+|---|---|
+| `-W FIFO -U 49` **without** `-Q` | catches — its stats thread supplies the gap |
+| `-W FIFO -U 49` **with** `-Q` | **strands.** IRQ count frozen, `rx_packets` = 0 |
+| SCHED_OTHER (drop `-W/-U`) | catches — the scheduler supplies the gap |
 
-### 1.3 `needs_wakeup` flag-timing quirk — since fixed
+Confirmed with `perf record -e sched:sched_switch` (the preemptions are **xdpsock→xdpsock**,
+its own stats thread) and `/proc/<pid>/status` (both loops show **0 voluntary** context
+switches; only xdpsock shows involuntary ones). `recvfrom` rates were equal (~1.46–1.48 M/s),
+so this is not over-polling.
 
-There was historically a `needs_wakeup`-related fragility (driver-dependent timing of
-the wakeup flag affecting the ZC wakeup path); it has since been addressed and is no
-longer a blocker on this kernel. Noted for completeness only.
+**A stray IRQ supplies the gap too.** A stale IRQ-pinning mask left WiFi interrupts on a
+supposedly isolated core, which masked the strand entirely. With all device IRQs moved off, the
+strand **reproduces at both `gro_flush_timeout=2000` and `200000`** — the gro value is
+irrelevant; the gap is the variable. Residual IPIs (`LOC`/`RES`/`CAL`, ~35/s) are *not* enough;
+NET_RX device activity is. **Check before trusting any FIFO busy-poll result:**
 
----
+```bash
+grep -E 'iwlwifi|mlx5' /proc/interrupts   # isolated-core columns MUST be 0
+```
 
-## 2. Intel I225-V — `igc` (netdevs `enp5s0` / `enp6s0`)
+**Fix — two escapes, both verified:**
 
-**Final verdict (2026-07-10, after a multi-day investigation):** the igc driver has
-**no self-service pump for the XSK zero-copy TX ring**. Everything below — the
-"wedges", the "modprobe fixes", the works-then-doesn't behaviour — turned out to be
-one root cause wearing different disguises. AF_XDP on igc is disqualified for
-one-frame-in-flight latency measurement; the NIC is DPDK-only in this campaign.
+```bash
+# A. SCHED_OTHER (what we publish). Scheduler preemption supplies the gap.
+#    Measured statistically tied with FIFO:49 on this bench, so nothing is lost.
 
-### 2.1 Root cause: ZC TX is only serviced from a NAPI path that nothing drives
+# B. Kill deferral. busy_poll_stop() then calls napi_complete_done() on every empty
+#    poll, so no gap is needed. Costs ~34k IRQ/s — on housekeeping cores only.
+echo 0 | sudo tee /sys/class/net/xxv1/napi_defer_hard_irqs
+echo 0 | sudo tee /sys/class/net/xxv1/gro_flush_timeout
+```
 
-In the igc source, `igc_xdp_xmit_zc()` — the only function that moves XSK TX
-descriptors to the hardware ring — is invoked *exclusively* from `igc_clean_tx_irq()`,
-i.e. from the **TX queue-vector's interrupt/NAPI handler**. The `need_wakeup` flag is
-likewise only ever set inside that same handler. Two facts make this fatal:
+Under a gapless FIFO loop there is no middle ground: `defer > 0` strands, `defer = 0` storms.
 
-- With `combined=1` (mandatory for xdpsock-style single-queue tests) the i225 runs
-  **unpaired** `rx-0` / `tx-0` MSI-X vectors — `igc_set_flag_queue_pairs()` only pairs
-  RX and TX onto one vector when more than half the max queues (4) are in use.
-  i40e, by contrast, always uses paired `TxRx` vectors: its RX poll services TX
-  completions in the same NAPI pass, which is why i40e honours the AF_XDP contract.
-- Both busy-polling and `sendto()` kicks drive the **RX** NAPI only. On igc a kick
-  returns having done nothing; `need_wakeup` on/off is behaviourally identical
-  (verified: unconditional-kick builds change nothing).
+### 1.3 DPDK: RX write-back is ITR-gated — fixed with NoITR
 
-So a userspace ZC application **cannot cause its own TX descriptors to be
-transmitted**. Frames leave only when *unrelated kernel traffic* (IPv6 housekeeping,
-ARP, anything addressed to the port) runs the TX vector's NAPI — a **donor pump**.
-Streaming tests mask this (interrupts are always in flight); a ping-pong exposes it:
-after the first hop there is no donor, and the exchange deadlocks. The kernel's own
-`xdpsock -l` (l2fwd) cannot ping-pong on igc — in zero-copy mode it deliberately
-issues no kicks (the source comments "Tx is driven by the NAPI loop"; the kick is
-gated on `XDP_COPY`).
+**Symptom.** Stock DPDK on the XXV710 gives a **~30 µs** median RTT at one frame in flight —
+roughly 3× what the silicon can do — with no dropped packets and no obvious cause.
 
-**The controlled proof (3-NIC manual A/B, chatter deliberately left ON):** l2fwd
-reflectors on both ports of each NIC, one seeded frame injected. mlx5: bounces
-indefinitely. i40e: **1,035,345 hops/side** (≈12.3 µs/RTT). igc: **freezes at
-rx=1 / tx=1** — while a unidirectional xdpsock Tx→Rx on the very same ports ran fine
-*simultaneously* (RX path healthy; TX pump absent). Same binaries, same procedure,
-one variable: the driver.
+**Mechanism.** The 700-series does **not** write an RX descriptor back per packet. Datasheet
+332464 rev4.1 §8.3.3.1.4.2: write-back happens only when (a) a full 128 B descriptor line
+completes (4 × 32 B — which never happens with one frame in flight), (b) the queue context is
+evicted, or (c) **the interrupt logic initiates it**. With one frame in flight only (c) is
+available, so the descriptor is delivered on the interrupt-moderation timer — the ITR. DPDK
+binds the data path with `I40E_ITR_INDEX_DEFAULT` (= 0, a real ITR) at `i40e_ethdev.c:2473`,
+and `i40e_calc_itr_interval()` programs that ITR to **32 µs** (`i40e_ethdev.h:1521`).
 
-### 2.2 The false trails this produced (kept as a methodology warning)
+The datasheet names the escape hatch itself, in the same section:
 
-Before the root cause was isolated, the symptom set supported several wrong theories,
-each briefly convincing:
+> *"The receive descriptors could be reported instantly for each packet by setting the ITR_INDX
+> to NoITR."*
 
-- **"ZC TX engine wedges under XDP attach/detach churn."** The freeze at exactly ring
-  depth (2048), zero completions, and millions of futile `sendto` kicks/sec looked
-  like a wedged DMA engine. It is simply the unserviced ring filling up.
-- **"`modprobe -r igc && modprobe igc` fixes it."** The reload never repaired
-  anything — it **restored the donor**: a fresh driver bind brings the ports up,
-  IPv6/DAD/MLD chatter fires, and that traffic services the TX queue for a while.
-- **"Control-plane ops (addr flush, flag changes) wedge TX."** They *silence the
-  donor* (a port with no addresses generates no kernel traffic), which kills ZC TX at
-  the next quiet moment. i40e survives identical ops because it never needed a donor.
-- **"It works when I test it, fails in the app."** Tests run right after
-  setup — while link-up chatter is still flowing. The app runs on a quiesced port.
+DPDK never does this on the data path. It defines `I40E_ITR_INDEX_NONE` (= 3) and uses it
+**only for the FDIR queue** (`i40e_fdir.c:233`) — exactly where it wants prompt write-back.
 
-**Rule that survives:** on igc, any ZC TX result is only valid if you can account for
-*what serviced the TX queue*. Cross-check `ethtool -S` on **both** ports against the
-app's own counters; igc's `imissed`/MPC is never populated and hides drops.
+**Fix — set `QINT_RQCTL.ITR_INDX = 3` (NoITR) by a direct BAR0 MMIO write.** No DPDK patch:
+the install stays stock. `pci::i40eSetNoItr()` (`PciHelpers.hpp`) maps
+`/sys/bus/pci/devices/<bdf>/resource0`, scans `QINT_RQCTL(q) = 0x0003A000 + 4q`, and
+read-modify-writes **bits 12:11 only** on each bound queue, preserving `MSIX_INDX`,
+`NEXTQ_INDX` and `NEXTQ_TYPE` so the interrupt linked-list stays intact. Applied after
+`dev_start` and read back:
 
-**Implication.** igc/i225 AF_XDP-ZC is not a measurable low-latency transport, with
-or without workarounds — the defect is architectural in the driver's NAPI wiring, not
-a tuning issue. The driver-quirk-immune path for igc is a **native DPDK PMD over
-vfio-pci** (`net_igc`), which takes `igc.ko` out of the loop entirely. (A `net_af_xdp`
-DPDK vdev does **not** count — it rides the same `igc.ko` ZC path.) An upstream
-report to intel-wired-lan is planned.
+```
+[PCI] xxv0 (0000:02:00.0): i40e NoITR on 1 RX queue(s) (q1: 0x47ff0001 -> 0x47ff1801)
+```
 
-### 2.3 Link/PHY warmup loss on cold bursts
+`XOR = 0x1800` — bits 11 and 12 exactly, nothing else touched. Enabled by `kI40eNoItr` in
+`src/app/TransportTraits.hpp`; applied identically to the DPDK vfio PMD, DPDK-over-AF_XDP and
+native AF_XDP, since it is a property of the silicon rather than of the stack.
 
-**Symptom.** At the *front* of a transmit burst, the first frames are lost.
+**Evidence — a 2 × 2 over the two knobs** (XXV710, one frame in flight, RTT median):
 
-**Evidence.** Healthy NIC, `xdpsock` TX 100 k `enp5s0` → `enp6s0` hardware
-`rx_packets` delta = **99 767** (≈233 lost); a separate clean run lost 218. The loss
-is at the front (xdpsock drains its tail), ~220–230 frames at ~3 M pps ≈ **~75 µs** —
-consistent with i225 PHY/LPI wake latency after idle.
+| ITR interval | `ITR_INDX` | Median RTT |
+|---|---|---:|
+| 32 µs (PMD default) | 0 — stock DPDK | ~30 µs |
+| 0 (interval cleared) | 0 | 9.028 µs |
+| 32 µs (PMD default) | **3 — NoITR** | **9.029 µs** |
 
-**Consequence.** A tiny cold burst (e.g. `--count 2`) sent right after bind falls
-*entirely* inside this window and appears to "vanish." This is a measurement-priming
-issue, **not** a TX defect — **warm the link** (continuous traffic) before small-burst
-or one-way latency tests, or exclude the warmup frames.
+The third row is the point: **NoITR alone reaches the floor with the 32 µs interval left fully
+in place**, so it genuinely detaches the queue from the ITR. Clearing the interval to zero
+reaches the same floor by a different route — the two are equivalent, and neither goes below
+~9 µs. That residual is the silicon (two serialised PCIe reads per TX plus the MAC/PHY), not
+write-back gating.
 
-### 2.4 Asynchronous-TX teardown sensitivity (drain before close)
+**Positive control — proof the hardware honours a post-`dev_start` write.** A register readback
+only proves the *register* took the value; it cannot prove the queue's internal context is
+using it. So we point `ITR_INDX` at an otherwise-unused ITR index loaded with a deliberately
+large interval, where a working write must be *visible*:
 
-**Mechanism.** AF_XDP TX is asynchronous: `commit()` only *enqueues* a descriptor and
-kicks; the frame leaves the NIC when the kernel later runs the driver's NAPI ZC-xmit.
-A TX-only generator that finishes its loop in microseconds and tears the socket down
-(blind `sleep`) can close **before** NAPI pushes the last descriptors — they die in
-the ring. xdpsock avoids this with `complete_tx_only_all()` (loop kick+reap until
-`outstanding_tx == 0`); DPDK does an equivalent drain on port-stop.
+| ITR index 1 loaded with | `ITR_INDX` | Median RTT |
+|---|---|---:|
+| 20 µs | 1 | **20.653 µs** (P99 32.4, max 32.8) |
 
-**Driver interaction.** i40e completes promptly enough that a one-shot path tolerated
-the missing drain; on igc completion waits for the donor pump (§2.1), so an undrained
-teardown is near-guaranteed to strand frames. The correct idiom on *any* driver is to
-**drive the doorbell yourself and drain until `outstanding_tx == 0` before teardown**
-— teardown-only, zero hot-path cost. (On i40e the RX busy-poll drives the same paired
-NAPI, so RTT is unaffected; on igc nothing drives it — see §2.1.)
+The RTT more than doubles, so post-start `QINT_RQCTL` writes are honoured. (This also disproves
+a competing theory — that under DPDK's polling mode, with `INTENA` cleared and `WB_ON_ITR`
+never set, the ITR-expiry write-back path is structurally dead. A 20 µs interval demonstrably
+slows write-back, so that path is alive.) Re-runnable via `kI40eItrProbe`.
+
+**Cleanest demonstration — DPDK-over-AF_XDP.** On that path an `ethtool -C rx-usecs 50`
+*survives* into the run, so the throttle is verifiably live in the register at measurement
+time — and the latency is unaffected:
+
+```
+[DPDK-ITR] xxv0: PFINT_ITRN(data-RX)=0x00000019 (50us) => RX path THROTTLED (ITRN nonzero!)
+=== Round-Trip Latency Results ===  Median: 10.750 us
+```
+
+A 50 µs RX throttle that the hardware was obeying would put this at 30–60 µs. It sits on the
+10.753 µs baseline measured with the ITR cleared. NoITR is doing all of the work, with the
+counterfactual printed in the same log.
+
+**Three traps if you re-implement this.**
+
+- **Unimplemented i40e registers read back `0xDEADBEEF`.** That value has bit 30 (`CAUSE_ENA`)
+  set *and* bits 12:11 (`ITR_INDX`) already equal to 3 — so a naive scan "finds" hundreds of
+  bound queues and reports every write as successful. Validate with reserved bit 31 == 0.
+- **The bound queue is not at index 0.** On this card it is at absolute index **1** (queue 0
+  belongs to the FDIR VSI). A hardcoded index would write the wrong register and still succeed.
+  Locate queues by their `CAUSE_ENA` bit instead of assuming.
+- **`NEXTQ_TYPE` differs by driver.** DPDK writes `0` (`I40E_QUEUE_TYPE_RX`); the kernel driver
+  chains RX→TX and writes `1`. A validator keyed on `NEXTQ_TYPE == 0` silently matches nothing
+  on the AF_XDP paths.
 
 ---
 
-## 3. Intel I225-V — DPDK `igc` PMD quirks
+## 2. Intel I225-V — `igc`
 
-Not defects on the scale of §2 — the igc PMD is sound and is the transport we publish
-for this NIC — but three behaviours cost real debugging time and one of them silently
-voids results.
+### 2.1 AF_XDP: zero-copy TX has no pump — disqualified
 
-### 3.1 `dev_configure(nb_txq=0)` silently breaks RX
+**Symptom.** A one-frame-in-flight ping-pong over AF_XDP zero-copy deadlocks after the first
+hop. Not slow — **unmeasurable**.
 
-**Symptom.** An RX-only port (our SingleRecorder receiver) configures cleanly and
-starts, the NIC receives every frame (`ipackets` climbs), but `rte_eth_rx_burst()`
-returns 0 forever — and `imissed` stays 0.
-**Mechanism.** Unlike mlx5/i40e, the igc PMD does not tolerate an asymmetric
-queue count: configuring 0 TX queues succeeds but leaves RX descriptor write-back
-dead.
-**Fix.** Always configure ≥1 queue in *both* directions on igc, even for
-unidirectional roles (dispatch calls `setSymmetricQueues(true)` for igc — driver policy lives in `TransportDispatch.hpp`).
+**Mechanism.** `igc_xdp_xmit_zc()` — the only function that moves XSK TX descriptors to the
+hardware ring — is called *exclusively* from `igc_clean_tx_irq()`, i.e. from the **TX**
+queue-vector's NAPI handler. `need_wakeup` is likewise only ever set there. Two facts make
+that fatal:
 
-### 3.2 RX `WTHRESH=0` stops descriptor write-back entirely — and `imissed` lies
+- With `combined=1` the i225 runs **unpaired** `rx-0` / `tx-0` MSI-X vectors —
+  `igc_set_flag_queue_pairs()` only pairs RX and TX onto one vector when more than half of the
+  4 max queues are in use. (i40e always uses paired `TxRx` vectors, so its RX poll services TX
+  completions in the same NAPI pass — which is why i40e honours the AF_XDP contract.)
+- Busy-polling and `sendto()` kicks drive the **RX** NAPI only. On igc a kick returns having
+  done nothing.
 
-**Symptom.** Setting `rxconf.rx_thresh.wthresh = 0` (attempting immediate
-per-descriptor write-back, a valid idiom on other Intel parts): TX port
-`opackets=300000`, RX port `ipackets=300000`, app `recorded=0`, `imissed=0`.
-**Mechanism.** On i225 the write-back threshold must be non-zero; with 0 the
-write-back engine has no trigger and never posts a DD bit. The PMD's `imissed` is
-never populated (the MPC counter isn't wired up), so the loss is invisible to the
-standard stats.
-**Rule.** Keep the PMD default (4) — a full audit showed it costs nothing at one
-frame in flight because EITR sits at its post-reset default of 0 (no moderation
-timer delaying partial write-back flushes). And on igc, never trust `imissed`:
-cross-check `opackets` (TX port) vs `ipackets` (RX port) vs the app's own count.
+So a zero-copy application **cannot cause its own TX descriptors to be transmitted**. Frames
+leave only when unrelated kernel traffic (IPv6 housekeeping, ARP, anything addressed to the
+port) happens to run the TX vector's NAPI. Streaming tests hide this — interrupts are always in
+flight. A ping-pong exposes it: after the first hop there is no such traffic, and it deadlocks.
 
-### 3.3 Nothing else to tune — the audit trail
+**Reproduce it with xdpsock + mausezahn.** Run `xdpsock -l` (l2fwd = MAC-swap echo) on **both**
+ports of a back-to-back pair, then inject **one** seed frame. l2fwd swaps src↔dst, so that
+single frame bounces A→B→A→B forever: exactly one frame in flight, self-paced at the real RTT.
+No injector loop, no external pacing.
 
-A register-level audit of the PMD (DPDK 25.11) and the kernel driver, done before
-committing to the 24 h soak, so nobody repeats it: EITR is never written by the PMD
-and the init-time `CTRL.RST` returns it to 0 (moderation off — optimal); EEE/LPI is
-actively disabled by the PMD's own base init (and i225 has no 802.3az support anyway
-— that's i226-only); DMA coalescing is never enabled; the TX doorbell is written
-immediately per burst with RS on every descriptor; flow control defaults to
-`fc_full` (pause advertised — harmless at one frame in flight); PCIe ASPM was
-verified disabled on both ports. The igc PMD has **no devargs at all**. The only
-latency lever that exists is the link speed (Benchmarks.md §5.2): the 2.5GBASE-T PHY
-carries ~2.4 µs/traversal more fixed pipeline latency than 1000BASE-T, so the
-campaign runs this NIC at 1 GbE via autoneg-advertisement restriction
-(`kIgcAdvertise1GOnly` in `src/app/TransportDispatch.hpp` -> `setLinkSpeeds`; the PMD rejects forced speed).
+```bash
+# xdpsock binds queue 0 ONLY — RSS on >1 queue steers frames elsewhere and fakes a "hang"
+sudo ethtool -L enp5s0 combined 1
+sudo ethtool -L enp6s0 combined 1
+
+# l2fwd on BOTH ports: zero-copy (-z), busy-poll (-B), batch 1, no stats thread (-Q)
+sudo taskset -c 5 ./xdpsock -i enp5s0 -q 0 -l -z -B -b 1 -a -Q &
+sudo taskset -c 6 ./xdpsock -i enp6s0 -q 0 -l -z -B -b 1 -a -Q &
+
+# inject exactly ONE frame: dst = enp6s0's MAC, src = enp5s0's MAC, ethertype 0x88b5, 46B pad
+sudo mausezahn enp5s0 -c 1 \
+  "f0 2f 74 b1 41 97  f0 2f 74 b1 41 96  88 b5  $(printf '00 %.0s' $(seq 46))"
+
+# watch it bounce (or not)
+watch -n1 'ethtool -S enp5s0 | grep -w rx_packets; ethtool -S enp6s0 | grep -w rx_packets'
+```
+
+Run the identical procedure on each NIC — same binary, same flags, one variable (the driver):
+
+| NIC | Result after one injected frame |
+|---|---|
+| ConnectX-4 Lx (mlx5) | bounces indefinitely |
+| XXV710 (i40e) | **1,035,345 hops/side** (≈12.3 µs/RTT) |
+| **I225-V (igc)** | **freezes at `rx=1 / tx=1`** |
+
+On igc the counters stop dead after the seed frame is received once. Meanwhile a
+*unidirectional* `xdpsock -t` → `xdpsock -r` on the very same ports runs fine **at the same
+time** — the RX path is healthy; only the TX pump is missing. `-m` (kick TX unconditionally,
+ignoring `need_wakeup`) changes nothing, which rules out "the driver just forgot to set the
+wakeup flag": the kick itself is a no-op because it drives the RX NAPI.
+
+> **Trap:** `xdpsock -t -C 1` (send one packet *total*) always succeeds on igc, because
+> `igc_configure()` pre-arms ~2047 RX descriptors at setup. That is a primed ring, not a
+> healthy driver. Only a **sustained** send→wait→send sequence exposes the stall.
+
+**Implication.** igc AF_XDP-ZC is not a viable low-latency transport, and no userspace
+workaround exists — the defect is in the driver's NAPI wiring. The DPDK-over-AF_XDP vdev does
+**not** escape it either, since it rides the same `igc.ko` zero-copy path. The only viable path
+for this NIC is the **native DPDK `net_igc` PMD over vfio-pci**, which takes `igc.ko` out of
+the loop entirely. An upstream report to intel-wired-lan is planned.
+
+### 2.2 DPDK: `nb_txq = 0` silently breaks RX
+
+**Symptom.** An RX-only port configures cleanly and starts, the NIC receives every frame
+(`ipackets` climbs), but `rte_eth_rx_burst()` returns 0 forever — and `imissed` stays 0.
+
+**Mechanism.** Unlike mlx5 and i40e, the igc PMD does not tolerate an asymmetric queue count:
+configuring 0 TX queues succeeds but leaves RX descriptor write-back dead.
+
+**Fix.** Configure ≥ 1 queue in *both* directions on igc, even for unidirectional roles —
+`setSymmetricQueues(true)` in `src/app/TransportTraits.hpp`.
+
+### 2.3 DPDK: RX `WTHRESH = 0` stops write-back, and `imissed` lies
+
+**Symptom.** Setting `rxconf.rx_thresh.wthresh = 0` — attempting immediate per-descriptor
+write-back, a valid idiom on other Intel parts — gives: TX port `opackets = 300000`, RX port
+`ipackets = 300000`, app `recorded = 0`, `imissed = 0`. Every frame arrives at the NIC and none
+reaches the application, and the stats report no loss.
+
+**Mechanism.** On i225 the write-back threshold must be non-zero; with 0 the write-back engine
+has no trigger and never posts a DD bit. The PMD's `imissed` is never populated (the MPC
+counter isn't wired up), so the loss is invisible to the standard stats.
+
+**Fix.** Keep the PMD default (4). It costs nothing at one frame in flight, because EITR sits
+at its post-reset default of 0 — there is no moderation timer delaying the flush. **And never
+trust `imissed` on igc:** cross-check `opackets` (TX port) against `ipackets` (RX port) against
+the application's own count.
+
+### 2.4 DPDK: the 2.5G PHY is slower than 1G — run the link at 1 GbE
+
+**Symptom.** The I225-V is **faster at 1 GbE than at its native 2.5 GbE**: 17.143 µs median RTT
+at 2.5 GbE against **13.397 µs** at 1 GbE. Dropping the link rate is worth **3.75 µs**.
+
+**Mechanism.** The PHY, and Intel documents it in its own driver. The igc PTP
+timestamp-correction constants (`igc.h`, applied per link speed in `igc_ptp.c`) give the i225's
+*fixed* MAC+PHY pipeline latency:
+
+| Link speed | TX (ns) | RX (ns) | Per wire traversal |
+|---|---:|---:|---:|
+| 2500 | 1325 | 1485 | **2.81 µs** |
+| 1000 | 80 | 300 | **0.38 µs** |
+
+An RTT crosses the wire twice, so 2.5GBASE-T carries ~5.6 µs of unavoidable PHY latency where
+1000BASE-T carries ~0.76 µs. The slower link's extra serialisation of a 64-byte frame (~0.7 µs
+RTT) does not come close to paying that back. This is inherent to 802.3bz — 2.5GBASE-T is a
+quarter-clocked 10GBASE-T, so the LDPC codeword that occupies 320 ns at 10 G takes 1.28 µs to
+fill at 2.5 G and must be buffered whole before it can be decoded.
+
+**Fix.** Restrict the autoneg **advertisement** to 1 G, before `dev_configure`:
+
+```cpp
+// src/app/TransportTraits.hpp — kIgcAdvertise1GOnly
+if (role.driver == "igc")
+    nic.setLinkSpeeds(RTE_ETH_LINK_SPEED_1G);   // -> conf.link_speeds
+```
+
+The PMD **rejects** `RTE_ETH_LINK_SPEED_FIXED`, so restricting the advertisement is the only
+supported route — autoneg still runs, which is fine for BASE-T master/slave negotiation. Both
+ends are the two ports of the same card, so both resolve to 1 G.
+
+**Nothing else on this PMD is a latency lever.** A register-level audit of DPDK 25.11 and the
+kernel driver found: EITR is never written by the PMD and the init-time `CTRL.RST` leaves it at
+0 (moderation already off); EEE/LPI is already disabled by the PMD's own base init, and the
+i225 has no 802.3az support at all (that is i226-only); DMA coalescing is never enabled; the TX
+doorbell is written immediately per burst with RS on every descriptor; PCIe ASPM was verified
+disabled on both ports. **The igc PMD has no devargs at all.**
 
 ---
 
-## 4. DPDK EAL — the control thread lands on the poll core (all PMDs)
+## 3. DPDK EAL — affects every PMD
 
-**Symptom.** RTT tail spikes on the isolated hot core, with no NIC or app cause.
-The `dpdk-intr` thread (EAL's control thread — it services the i40e 50 ms
-self-re-arming link/stat alarm and VFIO config-space interrupts, plus the
-multiprocess socket handler) ping-pongs with our busy-poll loop ~80×/s (proven via
-`perf record -e sched:sched_switch`).
+**Symptom.** RTT tail spikes on the isolated hot core, with no NIC or application cause. The
+`dpdk-intr` thread — EAL's control thread, which services the i40e 50 ms self-re-arming
+link/stat alarm, VFIO config-space interrupts and the multiprocess socket — ping-pongs with our
+busy-poll loop ~80×/s (proven with `perf record -e sched:sched_switch`).
 
 **Mechanism.** EAL derives its control-thread cpuset from **the caller's affinity at
-`rte_eal_init` MINUS the dataplane lcores**. Our RTT server/client pins the caller to
-its single isolated lcore *before* init, so that difference is **empty** — and EAL
-falls back to pinning the control thread onto our poll core.
+`rte_eal_init`, minus the dataplane lcores**. Our RTT roles pin the caller to a single isolated
+lcore *before* init, so that difference is **empty** — and EAL falls back to pinning the control
+thread onto our poll core.
 
-**Fix** (`DpdkEal::ealInit`, `DPDK.hpp`). Narrow the caller's affinity to
-`{kControlThreadCore}` across the `rte_eal_init` call, then restore the caller's own
-pin. The control cpuset then resolves to exactly that core. Core **0** is the kernel's
-housekeeping/IRQ core (`irqaffinity=0,1`), where periodic work already lives.
+**Fix** (`DPDKEal::ealInit`). Narrow the caller's affinity to the housekeeping core *across* the
+`rte_eal_init` call, then restore the caller's own pin:
 
-**Scope.** Affects every PCI/vfio PMD. The AF_XDP PMD is immune (no PCI/VFIO interrupt
-source), but the fix is unconditional and harmless there.
+```cpp
+cpu_set_t saved, only;
+pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved);
+CPU_ZERO(&only);
+CPU_SET(kControlThreadCore, &only);                      // core 0 = housekeeping/IRQ core
+pthread_setaffinity_np(pthread_self(), sizeof(only), &only);
+rte_eal_init(argc, argv);                                // control cpuset = {0}
+pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved);
+```
 
-### 4.1 Process-global EAL — why `prepare()` and `init()` are separate
+Affects every PCI/vfio PMD. The AF_XDP PMD is immune (no PCI interrupt source), but the fix is
+harmless there.
 
-EAL initialises **once per process**, and its `-a` allowlist fixes which PCI devices
-exist for the **whole** process. The single-recorder owns BOTH loopback ports in one
-process, so both BDFs (or both `--vdev` strings) must be registered *before* the first
-`init()` triggers that one EAL init — hence the `prepare()` / `init()` split, and the
-process-wide (non-template) `DpdkEal` base that holds the lists. A static inside the
-class *template* would be duplicated per specialization (`DPDK<TxOnly>` vs
-`DPDK<RxOnly>`) and double-init EAL.
+**Process-global EAL — why `prepare()` and `init()` are separate.** EAL initialises **once per
+process**, and its `-a` allowlist fixes which PCI devices exist for the whole process. The
+single-recorder owns both loopback ports in one process, so both BDFs (or both `--vdev` strings)
+must be registered *before* the first `init()` triggers that one EAL init. Hence the split, and
+hence the non-template `DPDKEal` base holding the lists — a static inside the class *template*
+would be duplicated per specialisation (`DPDK<TxOnly>` vs `DPDK<RxOnly>`) and double-init EAL.
+Two allowlist rules: entries may carry devargs (`<bdf>,key=val`) and dedup compares only the BDF
+part (**first registration wins**); and the AF_XDP vdev path needs `--no-pci --in-memory`, so
+two AF_XDP primaries (RTT server + client) can run on one host without colliding on the lock
+file.
 
-Two allowlist rules worth knowing: entries may carry devargs (`<bdf>,key=val`) and
-dedup compares only the BDF part, **first registration wins** (so a devargs-bearing
-entry from `prepare()` is never shadowed by `ealInit`'s bare fallback); and the
-AF_XDP vdev path additionally needs `--no-pci` plus `--in-memory` (no
-`/var/run/dpdk/<prefix>` files) so two AF_XDP primaries — RTT server + client — can
-run on one host without colliding on the lock.
+**SIMD width — Intel's "scalar is a big latency win" guidance did NOT reproduce here.**
+`--force-max-simd-bitwidth` selects the i40e PMD's RX/TX path; A/B on XXV710 RTT gave
+**AVX-512 ≡ scalar ≈ 9.15 µs median**. The floor is the hardware pipeline, not the vector path.
+We ship **256** (AVX2): same latency as 512, keeps throughput headroom, avoids AVX-512's
+frequency side effects. Verify which path the PMD actually picked — the cheap way to confirm any
+devarg took:
 
-### 4.2 SIMD width and the i40e vector path
+```
+[DPDK] xxv0: tx burst mode: Vector AVX2      # rte_eth_{rx,tx}_burst_mode_get()
+[DPDK] xxv0: rx burst mode: Vector AVX2
+```
 
-`--force-max-simd-bitwidth` selects the i40e PMD's RX/TX path (512 = AVX-512, 256 =
-AVX2, 128 = SSE, 64 = scalar). **A/B on XXV710 RTT (2026-06-23): AVX-512 and scalar
-gave the SAME ~9.15 µs median** — the floor is the i40e hardware pipeline, not the PMD
-vector path, so Intel's "scalar = big latency win" guidance did **not** reproduce here.
-We ship **256** (AVX2): same latency as 512, keeps vector throughput headroom, and
-avoids AVX-512's frequency/power side effects. It is a cold EAL startup arg (no
-hot-path codegen impact); the startup burst-mode print (`rte_eth_{rx,tx}_burst_mode_get`)
-verifies which path the PMD actually picked — the cheap way to confirm any devarg took.
-
-### 4.3 Teardown: `dev_stop` only, never `dev_close`
-
-`shutdown()` calls `rte_eth_dev_stop` and nothing else. `dev_stop` disables
-queues/DMA/MSI-X and cancels the periodic alarm, so a device on vfio cannot keep
-running unattended and contend on PCIe with the next run's NIC — an earlier
-no-`dev_stop` version left the **igc DMA-ing during a subsequent XXV710 run**, producing
-a fat tail. We deliberately do **not** `set_link_up` or `dev_close`: `dev_stop` parks the
-PHY (i40e), so the next run's `dev_start` re-syncs from parked (~4.7 ms, ~85 ms in) —
-absorbed by the recorder's 500 k-packet warmup. The next process re-probes;
-`i40e_pf_reset()` cleans the stopped state.
-
-Also note the **bind-once** rule: `shutdown()` does not restore the kernel driver.
-Restoring it in the destructor **hangs** (the sysfs unbind blocks until vfio releases
-the device, but EAL still holds it — we never call `rte_eal_cleanup`). Re-runs resolve
-the BDF from the predictable name (`pci::bdfFromName`) since the netdev is gone.
-Recovery if ever needed: `dpdk-devbind --bind=i40e <bdf>`, or reboot.
+**Teardown: `dev_stop` only, never `dev_close`.** `dev_stop` disables queues/DMA/MSI-X and
+cancels the periodic alarm, so a device on vfio cannot keep running unattended and contend on
+PCIe with the next run — an earlier version without it left the **igc DMA-ing during a
+subsequent XXV710 run**, producing a fat tail. We deliberately do not `set_link_up` or
+`dev_close`: `dev_stop` parks the PHY, so the next `dev_start` re-syncs from parked (~4.7 ms),
+absorbed by the warmup. Also **bind-once**: `shutdown()` does not restore the kernel driver —
+doing it in the destructor **hangs**, because the sysfs unbind blocks until vfio releases the
+device while EAL still holds it (we never call `rte_eal_cleanup`). Recovery if needed:
+`dpdk-devbind --bind=i40e <bdf>`.

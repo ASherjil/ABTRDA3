@@ -10,7 +10,7 @@
 // Definitions live in DPDKEal.cpp, so rte_eal_init / the vfio bind are compiled once
 // instead of in every TU that includes DPDK.hpp.
 //
-// Traps + rationale: docs/Known_driver_issues.md §4.
+// Traps + rationale: docs/Known_driver_issues.md §3.
 
 #include <cstddef>
 #include <string>
@@ -21,17 +21,17 @@ protected:
   DPDKEal() noexcept = default;
 
   // i40e RX/TX path select: AVX-512 and scalar measured IDENTICAL (~9.15us) — the
-  // floor is the i40e hardware, not the vector path. 256 = AVX2 (KDI §4.2).
+  // floor is the i40e hardware, not the vector path. 256 = AVX2 (KDI §3).
   static constexpr unsigned kMaxSimdBitwidth = 256;
 
   // Park EAL's control thread ("dpdk-intr") here, off the poll core — otherwise it
-  // lands ON it and ping-pongs with our busy-poll ~80x/s -> tail spikes (KDI §4).
+  // lands ON it and ping-pongs with our busy-poll ~80x/s -> tail spikes (KDI §3).
   // Core 0 = kernel housekeeping/IRQ core (irqaffinity=0,1).
   static constexpr int kControlThreadCore = 0;
 
   // Both lists are filled by prepare() BEFORE the single EAL init (the single-recorder
   // owns both loopback ports in one process). Dedup keys on the BDF/vdev name and the
-  // FIRST registration wins, so a devargs-bearing entry survives (KDI §4.1).
+  // FIRST registration wins, so a devargs-bearing entry survives (KDI §3).
   static void addAllowedBdf(const std::string& bdf);   // "<bdf>[,key=val...]"    -> -a
   static void addVdev(const std::string& arg);         // "net_af_xdpN,iface=..." -> --vdev
 

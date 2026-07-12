@@ -467,7 +467,7 @@ inline bool i40eItrProbe(const std::string& bdf, std::string_view ifname,
 // (2026-07-10): the igc PMD's base init already disables EEE, and the i225 has no
 // 802.3az support at all (i226-only) — this always logs 0x0 -> 0x0. Kept as
 // belt-and-braces for parity with the published soak binaries; see
-// docs/Known_driver_issues.md §3.3.
+// docs/Known_driver_issues.md §2.4.
 inline bool igcDisableEee(const std::string& bdf, std::string_view ifname) noexcept {
   constexpr std::size_t   kEeer      = 0x00000E30;
   constexpr std::uint32_t kLpiEnable = 0x00030000;   // TX_LPI_EN | RX_LPI_EN

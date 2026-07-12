@@ -34,13 +34,13 @@
 // driver name), both false = default:
 //   default          PCI pass-through — prepare() unbinds the kernel driver onto
 //                    vfio-pci (needs intel_iommu=on iommu=pt). BIND-ONCE: shutdown()
-//                    does NOT restore the kernel driver (it would hang; KDI §4.3).
+//                    does NOT restore the kernel driver (it would hang; KDI §3).
 //   bifurcated=true  mlx5-class — stays on the kernel driver, DPDK drives alongside.
 //   afxdpPMD=true    DPDK-over-AF_XDP via a net_af_xdp vdev; the port is preconditioned
 //                    and its granted modes (ZC / busy-poll / deferral) read back.
 //
 // prepare()/init() are SPLIT because EAL is process-global: every port must be
-// registered before the first init() triggers the one rte_eal_init (KDI §4.1).
+// registered before the first init() triggers the one rte_eal_init (KDI §3).
 // init(doWaitLink=false) starts a port without waiting — a loopback link only comes
 // up once BOTH PHYs are up, so dispatch starts both, then waitLink()s both.
 // RING SIZES: 256 (not 1024) — at one frame in flight the rings are pure cache
@@ -322,7 +322,7 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
 
   if (HAS_RX || bothQueues) {
     // PMD-default thresholds: audited optimal at one-in-flight on every campaign NIC
-    // (never override rx wthresh to 0 on igc — it kills write-back; KDI §3.2).
+    // (never override rx wthresh to 0 on igc — it kills write-back; KDI §2.3).
     rte_eth_rxconf rxconf = info.default_rxconf;
     rxconf.offloads = conf.rxmode.offloads;
     if (rte_eth_rx_queue_setup(m_port, QueueId, nb_rxd, sid, &rxconf, m_pool) < 0) {
@@ -430,7 +430,7 @@ void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::shutdo
     rte_pktmbuf_free(m_pendingRx);
     m_pendingRx = nullptr;
   }
-  // dev_stop ONLY — no set_link_up, no dev_close, no kernel-driver restore (KDI §4.3).
+  // dev_stop ONLY — no set_link_up, no dev_close, no kernel-driver restore (KDI §3).
   rte_eth_dev_stop(m_port);
   if constexpr (HAS_TX) {
     if (m_txReuse) {
@@ -526,7 +526,7 @@ void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setLin
 }
 
 // For PMDs that break on an asymmetric queue config (igc: nb_txq=0 silently kills RX
-// — docs/Known_driver_issues.md §3.1). The AF_XDP PMD forces this internally.
+// — docs/Known_driver_issues.md §2.2). The AF_XDP PMD forces this internally.
 template<DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc, std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
 void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::setSymmetricQueues(bool on) noexcept {
   m_symmetricQueues = on;

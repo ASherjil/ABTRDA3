@@ -48,10 +48,7 @@ dpdk_bifurcated = false               # see [client] — same two DPDK binding-m
 dpdk_afxdp_pmd  = false
 
 # ── SingleRecorder (--single) ───────────────────────────────────────────────
-# Three DISTINCT isolated cores (rtserver: isolcpus=2-4). Run is time-bounded:
-# duration_sec = 60 for a smoke test, 86400 for a 24 h soak. The first 500k samples
-# are discarded as warmup (fixed in code), so add a little margin to duration_sec
-# (e.g. 310 for ~5 min of recorded data).
+# This is for advanced benchmarking, not recommended to use please ignore
 [single_recorder]
 hot_path_core           = 2           # Tx thread
 rx_core                 = 3           # Rx thread   (must differ from tx + recorder)
