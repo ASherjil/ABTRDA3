@@ -314,6 +314,11 @@ bool DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::init(b
     std::fprintf(stderr, "[DPDK] adjust_nb_rx_tx_desc failed (port %u)\n", m_port);
     return false;
   }
+  // Report what the PMD ACTUALLY took: adjust_nb_rx_tx_desc silently clamps to the PMD's
+  // min/max, so a requested ring is not a granted one. RX size drives the in-poll mbuf refill
+  // burst (mlx5: min(64, nb_rxd>>2)), which is a P99 lever — do not leave it unobservable.
+  std::fprintf(stderr, "[DPDK] %s: rx_desc=%u (asked %u) tx_desc=%u\n",
+               m_ifname.c_str(), nb_rxd, m_nbRxDesc, nb_txd);
 
   if (HAS_RX || bothQueues) {
     // PMD-default thresholds: audited optimal at one-in-flight on every campaign NIC

@@ -128,6 +128,54 @@ struct PacketMmapTraits : TransportBase<PacketMmapTraits> {
     }
 };
 
+// ── i40e RX write-back policy (SILICON, not per-transport) ──────────────────
+// The XXV710 honors the per-queue ITR even in pure polling mode: it gates when completed RX
+// descriptors are DMA'd back to host RAM. Applies to EVERY stack that touches this NIC —
+// DPDK (vfio), DPDK-over-AF_XDP, and native AF_XDP (kernel-bound) — so it lives up here,
+// above the traits that use it.
+//
+// NoITR (QINT_RQCTL.ITR_INDX = 3). Datasheet 332464 §8.3.3.1.4.2, verbatim: "The receive
+// descriptors could be reported instantly for each packet by setting the ITR_INDX to NoITR."
+// DPDK binds the data path with I40E_ITR_INDEX_DEFAULT (0 — a real ITR, 32us interval) at
+// i40e_ethdev.c:2473 and uses I40E_ITR_INDEX_NONE (3) ONLY for FDIR (i40e_fdir.c:233).
+//
+// MEASURED (XXV710, one frame in flight, 2x2 on the two knobs — 32M samples on the last row):
+//   ITR interval 32us (PMD default) + ITR_INDX 0 -> ~30us    stock DPDK
+//   ITR interval 0    (ITR cleared) + ITR_INDX 0 ->  9.028us
+//   ITR interval 0    (ITR cleared) + ITR_INDX 3 ->  9.027us
+//   ITR interval 32us (PMD default) + ITR_INDX 3 ->  9.029us  <== NoITR ALONE. Interval moot.
+// NoITR genuinely detaches the queue from the ITR. It and interval-zero are two routes to the
+// SAME floor: either alone suffices, together they are redundant, and NEITHER goes below ~9us
+// — so the ~9us floor is silicon (2 serialized PCIe reads/TX + MAC/PHY), NOT write-back
+// gating. We prefer NoITR: ONE write instead of two, and immune to anything re-arming the
+// interval — which matters most on the KERNEL path, where adaptive ITR rewrites the INTERVAL
+// (never the INDEX) behind our back. The write IS honored post-start: a positive control
+// (i40eItrProbe — point the queue at a 20us ITR index) took the median 9.03 -> 20.65us.
+inline constexpr bool kI40eNoItr = true;
+
+// Diagnostic only (see above). Flip on to re-demonstrate that BAR0 writes reach this silicon.
+inline constexpr bool          kI40eItrProbe         = false;
+inline constexpr std::uint32_t kI40eItrProbeIdx      = 1;    // free: NoITR leaves index 0 alone
+inline constexpr std::uint32_t kI40eItrProbeInterval = 10;   // x2us = 20us
+
+// Belt-and-braces ITR-INTERVAL clear (pci::i40eClearItr) ON TOP of NoITR. Redundant: NoITR
+// alone measures 9.029us with the interval left at the PMD's 32us default. Kept callable, OFF.
+inline constexpr bool kI40eAlsoClearItr = false;
+
+static_assert(!(kI40eNoItr && kI40eItrProbe), "NoITR and the ITR probe both write ITR_INDX");
+static_assert(kI40eNoItr || kI40eAlsoClearItr || kI40eItrProbe,
+              "i40e with neither NoITR nor the ITR clear sits at the PMD's 32us default (~30us RTT)");
+
+// Apply + verify, on ANY stack. `bdf` must already be resolved (post-vfio-unbind a renamed
+// port like "xxv0" cannot be re-derived from its name).
+inline void i40eApplyWritebackPolicy(const std::string& bdf, std::string_view ifname,
+                                     const char* tag) {
+    if (kI40eAlsoClearItr) pci::i40eClearItr(bdf, ifname);
+    if (kI40eNoItr)        pci::i40eSetNoItr(bdf, ifname);
+    if (kI40eItrProbe)     pci::i40eItrProbe(bdf, ifname, kI40eItrProbeIdx, kI40eItrProbeInterval);
+    pci::reportItr(bdf, ifname, tag);   // under NoITR a NONZERO ITRN is fine — it is ignored
+}
+
 // ── af_xdp ──────────────────────────────────────────────────────────────────
 // Direction is a compile-time param, so each role gets a MINIMAL socket (TxOnly skips
 // FILL/XSKMAP/steering; RxOnly skips the TX ring) and the TX kick policy can differ by
@@ -156,17 +204,27 @@ struct AfxdpTraits : TransportBase<AfxdpTraits> {
 
     template<class Nic>
     static bool init(Nic& xsk, const TestConfig& cfg, const RoleConfig& role) {
+        // Kernel-bound throughout, so the netdev exists and the BDF resolves by name.
+        const bool  isI40e = pci::boundToI40e(role.interface);
+        const std::string bdf = isI40e ? pci::resolveBdf(role.interface) : std::string{};
+
+        // PRE-BIND read. An `ethtool -C rx-usecs 50` lands in PFINT_ITRN immediately, yet by
+        // the time we look after the bind it reads 0 — so SOMETHING between here and there
+        // zeroes it. This line pins down whether that something is the XSK bind itself (which
+        // would mean AF_XDP never depended on ambient ITR state) or something earlier.
+        if (isI40e) pci::reportItr(bdf, role.interface, "AFXDP-ITR pre-bind");
+
         if (!xsk.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend))
             return false;
         // Coalescing MUST be zeroed AFTER the bind — xsk_socket__create() resets it, so
         // NicTuner cannot do it during pre-bind construction.
         if (cfg.nicTunerMode != NicTunerMode::Off)
             NicTuner::setCoalescingZero(role.interface.c_str());
-        // Read-only: confirm in SILICON that the data-queue RX ITR really is 0 after
-        // ethtool/NicTuner — a nonzero PFINT_ITRN is the RX-writeback throttle, not a
-        // NAPI-cadence limit (i40e only; KDI §1).
-        if (pci::boundToI40e(role.interface))
-            pci::reportItr(role.interface, "AFXDP-ITR");
+        // i40e: SET the write-back policy, don't just report it. NoITR detaches the queue from
+        // the ITR entirely, so it holds regardless of what the interval says — and unlike an
+        // interval clear it cannot be undone by the kernel's adaptive ITR. Must run AFTER
+        // xsk.init(): the bind reconfigures the queue pair and rewrites QINT_RQCTL.
+        if (isI40e) i40eApplyWritebackPolicy(bdf, role.interface, "AFXDP-ITR post-bind");
         return true;
     }
 
@@ -218,12 +276,13 @@ template<class Nic>
     return bdf;
 }
 
-// AFTER dev_start (a reset during start would wipe these). "i40e" covers both the vfio
-// PMD and DPDK-over-AF_XDP on a kernel-bound i40e — same silicon, same write-back
-// throttle. Both helpers read back what landed.
+// AFTER dev_start (a reset during start would wipe these). "i40e" covers BOTH the vfio PMD and
+// DPDK-over-AF_XDP on a kernel-bound i40e — same silicon, same write-back throttle, same policy
+// (i40eApplyWritebackPolicy, shared with native AF_XDP). The BDF is passed EXPLICITLY: after a
+// vfio unbind a renamed port ("xxv0") cannot be re-derived from its name.
 inline void dpdkPostInitFixes(const std::string& bdf, const RoleConfig& role) {
     if (role.driver == "i40e")
-        pci::i40eClearItr(bdf, role.interface);
+        i40eApplyWritebackPolicy(bdf, role.interface, "DPDK-ITR");
     if (role.driver == "igc" && !role.dpdkAfxdpPmd)
         pci::igcDisableEee(bdf, role.interface);
 }
