@@ -106,23 +106,22 @@ for ifc in "${PING_IF}" "${PONG_IF}"; do
     fi
 done
 
-TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="./eflatency_${TS}"
-mkdir -p "${OUT_DIR}"
+# Everything prints to the terminal; the two process logs live in a temp dir
+# that is removed on exit — no artifacts left behind.
+TMP="$(mktemp -d /tmp/eflatency.XXXXXX)"
+trap 'rm -rf "${TMP}"' EXIT
 FRAME=$(( PAYLOAD + 42 ))
 
-{
-    echo "── eflatency bench ${TS} ──"
-    echo "kernel:    $(uname -r)"
-    echo "eflatency: ${EFLATENCY}"
-    echo "ping ${PING_IF} core ${PING_CORE}  |  pong ${PONG_IF} core ${PONG_CORE}"
-    echo "iters ${ITERS}  warmups ${WARMUPS}  payload ${PAYLOAD} (frame ${FRAME}B)  ct_thresh ${CT_THRESH}  modes ${MODES} ${NO_POISON}"
-    for ifc in "${PING_IF}" "${PONG_IF}"; do
-        ethtool "${ifc}" 2>/dev/null | grep -E "Speed|Link detected" | tr -s ' \n' ' ' | sed "s/^/${ifc}: /"
-        echo ""
-        ethtool --show-fec "${ifc}" 2>/dev/null | grep -i "Active FEC" | sed "s/^/${ifc}: /" || true
-    done
-} | tee "${OUT_DIR}/summary.txt"
+echo "── eflatency bench ──"
+echo "kernel:    $(uname -r)"
+echo "eflatency: ${EFLATENCY}"
+echo "ping ${PING_IF} core ${PING_CORE}  |  pong ${PONG_IF} core ${PONG_CORE}"
+echo "iters ${ITERS}  warmups ${WARMUPS}  payload ${PAYLOAD} (frame ${FRAME}B)  ct_thresh ${CT_THRESH}  modes ${MODES} ${NO_POISON}"
+for ifc in "${PING_IF}" "${PONG_IF}"; do
+    ethtool "${ifc}" 2>/dev/null | grep -E "Speed|Link detected" | tr -s ' \n' ' ' | sed "s/^/${ifc}: /"
+    echo ""
+    ethtool --show-fec "${ifc}" 2>/dev/null | grep -i "Active FEC" | sed "s/^/${ifc}: /" || true
+done
 
 # ── run ──────────────────────────────────────────────────────────────────────
 # pong MUST get the same -n/-w as ping: it loops exactly warmups+iterations
@@ -130,22 +129,22 @@ FRAME=$(( PAYLOAD + 42 ))
 # mid-run and strands the ping).
 taskset -c "${PONG_CORE}" "${EFLATENCY}" -n "${ITERS}" -w "${WARMUPS}" -s "${PAYLOAD}" \
     -c "${CT_THRESH}" -m "${MODES}" ${NO_POISON} \
-    pong "${PONG_IF}" > "${OUT_DIR}/pong.log" 2>&1 &
+    pong "${PONG_IF}" > "${TMP}/pong.log" 2>&1 &
 PONG_PID=$!
-trap 'kill ${PONG_PID} 2>/dev/null || true' EXIT
+trap 'kill ${PONG_PID} 2>/dev/null || true; rm -rf "${TMP}"' EXIT
 sleep 2
 if ! kill -0 "${PONG_PID}" 2>/dev/null; then
     echo "ERROR: pong died at startup:"
-    cat "${OUT_DIR}/pong.log"
+    cat "${TMP}/pong.log"
     exit 1
 fi
 
 echo "── running (~$(( ITERS / 500000 ))s estimated) ──"
 taskset -c "${PING_CORE}" "${EFLATENCY}" -n "${ITERS}" -w "${WARMUPS}" -s "${PAYLOAD}" \
     -c "${CT_THRESH}" -m "${MODES}" ${NO_POISON} \
-    ping "${PING_IF}" > "${OUT_DIR}/ping.log" 2>&1 &
+    ping "${PING_IF}" > "${TMP}/ping.log" 2>&1 &
 PING_PID=$!
-trap 'kill ${PING_PID} ${PONG_PID} 2>/dev/null || true' EXIT
+trap 'kill ${PING_PID} ${PONG_PID} 2>/dev/null || true; rm -rf "${TMP}"' EXIT
 
 # confirm actual placement (PSR = the cpu each process is executing on)
 sleep 3
@@ -157,12 +156,12 @@ for spec in "ping:${PING_PID}:${PING_CORE}" "pong:${PONG_PID}:${PONG_CORE}"; do
     psr="$(ps -o psr= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
     if [[ -z "${psr}" ]]; then
         # already exited: fine for a very short run; the wait below judges success
-        echo "  ${name} pid ${pid} finished before the placement check (short run)" | tee -a "${OUT_DIR}/summary.txt"
+        echo "  ${name} pid ${pid} finished before the placement check (short run)"
     elif [[ "${psr}" != "${want}" ]]; then
         echo "ERROR: ${name} (pid ${pid}) is on cpu ${psr}, expected cpu ${want} — aborting"
         exit 1
     else
-        echo "  ${name} pid ${pid} confirmed on isolated cpu ${psr}" | tee -a "${OUT_DIR}/summary.txt"
+        echo "  ${name} pid ${pid} confirmed on isolated cpu ${psr}"
     fi
 done
 
@@ -171,7 +170,7 @@ done
 DEADLINE=$(( SECONDS + ITERS / 250000 + 60 ))
 while kill -0 "${PING_PID}" 2>/dev/null; do
     if (( SECONDS > DEADLINE )); then
-        echo "ERROR: run exceeded time budget — killing both (see ${OUT_DIR}/*.log)"
+        echo "ERROR: run exceeded time budget — killing both"
         kill "${PING_PID}" "${PONG_PID}" 2>/dev/null || true
         exit 1
     fi
@@ -179,7 +178,7 @@ while kill -0 "${PING_PID}" 2>/dev/null; do
         sleep 5
         if kill -0 "${PING_PID}" 2>/dev/null; then
             echo "ERROR: pong exited but ping is still running (stranded) — pong.log:"
-            cat "${OUT_DIR}/pong.log"
+            cat "${TMP}/pong.log"
             kill "${PING_PID}" 2>/dev/null || true
             exit 1
         fi
@@ -190,20 +189,17 @@ done
 PING_RC=0
 wait "${PING_PID}" || PING_RC=$?
 kill "${PONG_PID}" 2>/dev/null || true
-trap - EXIT
-cat "${OUT_DIR}/ping.log"
+trap 'rm -rf "${TMP}"' EXIT
+cat "${TMP}/ping.log"
 if [[ "${PING_RC}" != "0" ]]; then
     echo "ERROR: ping exited with ${PING_RC}"
     exit 1
 fi
 
 # ── validate the datapath actually used (v9 prints "# mode: CTPIO") ──────────
-if grep -qE "^# (TX )?mode:" "${OUT_DIR}/ping.log" && \
-   ! grep -qE "^# (TX )?mode: CTPIO" "${OUT_DIR}/ping.log"; then
+if grep -qE "^# (TX )?mode:" "${TMP}/ping.log" && \
+   ! grep -qE "^# (TX )?mode: CTPIO" "${TMP}/ping.log"; then
     echo "WARNING: TX mode is NOT CTPIO — this is not the ULL configuration:"
-    grep -E "^# (TX )?mode:" "${OUT_DIR}/ping.log"
+    grep -E "^# (TX )?mode:" "${TMP}/ping.log"
 fi
 
-# eflatency's own table (mean/min/50%/95%/99%/max) is the result — keep it all
-cat "${OUT_DIR}/ping.log" >> "${OUT_DIR}/summary.txt"
-echo "── done: ${OUT_DIR}/summary.txt ──"

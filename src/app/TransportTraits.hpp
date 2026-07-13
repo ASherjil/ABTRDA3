@@ -418,13 +418,19 @@ inline constexpr unsigned kEfViCtThreshold = 64;
 // doorbell+NIC-read baseline on this silicon, isolating CTPIO's contribution
 // from the PMD-vs-ef_vi software difference.
 inline constexpr bool kEfViUseCtpio = true;
+// Unpaced CTPIO writer (EF_VI_CTPIO_MODE=fast, baked in via setenv at init). libciul's
+// default paced writer is calibrated for a 10G link and randomly loses the NIC's CTPIO
+// ingest-timeout race on 25G — 0.6-11% of sends per run fell back to the +1us DMA path,
+// which WAS the P99.9+ shelf. Measured: P99.999 3.256 -> 2.393us. See the CtpioFast
+// comment in EtherFabricVirtualInterface.hpp for the full A/B.
+inline constexpr bool kEfViCtpioFast = true;
 
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
 
-    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
-    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
-    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
+    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViCtpioFast>;
+    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViCtpioFast>;
+    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViCtpioFast>;
 
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
     static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }
