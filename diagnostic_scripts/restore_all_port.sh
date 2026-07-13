@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# restore_xxv_i40e.sh — rebind NIC ports from vfio-pci back to their kernel driver
-# after a DPDK run.
+# restore_intel_ports.sh — rebind NIC ports from vfio-pci back to their kernel
+# driver after a DPDK run, and bring every benchmark port up in one go.
 #
 # WHY THIS EXISTS: our DPDK prepare() binds the port to vfio-pci by setting
 # `driver_override = vfio-pci`. That override BLOCKS binding to any other driver,
@@ -9,17 +9,20 @@
 # is the one step the standard tools miss. Per device: unbind -> clear override ->
 # bind the kernel driver -> bring the netdev up -> wait for carrier.
 #
-# By default it restores BOTH DPDK-capable Intel NIC pairs on this box:
-#   Intel XXV710-DA2 (i40e)  0000:02:00.0 / 0000:02:00.1
-#   Intel I225-V     (igc)   0000:05:00.0 / 0000:06:00.0
-# (ConnectX-4 Lx / mlx5 is bifurcated — never unbound — so it is not listed.)
+# By default it restores/ups BOTH DPDK-capable NIC pairs on this box:
+#   Solarflare X2522-25G (sfc)  0000:01:00.0 / 0000:01:00.1  (also un-DOWNs them
+#                               after boot — netplan does not manage these ports)
+#   Intel I225-V         (igc)  0000:05:00.0 / 0000:06:00.0
+# (ConnectX-4 Lx / mlx5 at 02:00.x is bifurcated — never unbound — not listed.
+#  The XXV710/i40e pair was REMOVED 2026-07-12; 02:00.x is the CX4 now, so the
+#  old i40e default would have bounced the wrong card.)
 # A port already on its target kernel driver is left in place (just brought up) —
-# i.e. re-running is a safe no-op.
+# i.e. re-running is a safe no-op, including right after boot to up the links.
 #
 # USAGE:
-#   ./restore_xxv_i40e.sh                          # restore BOTH pairs above
-#   ./restore_xxv_i40e.sh igc 0000:06:00.0         # explicit: one driver + BDF(s)
-#   ./restore_xxv_i40e.sh i40e 0000:02:00.0 0000:02:00.1
+#   ./restore_intel_ports.sh                       # restore + up both pairs above
+#   ./restore_intel_ports.sh igc 0000:06:00.0      # explicit: one driver + BDF(s)
+#   ./restore_intel_ports.sh sfc 0000:01:00.0 0000:01:00.1
 #
 # Re-execs itself under sudo if not run as root.
 
@@ -35,13 +38,14 @@ fi
 declare -a TARGETS
 if [ "$#" -eq 0 ]; then
     TARGETS=(
-        "i40e 0000:02:00.0 0000:02:00.1"   # Intel XXV710-DA2
+        "sfc 0000:01:00.0 0000:01:00.1"    # Solarflare X2522-25G-PLUS
         "igc 0000:05:00.0 0000:06:00.0"    # Intel I225-V
     )
 else
     driver="$1"; shift
     if [ "$#" -eq 0 ]; then
-        set -- 0000:02:00.0 0000:02:00.1   # legacy default BDFs for a bare driver arg
+        echo "usage: $0 [<driver> <bdf>...]" >&2
+        exit 1
     fi
     TARGETS=("$driver $*")
 fi
@@ -131,4 +135,21 @@ echo
 echo "=== result ==="
 for bdf in "${ALL_BDFS[@]}"; do
     verify_dev "$bdf"
+done
+
+# ---- temperatures: hwmon returns with the kernel driver (vfio exposes none) --
+# Read right after rebind: thermal time constants are long enough that this is a
+# good estimate of the just-finished run's steady state.
+echo
+echo "=== temperatures ==="
+for bdf in "${ALL_BDFS[@]}"; do
+    hw="$(ls -d "/sys/bus/pci/devices/$bdf/hwmon/hwmon"* 2>/dev/null | head -1)"
+    [ -n "$hw" ] || continue
+    for t in "$hw"/temp*_input; do
+        [ -e "$t" ] || continue
+        b="${t%_input}"
+        label="$(cat "${b}_label" 2>/dev/null || basename "$b")"
+        val="$(cat "$t" 2>/dev/null)" || continue
+        printf "%s  %-30s %3d C\n" "$bdf" "$label" "$((val / 1000))"
+    done
 done

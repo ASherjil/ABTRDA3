@@ -259,6 +259,18 @@ inline constexpr const char* kMlx5LatencyDevargs =
 // a compile-time 64, so a 64-entry ring would leave it no headroom.
 inline constexpr std::uint16_t kMlx5NbRxDesc = 64;
 
+// sfc latency devargs (X2522). perf_profile defaults to THROUGHPUT — hardware/evq
+// moderation tuned for bulk, pure added latency in a ping-pong — so low-latency must be
+// asked for explicitly. rx ef10 = the native X2 datapath (what auto picks; pinned for
+// determinism). tx ef10_simple = the fastest TX datapath: no multi-seg, one mempool,
+// neglects mbuf refcounts — all fine for single-seg frames from one pool with a fresh
+// mbuf per send. Do NOT pair it with setTxInlineReuse: the reuse trick keeps a
+// high-refcount mbuf the PMD must decrement-not-free, exactly what ef10_simple skips;
+// and unlike mlx5 there is no full-inline TX, so the NIC DMA-reads the buffer anyway
+// (the reuse win does not exist here — DPDK/sfc has no CTPIO; that gap IS ef_vi's win).
+inline constexpr const char* kSfcLatencyDevargs =
+    "perf_profile=low-latency,rx_datapath=ef10,tx_datapath=ef10_simple";
+
 // BEFORE prepare(): set the knobs and resolve the BDF while the netdev still exists (the
 // vfio unbind removes it, and renamed ports like "xxv0" cannot be re-derived after).
 // setDevargs must land before prepare() registers the BDF.
@@ -273,6 +285,9 @@ template<class Nic>
         nic.setDevargs(kMlx5LatencyDevargs);
         nic.setTxInlineReuse(true);
         nic.setNbRxDesc(kMlx5NbRxDesc);      // shrinks the in-poll refill burst 64 -> 16
+    }
+    if (role.driver == "sfc" && !role.dpdkAfxdpPmd) {
+        nic.setDevargs(kSfcLatencyDevargs);  // no inline reuse — see kSfcLatencyDevargs
     }
     return bdf;
 }
@@ -395,12 +410,21 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
 // EAL/vfio, driver/lcore ignored. Needs onload + sfc_char + sfc_resource loaded
 // and root. The DPDK comparison on this NIC is the sfc PMD, which DOES need a
 // vfio-pci bind — the two cannot hold the card at once.
+// CTPIO cut-through threshold in bytes: >= frame_len = store-and-forward for that frame
+// (at frame_size 64 the default 64 is already S&F — no underrun/poison possible);
+// EF_VI_CTPIO_CT_THRESHOLD_SNF (0xffff) = S&F at every size. Live lever at 128B frames.
+inline constexpr unsigned kEfViCtThreshold = 64;
+// false = plain DMA-descriptor sends through the same ef_vi VI: our own
+// doorbell+NIC-read baseline on this silicon, isolating CTPIO's contribution
+// from the PMD-vs-ef_vi software difference.
+inline constexpr bool kEfViUseCtpio = true;
+
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
 
-    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly>;
-    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly>;
-    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx>;
+    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
+    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
+    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
 
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
     static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }
