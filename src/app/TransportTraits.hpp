@@ -27,6 +27,7 @@
 #include "AFXDP.hpp"
 #include "DPDK.hpp"
 #include "Verbs.hpp"
+#include "EtherFabricVirtualInterface.hpp"
 #include "Intel_I210.hpp"
 #include "Cadence_GEM.hpp"
 #include "TapBridge.hpp"
@@ -384,6 +385,34 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
 
     static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
         fmt::println("[{}] Transport: verbs on {} (RAW_PACKET QP)", roleName, role.interface);
+    }
+};
+
+// ── ef_vi ────────────────────────────────────────────────────────────────────
+// Solarflare/AMD kernel bypass on the X2522 (EF10) — CTPIO TX writes the frame
+// through a write-combined MMIO aperture straight into the NIC TX FIFO. Same
+// shape as verbs: bifurcated (kernel sfc keeps the port, must be admin-UP), no
+// EAL/vfio, driver/lcore ignored. Needs onload + sfc_char + sfc_resource loaded
+// and root. The DPDK comparison on this NIC is the sfc PMD, which DOES need a
+// vfio-pci bind — the two cannot hold the card at once.
+struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
+    static constexpr std::string_view kName = "ef_vi";
+
+    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly>;
+    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly>;
+    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx>;
+
+    static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
+    static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }
+    static RxTx   makeRxTx(const TestConfig&, const RoleConfig& role) { return RxTx(role.interface); }
+
+    template<class Nic>
+    static bool init(Nic& nic, const TestConfig&, const RoleConfig&) {
+        return nic.init();
+    }
+
+    static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
+        fmt::println("[{}] Transport: ef_vi on {} (CTPIO)", roleName, role.interface);
     }
 };
 

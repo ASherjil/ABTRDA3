@@ -27,6 +27,7 @@ target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/TapBridge>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/EtherFabricVirtualInterface>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -87,6 +88,20 @@ message(STATUS "Verbs transport: libibverbs ${LIBIBVERBS_VERSION}")
 pkg_check_modules(LIBMLX5 REQUIRED IMPORTED_TARGET libmlx5)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBMLX5)
 message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE poll)")
+
+# =============================================================================
+# ef_vi transport — header-only EtherFabricVirtualInterface.hpp over libciul
+# (Solarflare/AMD kernel bypass, Onload 9.0.2, X2522). Onload installs
+# libciul1.a + /usr/include/etherfabric WITHOUT a pkg-config file, so this is
+# find_library/find_path rather than the pkg_check_modules used above. PUBLIC
+# for the same reason as libdpdk/libibverbs: the header emits ef_* calls into
+# every consumer. SYSTEM keeps the C headers clear of -Wconversion/-Wpedantic.
+# =============================================================================
+find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h REQUIRED)
+find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul REQUIRED)
+target_include_directories(abtrda3 SYSTEM PUBLIC ${ETHERFABRIC_INCLUDE_DIR})
+target_link_libraries(abtrda3 PUBLIC ${LIBCIUL_LIBRARY})
+message(STATUS "ef_vi transport: ${LIBCIUL_LIBRARY}")
 
 # 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style).
 #    Output lands NEXT TO the abtrda3_test executable (build/src/app) — the
