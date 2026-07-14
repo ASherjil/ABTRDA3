@@ -20,6 +20,7 @@
 #include <string_view>
 
 #include <fmt/core.h>
+#include <fmt/format.h>
 
 #include "../common/RxFrame.hpp"
 
@@ -115,19 +116,7 @@
 
 enum class EtherFabricMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
-// CtpioFast selects libciul's unpaced CTPIO writer (EF_VI_CTPIO_MODE=fast, set via
-// setenv(overwrite=0) before the VI alloc — a shell export still wins). The default
-// "paced" writer inserts wb_ticks delays between 64B WC buffers, calibrated for a
-// HARD-CODED 10G link from a per-process TSC measurement (ciul/ctpio.c: "TODO:
-// Supporting 10Gbit link only for now") — on 25G it sits at the NIC's CTPIO
-// ingest-timeout cliff, and 0.6-11% of reflector sends (a per-run lottery, since the
-// calibration differs each start) silently fell back to the +1us DMA path: that was
-// the entire P99.9+ shelf. Measured A/B with fast (30s, 14.1M samples): P99.9
-// 2.988 -> 2.317us, P99.999 3.256 -> 2.393us, server fallbacks 6.8% -> 0.29%, zero
-// CRC discards. Pacing exists to avoid TLP reordering in CUT-THROUGH mode; with
-// CtThreshold >= frame_len (store-and-forward) the NIC assembles the whole frame
-// before emitting, so pacing buys nothing at this frame size.
-template<EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8, std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true, bool CtpioFast = true>
+template<EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8, std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true>
 class EtherFabricVirtualInterface {
   static constexpr bool HAS_RX = (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
   static constexpr bool HAS_TX = (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
@@ -138,6 +127,14 @@ class EtherFabricVirtualInterface {
 
   static constexpr int kEvPollBatch = 8;
   static_assert(kEvPollBatch >= EF_VI_EVENT_POLL_MIN_EVS);
+
+  // One unused guard slot on EACH side of the TX region. Measured (2x 5-min
+  // histogram runs, 144M sends each): CTPIO noncontig fallbacks concentrate
+  // 94-98% on the EDGE TX slots — client slot 0 (its cacheline neighborhood
+  // abuts the DDIO-hot RX region) and server slot NbTxBufs-1 (abuts foreign
+  // heap) — deterministically across runs, with per-run severity from ~150ppm
+  // to ~100% of that slot's sends. The guards make every live TX slot interior.
+  static constexpr std::uint32_t kTxGuardSlots = 1;
 
 public:
   explicit EtherFabricVirtualInterface(std::string_view ifname) noexcept;
@@ -214,6 +211,7 @@ private:
   int      m_evIdx{0};
 
   std::uint32_t m_heldId{0};
+  std::uint32_t m_rxPendingPush{0};
   std::uint32_t m_txHead{0};
   std::uint32_t m_txTail{0};
   std::uint32_t m_txSlot{0};
@@ -221,6 +219,7 @@ private:
 
   std::uint64_t m_ctpioWins{0};
   std::uint64_t m_ctpioFallbacks{0};
+  std::array<std::uint64_t, NbTxBufs> m_fallbackPerSlot{};
   std::uint64_t m_rxDiscards{0};
   std::uint64_t m_rxCrcBad{0};
   std::uint64_t m_rxDropped{0};
@@ -230,21 +229,17 @@ private:
 
 // =============================================================================
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
   : m_ifname{ifname} {}
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::~EtherFabricVirtualInterface() {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::~EtherFabricVirtualInterface() {
   shutdown();
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::init() noexcept {
-  if constexpr (HAS_TX && UseCtpio && CtpioFast) {
-    ::setenv("EF_VI_CTPIO_MODE", "fast", 0);
-  }
-
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::init() noexcept {
   if (!readMac()) return false;
 
   const unsigned ifindex = if_nametoindex(m_ifname.c_str());
@@ -297,7 +292,7 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
   if (ef_vi_capabilities_get(m_dh, static_cast<int>(ifindex), EF_VI_CAP_MIN_BUFFER_MODE_SIZE, &minPage) != 0 || minPage < 4096) {
     minPage = 4096;
   }
-  const std::size_t slotBytes = static_cast<std::size_t>(NbRxBufs + NbTxBufs) * BufSize;
+  const std::size_t slotBytes = static_cast<std::size_t>(NbRxBufs + NbTxBufs + 2 * kTxGuardSlots) * BufSize;
   m_memBytes = (std::max(slotBytes, static_cast<std::size_t>(minPage)) + 4095) & ~static_cast<std::size_t>(4095);
   if (minPage >= 2 * 1024 * 1024) {
     m_mem = static_cast<std::uint8_t*>(mmap(nullptr, m_memBytes, PROT_READ | PROT_WRITE,
@@ -326,7 +321,7 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     m_rxDma[i] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(i) * BufSize);
   }
   for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
-    m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(NbRxBufs + s) * BufSize);
+    m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(NbRxBufs + kTxGuardSlots + s) * BufSize);
   }
 
   if constexpr (HAS_RX) {
@@ -347,20 +342,27 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                m_ifname, ef_vi_version_str(),
                m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                NbRxBufs, NbTxBufs,
-               UseCtpio ? (CtpioFast ? "CTPIO-fast" : "CTPIO-paced") : "DMA",
+               UseCtpio ? "CTPIO" : "DMA",
                UseCtpio ? CtThreshold : 0U,
                m_rxPrefix,
                m_evMerge ? " [EVENT-MERGE FORCED]" : "");
   return true;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::shutdown() noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::shutdown() noexcept {
   if (m_haveVi) {
     if constexpr (HAS_TX) {
       if constexpr (UseCtpio) {
         fmt::println(stderr, "[ef_vi] {}: tx ctpio_wins={} ctpio_fallbacks={} tx_errors={}",
                      m_ifname, m_ctpioWins, m_ctpioFallbacks, m_txErrors);
+        if (m_ctpioFallbacks > 0) {
+          std::string slots;
+          for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
+            slots += fmt::format("{}{}", s == 0 ? "" : " ", m_fallbackPerSlot[s]);
+          }
+          fmt::println(stderr, "[ef_vi] {}: fallbacks_per_slot=[{}]", m_ifname, slots);
+        }
       } else {
         fmt::println(stderr, "[ef_vi] {}: tx dma_sends={} tx_errors={}",
                      m_ifname, m_ctpioFallbacks, m_txErrors);
@@ -395,21 +397,21 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::macAddress() const noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::macAddress() const noexcept {
   return m_mac;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
     std::memcpy(txSlot(s), frameTemplate.data(),
                 std::min<std::size_t>(frameTemplate.size(), BufSize));
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::acquire(std::uint32_t frameLen) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::acquire(std::uint32_t frameLen) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   if (frameLen > BufSize) [[unlikely]] return nullptr;
   if (m_txHead - m_txTail >= NbTxBufs) [[unlikely]] {
     RxEv scratch;
@@ -421,8 +423,8 @@ inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize,
   return txSlot(m_txSlot);
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::commit() noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::commit() noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (UseCtpio) {
     ef_vi_transmit_ctpio(&m_vi, txSlot(m_txSlot), m_txLen, CtThreshold);
     for (;;) {
@@ -454,8 +456,8 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   ++m_txHead;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::send(std::span<const std::uint8_t> frame) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::send(std::span<const std::uint8_t> frame) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
   if (dst == nullptr) [[unlikely]] return false;
   std::memcpy(dst, frame.data(), frame.size());
@@ -463,8 +465,8 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   return true;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
   RxEv ev;
   if (!pollEvent(ev, true)) [[likely]] return {};
   m_heldId = ev.id;
@@ -474,26 +476,40 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
            .status = 1 };
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
-  ef_vi_receive_post(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
+  // Decoupled re-post: init writes the descriptor with NO doorbell. The push
+  // (every 8th descriptor, EF10 batch rule) fires from the IDLE spin instead —
+  // ef_vi_receive_post's every-8th doorbell was phase-locked to the TX slot
+  // rotation and its MMIO write, landing adjacent to a CTPIO burst, tore the
+  // aperture write stream (noncontig poisons pinned to one slot per role:
+  // server slot 7 / client slot 0, 94-98% of all fallbacks). The valve only
+  // matters for RxOnly under sustained load (never idle); RxTx roles idle
+  // every round. receive_push posts floor-8 batches and no-ops when empty.
+  ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
+  ++m_rxPendingPush;
+  if (m_rxPendingPush >= 64) [[unlikely]] {
+    ef_vi_receive_push(&m_vi);
+    m_rxPendingPush &= 7;
+  }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::rxSlot(std::uint32_t i) const noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::rxSlot(std::uint32_t i) const noexcept {
   return m_mem + static_cast<std::size_t>(i) * BufSize;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::txSlot(std::uint32_t s) const noexcept {
-  return m_mem + static_cast<std::size_t>(NbRxBufs + s) * BufSize;
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::txSlot(std::uint32_t s) const noexcept {
+  return m_mem + static_cast<std::size_t>(NbRxBufs + kTxGuardSlots + s) * BufSize;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
   ++m_rxDiscards;
   if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) ++m_rxCrcBad;
-  ef_vi_receive_post(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
+  ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
+  ++m_rxPendingPush;
 }
 
 // Walks the shared event queue. TX completions and discards are consumed in
@@ -501,8 +517,8 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 // left at the cursor head for tryReceive() when !wantRx (the TX-side drain
 // must never eat a frame). One eventq_poll refill per call keeps the empty
 // path (the hottest code here — the app spins on it) at a handful of insns.
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::pollEvent(RxEv& out, bool wantRx) noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::pollEvent(RxEv& out, bool wantRx) noexcept {
   for (int pass = 0; ; ++pass) {
     while (m_evIdx < m_nEv) {
       ef_event& ev = m_evs[m_evIdx];
@@ -523,6 +539,12 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
             m_ctpioWins += static_cast<std::uint64_t>(n);
           } else {
             m_ctpioFallbacks += static_cast<std::uint64_t>(n);
+            // Per-slot histogram: a measured 5-min run failed at EXACTLY 1/8 =
+            // one cursed slot of the NbTxBufs rotation (per-run: the buffer +
+            // aperture are allocated fresh each start). dma_id = slot index.
+            for (int k = 0; k < n; ++k) {
+              ++m_fallbackPerSlot[static_cast<std::uint32_t>(ids[k]) & (NbTxBufs - 1)];
+            }
           }
         } else {
           m_ctpioFallbacks += static_cast<std::uint64_t>(n);
@@ -544,7 +566,8 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         if (n <= 0) break;
         for (int k = 1; k < n; ++k) {
           ++m_rxDropped;
-          ef_vi_receive_post(&m_vi, m_rxDma[static_cast<std::uint32_t>(ids[k])], ids[k]);
+          ef_vi_receive_init(&m_vi, m_rxDma[static_cast<std::uint32_t>(ids[k])], ids[k]);
+          ++m_rxPendingPush;
         }
         std::uint16_t bytes = 0;
         ef_vi_receive_get_bytes(&m_vi, rxSlot(static_cast<std::uint32_t>(ids[0])), &bytes);
@@ -577,12 +600,26 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
     if (pass > 0) return false;
     m_nEv   = ef_eventq_poll(&m_vi, m_evs, kEvPollBatch);
     m_evIdx = 0;
-    if (m_nEv == 0) [[likely]] return false;
+    if (m_nEv == 0) [[likely]] {
+      if constexpr (HAS_RX) {
+        // Idle: the wall configuration's push placement (first empty poll).
+        // A TX-quiescent gate (m_txHead == m_txTail) was tried and fixed the
+        // client's phase-lock on the no-guard layout but re-phased the server's
+        // doorbell into a two-slot curse — the doorbell triggers a DELAYED
+        // NIC-side descriptor fetch, so CPU-side timing can only move the
+        // collision, not remove it. wantRx excludes the TX-side drain.
+        if (wantRx && m_rxPendingPush >= 8) {
+          ef_vi_receive_push(&m_vi);
+          m_rxPendingPush &= 7;
+        }
+      }
+      return false;
+    }
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool CtpioFast>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, CtpioFast>::readMac() noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::readMac() noexcept {
   const std::string p = "/sys/class/net/" + m_ifname + "/address";
   FILE* f = std::fopen(p.c_str(), "r");
   if (!f) {
