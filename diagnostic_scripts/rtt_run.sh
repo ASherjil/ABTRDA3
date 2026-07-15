@@ -60,10 +60,18 @@ stop_server() {
 }
 trap 'echo; echo "[rtt_run] interrupted"; stop_server; exit 130' INT TERM
 
+# The inner sudo below applies env_reset and STRIPS EF_VI_*/ABTRDA3_* — the
+# variables that tune libciul's CTPIO writer and the ef_vi backend. Forward
+# them explicitly as sudo command-line assignments (those survive env_reset).
+mapfile -t ENVPASS < <(env | grep -E '^(EF_VI_|ABTRDA3_)[A-Za-z0-9_]*=')
+
 echo "[rtt_run] app=$APP"
 echo "[rtt_run] cfg=$CFG"
+if [ "${#ENVPASS[@]}" -gt 0 ]; then
+    echo "[rtt_run] env passthrough: ${ENVPASS[*]}"
+fi
 echo "[rtt_run] ===== SERVER (background) ====="
-sudo "$APP" --server --config "$CFG" &
+sudo "${ENVPASS[@]}" "$APP" --server --config "$CFG" &
 
 echo "[rtt_run] waiting ${WAIT}s for the server to come up (override: WAIT=<sec>)…"
 sleep "$WAIT"
@@ -75,9 +83,9 @@ fi
 
 echo "[rtt_run] ===== CLIENT ====="
 if [ -n "$COUNT" ]; then
-    sudo "$APP" --client --config "$CFG" --count "$COUNT"
+    sudo "${ENVPASS[@]}" "$APP" --client --config "$CFG" --count "$COUNT"
 else
-    sudo "$APP" --client --config "$CFG"
+    sudo "${ENVPASS[@]}" "$APP" --client --config "$CFG"
 fi
 rc=$?
 

@@ -10,6 +10,14 @@
 #include <net/if.h>
 #include <sys/mman.h>
 
+// Older glibc <sys/mman.h> lacks the explicit-size hugetlb flags (21 = log2(2MiB))
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -215,6 +223,9 @@ private:
   std::uint32_t m_txHead{0};
   std::uint32_t m_txTail{0};
   std::uint32_t m_txSlot{0};
+  std::uint32_t m_txPhase{0};
+  std::uint32_t m_txPad{0};
+  std::uint32_t m_txBase{NbRxBufs + kTxGuardSlots};
   std::uint32_t m_txLen{0};
 
   std::uint64_t m_ctpioWins{0};
@@ -288,27 +299,51 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     return false;
   }
 
-  unsigned long minPage = 4096;
-  if (ef_vi_capabilities_get(m_dh, static_cast<int>(ifindex), EF_VI_CAP_MIN_BUFFER_MODE_SIZE, &minPage) != 0 || minPage < 4096) {
-    minPage = 4096;
-  }
-  const std::size_t slotBytes = static_cast<std::size_t>(NbRxBufs + NbTxBufs + 2 * kTxGuardSlots) * BufSize;
-  m_memBytes = (std::max(slotBytes, static_cast<std::size_t>(minPage)) + 4095) & ~static_cast<std::size_t>(4095);
-  if (minPage >= 2 * 1024 * 1024) {
-    m_mem = static_cast<std::uint8_t*>(mmap(nullptr, m_memBytes, PROT_READ | PROT_WRITE,
-                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0));
-    if (m_mem == MAP_FAILED) {
-      m_mem = nullptr;
-      fmt::println(stderr, "[ef_vi] {}: hugepage alloc of {} bytes failed", m_ifname, m_memBytes);
-      return false;
+  // All buffer slots live in explicit 2MiB hugetlb pages (one page fits the
+  // default 265-slot config). With 4K heap pages, every process start drew fresh
+  // page placement per slot, and that draw set the CTPIO tear severity of the
+  // phase-chosen slot (150ppm..100% — the per-run lottery). A 2M-aligned page
+  // fixes every address bit below 2M across runs. The 2M size MUST be explicit:
+  // rtserver's default hugepagesz is 1G (the DPDK pool). The 2M pool needs
+  // creating once per boot:
+  //   echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+  constexpr std::size_t kHugePage = 2u * 1024u * 1024u;
+
+  // TX region pad. The rotation-origin sweep proved the CTPIO tear is bound to
+  // an ADDRESS (a fragile cell at a fixed offset within the 2M page — slot 5's
+  // 0x83000 in the default layout), NOT to the doorbell phase: the victim slot
+  // never moved with the rotation origin. This knob slides the whole TX region
+  // by N slots (N x BufSize bytes) inside the page so no TX slot occupies a
+  // fragile cell. Init-time only. ABTRDA3_TX_PAD=<slots>, per-port override
+  // ABTRDA3_TX_PAD_<ifname>. Prediction of the cell model: victim index
+  // decrements as pad grows (pad=1 -> slot 4 ...), histogram flat once the
+  // region clears the cell (pad >= 6 for the default layout).
+  if constexpr (HAS_TX) {
+    const std::string padPerPort = fmt::format("ABTRDA3_TX_PAD_{}", m_ifname);
+    const char* pad = std::getenv(padPerPort.c_str());
+    if (pad == nullptr) {
+      pad = std::getenv("ABTRDA3_TX_PAD");
     }
-    m_memHuge = true;
-  } else {
-    if (posix_memalign(reinterpret_cast<void**>(&m_mem), minPage, m_memBytes) != 0) {
-      fmt::println(stderr, "[ef_vi] {}: posix_memalign({}) failed", m_ifname, m_memBytes);
-      return false;
+    if (pad != nullptr) {
+      m_txPad = static_cast<std::uint32_t>(std::atoi(pad));
+      if (m_txPad > 512) {
+        m_txPad = 512;
+      }
     }
   }
+  m_txBase = NbRxBufs + kTxGuardSlots + m_txPad;
+
+  const std::size_t slotBytes = static_cast<std::size_t>(NbRxBufs + NbTxBufs + 2 * kTxGuardSlots + m_txPad) * BufSize;
+  m_memBytes = (slotBytes + kHugePage - 1) & ~(kHugePage - 1);
+  m_mem = static_cast<std::uint8_t*>(mmap(nullptr, m_memBytes, PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0));
+  if (m_mem == MAP_FAILED) {
+    m_mem = nullptr;
+    fmt::println(stderr, "[ef_vi] {}: 2MiB hugepage alloc failed ({} bytes) — empty 2M pool? create it:", m_ifname, m_memBytes);
+    fmt::println(stderr, "        echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages");
+    return false;
+  }
+  m_memHuge = true;
   std::memset(m_mem, 0, m_memBytes);
 
   if (ef_memreg_alloc(&m_memreg, m_dh, &m_pd, m_dh, m_mem, m_memBytes) != 0) {
@@ -321,7 +356,28 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     m_rxDma[i] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(i) * BufSize);
   }
   for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
-    m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(NbRxBufs + kTxGuardSlots + s) * BufSize);
+    m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(m_txBase + s) * BufSize);
+  }
+
+  if constexpr (HAS_TX) {
+    // TX rotation origin. The RX-push doorbell fires at a fixed round phase
+    // (the RX 'added' counter crossing a multiple of 8), so WHICH physical TX
+    // slot is in flight when its delayed NIC-side descriptor fetch lands is
+    // selected by where the rotation starts. With the buffer layout frozen
+    // (2M hugepage + ASLR off), per-slot tear severity is a fixed property of
+    // the slot's address — this knob chooses the slot that absorbs the
+    // collision. Init-time only, zero hot-path cost.
+    // ABTRDA3_TX_PHASE=<0..NbTxBufs-1>, per-port override ABTRDA3_TX_PHASE_<ifname>.
+    const std::string perPort = fmt::format("ABTRDA3_TX_PHASE_{}", m_ifname);
+    const char* phase = std::getenv(perPort.c_str());
+    if (phase == nullptr) {
+      phase = std::getenv("ABTRDA3_TX_PHASE");
+    }
+    if (phase != nullptr) {
+      m_txPhase = static_cast<std::uint32_t>(std::atoi(phase)) & (NbTxBufs - 1);
+      m_txHead = m_txPhase;
+      m_txTail = m_txPhase;
+    }
   }
 
   if constexpr (HAS_RX) {
@@ -338,13 +394,20 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     m_rxPrefix = ef_vi_receive_prefix_len(&m_vi);
   }
 
-  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B{}",
+  // The mode libciul's CTPIO writer will use — read from OUR environment, the
+  // same place ef_vi_transmit_ctpio reads it. Prints the truth even when a
+  // launcher script (sudo env_reset!) silently strips the variable.
+  const char* ctpioModeEnv = std::getenv("EF_VI_CTPIO_MODE");
+  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge txphase={} txpad={} ctpio_mode={}{}",
                m_ifname, ef_vi_version_str(),
                m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                NbRxBufs, NbTxBufs,
                UseCtpio ? "CTPIO" : "DMA",
                UseCtpio ? CtThreshold : 0U,
                m_rxPrefix,
+               m_txPhase,
+               m_txPad,
+               ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)",
                m_evMerge ? " [EVENT-MERGE FORCED]" : "");
   return true;
 }
@@ -501,7 +564,7 @@ inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize,
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::txSlot(std::uint32_t s) const noexcept {
-  return m_mem + static_cast<std::size_t>(NbRxBufs + kTxGuardSlots + s) * BufSize;
+  return m_mem + static_cast<std::size_t>(m_txBase + s) * BufSize;
 }
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
