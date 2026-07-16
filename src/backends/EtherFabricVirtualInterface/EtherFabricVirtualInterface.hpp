@@ -124,6 +124,26 @@
 
 enum class EtherFabricMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 
+// RX payload polling (event-queue bypass). On EF10 the NIC DMAs the FRAME into
+// the posted buffer first and composes the EVQ event as a SEPARATE later write —
+// everyone who waits on the EVQ pays for that second DMA plus event decode.
+// RX buffers complete in strict FIFO ring order, so tryReceive() instead spins
+// on the next buffer's ETHERTYPE (offset 12 — the only field our raw-L2 protocol
+// guarantees nonzero; MAC bytes and seq can legitimately be 0). release() clears
+// the marker before re-posting. The EVQ still gets drained on every poll miss —
+// TX completions and counters ride there — but RX events become bookkeeping
+// no-ops. Trade-offs, deliberate for this point-to-point CRC-clean rig:
+//   * discard filtering is bypassed — a bad frame would be delivered before its
+//     discard event is seen (rig history: 0 discards in 437M+ samples; the
+//     discard counter still runs and flags any occurrence at shutdown);
+//   * frame length is not known at delivery (span covers the whole slot);
+//   * only bytes 0..63 (the marker's cacheline/TLP) are guaranteed present at
+//     detection — fine for this protocol, which never reads past byte 25;
+//   * the EVQ drain rides the poll MISS path — a saturating RX stream with no
+//     misses (RxOnly at line rate) would starve it until the EVQ overflows
+//     (visible as unexpected_events). RxTx ping-pong misses every round.
+inline constexpr bool kEfViRxPayloadPoll = true;
+
 template<EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8, std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true>
 class EtherFabricVirtualInterface {
   static constexpr bool HAS_RX = (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
@@ -219,11 +239,11 @@ private:
   int      m_evIdx{0};
 
   std::uint32_t m_heldId{0};
+  std::uint32_t m_rxNextIdx{0};          // payload-poll FIFO cursor: next buffer to complete
   std::uint32_t m_rxPendingPush{0};
   std::uint32_t m_txHead{0};
   std::uint32_t m_txTail{0};
   std::uint32_t m_txSlot{0};
-  std::uint32_t m_txPhase{0};
   std::uint32_t m_txPad{0};
   std::uint32_t m_txBase{NbRxBufs + kTxGuardSlots};
   std::uint32_t m_txLen{0};
@@ -231,6 +251,8 @@ private:
   std::uint64_t m_ctpioWins{0};
   std::uint64_t m_ctpioFallbacks{0};
   std::array<std::uint64_t, NbTxBufs> m_fallbackPerSlot{};
+  std::uint64_t m_rxPollHits{0};         // payload-poll deliveries
+  std::uint64_t m_rxEvReconciled{0};     // RX events consumed as bookkeeping no-ops
   std::uint64_t m_rxDiscards{0};
   std::uint64_t m_rxCrcBad{0};
   std::uint64_t m_rxDropped{0};
@@ -359,27 +381,6 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(m_txBase + s) * BufSize);
   }
 
-  if constexpr (HAS_TX) {
-    // TX rotation origin. The RX-push doorbell fires at a fixed round phase
-    // (the RX 'added' counter crossing a multiple of 8), so WHICH physical TX
-    // slot is in flight when its delayed NIC-side descriptor fetch lands is
-    // selected by where the rotation starts. With the buffer layout frozen
-    // (2M hugepage + ASLR off), per-slot tear severity is a fixed property of
-    // the slot's address — this knob chooses the slot that absorbs the
-    // collision. Init-time only, zero hot-path cost.
-    // ABTRDA3_TX_PHASE=<0..NbTxBufs-1>, per-port override ABTRDA3_TX_PHASE_<ifname>.
-    const std::string perPort = fmt::format("ABTRDA3_TX_PHASE_{}", m_ifname);
-    const char* phase = std::getenv(perPort.c_str());
-    if (phase == nullptr) {
-      phase = std::getenv("ABTRDA3_TX_PHASE");
-    }
-    if (phase != nullptr) {
-      m_txPhase = static_cast<std::uint32_t>(std::atoi(phase)) & (NbTxBufs - 1);
-      m_txHead = m_txPhase;
-      m_txTail = m_txPhase;
-    }
-  }
-
   if constexpr (HAS_RX) {
     ef_filter_spec fs;
     ef_filter_spec_init(&fs, EF_FILTER_FLAG_NONE);
@@ -398,16 +399,16 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
   // same place ef_vi_transmit_ctpio reads it. Prints the truth even when a
   // launcher script (sudo env_reset!) silently strips the variable.
   const char* ctpioModeEnv = std::getenv("EF_VI_CTPIO_MODE");
-  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge txphase={} txpad={} ctpio_mode={}{}",
+  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge txpad={} ctpio_mode={} rx={}{}",
                m_ifname, ef_vi_version_str(),
                m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                NbRxBufs, NbTxBufs,
                UseCtpio ? "CTPIO" : "DMA",
                UseCtpio ? CtThreshold : 0U,
                m_rxPrefix,
-               m_txPhase,
                m_txPad,
                ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)",
+               kEfViRxPayloadPoll ? "payload-poll" : "evq",
                m_evMerge ? " [EVENT-MERGE FORCED]" : "");
   return true;
 }
@@ -434,6 +435,12 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     if constexpr (HAS_RX) {
       fmt::println(stderr, "[ef_vi] {}: rx discards={} (crc_bad={}) dropped={} unexpected_events={}",
                    m_ifname, m_rxDiscards, m_rxCrcBad, m_rxDropped, m_evUnexpected);
+      if constexpr (kEfViRxPayloadPoll) {
+        // Sanity pair: every poll delivery should eventually produce one RX
+        // event; a persistent gap means ring/cursor desync.
+        fmt::println(stderr, "[ef_vi] {}: rx poll_hits={} events_reconciled={}",
+                     m_ifname, m_rxPollHits, m_rxEvReconciled);
+      }
     }
     ef_vi_free(&m_vi, m_dh);
     m_haveVi = false;
@@ -530,13 +537,36 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
-  RxEv ev;
-  if (!pollEvent(ev, true)) [[likely]] return {};
-  m_heldId = ev.id;
-  return { .data   = { rxSlot(ev.id) + m_rxPrefix, ev.len - static_cast<std::uint32_t>(m_rxPrefix) },
-           .sec    = 0,
-           .nsec   = 0,
-           .status = 1 };
+  if constexpr (kEfViRxPayloadPoll) {
+    // Spin target: the next-in-FIFO buffer's ethertype. volatile — the write
+    // comes from NIC DMA, invisible to the compiler; without it this load gets
+    // hoisted out of the caller's spin loop and never sees the frame land.
+    std::uint8_t* buf = rxSlot(m_rxNextIdx);
+    const volatile std::uint16_t* marker =
+        reinterpret_cast<const volatile std::uint16_t*>(buf + m_rxPrefix + 12);
+    if (*marker != 0) [[unlikely]] {
+      m_heldId    = m_rxNextIdx;
+      m_rxNextIdx = (m_rxNextIdx + 1) % NbRxBufs;
+      ++m_rxPollHits;
+      return { .data   = { buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix) },
+               .sec    = 0,
+               .nsec   = 0,
+               .status = 1 };
+    }
+    // Miss: housekeeping only — TX completions, counters, the idle RX push.
+    // RX events are consumed as no-ops inside pollEvent in this mode.
+    RxEv ev;
+    (void)pollEvent(ev, true);
+    return {};
+  } else {
+    RxEv ev;
+    if (!pollEvent(ev, true)) [[likely]] return {};
+    m_heldId = ev.id;
+    return { .data   = { rxSlot(ev.id) + m_rxPrefix, ev.len - static_cast<std::uint32_t>(m_rxPrefix) },
+             .sec    = 0,
+             .nsec   = 0,
+             .status = 1 };
+  }
 }
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
@@ -549,6 +579,11 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   // server slot 7 / client slot 0, 94-98% of all fallbacks). The valve only
   // matters for RxOnly under sustained load (never idle); RxTx roles idle
   // every round. receive_push posts floor-8 batches and no-ops when empty.
+  if constexpr (kEfViRxPayloadPoll) {
+    // Clear the poll marker before the buffer goes back to the NIC — a stale
+    // ethertype from this frame would false-fire the next lap of the ring.
+    std::memset(rxSlot(m_heldId) + m_rxPrefix + 12, 0, 2);
+  }
   ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
   ++m_rxPendingPush;
   if (m_rxPendingPush >= 64) [[unlikely]] {
@@ -571,6 +606,13 @@ template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std:
 inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
   ++m_rxDiscards;
   if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) ++m_rxCrcBad;
+  if constexpr (kEfViRxPayloadPoll) {
+    // Payload mode: the bad frame's marker already fired (or will) and the app
+    // delivers + releases this buffer like any other — re-initing it here would
+    // double-post. The nonzero discard counter at shutdown is the alarm; this
+    // rig has never produced one (0 in 437M+ samples, FEC off, DAC, CRC clean).
+    return;
+  }
   ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
   ++m_rxPendingPush;
 }
@@ -587,6 +629,13 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
       ef_event& ev = m_evs[m_evIdx];
       switch (EF_EVENT_TYPE(ev)) {
       case EF_EVENT_TYPE_RX: {
+        if constexpr (kEfViRxPayloadPoll) {
+          // Delivery already happened (or is about to) via the payload marker —
+          // the event is pure bookkeeping.
+          ++m_rxEvReconciled;
+          ++m_evIdx;
+          break;
+        }
         if (!wantRx) return false;
         out.id  = static_cast<std::uint32_t>(EF_EVENT_RX_RQ_ID(ev));
         out.len = static_cast<std::uint32_t>(EF_EVENT_RX_BYTES(ev));
@@ -622,6 +671,13 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         break;
       }
       case EF_EVENT_TYPE_RX_MULTI: {
+        if constexpr (kEfViRxPayloadPoll) {
+          ef_request_id ids[EF_VI_RECEIVE_BATCH];
+          const int n = ef_vi_receive_unbundle(&m_vi, &ev, ids);
+          m_rxEvReconciled += static_cast<std::uint64_t>(n > 0 ? n : 0);
+          ++m_evIdx;
+          break;
+        }
         if (!wantRx) return false;
         ef_request_id ids[EF_VI_RECEIVE_BATCH];
         const int n = ef_vi_receive_unbundle(&m_vi, &ev, ids);

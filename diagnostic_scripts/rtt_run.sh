@@ -45,6 +45,59 @@ CFG="$(cd "$(dirname "$CFG")" && pwd)/$(basename "$CFG")"
 # Run from the binary's dir so AF_XDP's af_xdp_kern.o (CWD-relative) resolves.
 cd "$APP_DIR" || { echo "[rtt_run] ERROR: cannot cd to $APP_DIR" >&2; exit 1; }
 
+# ── ef_vi preflight ───────────────────────────────────────────────────────────
+# The certified ef_vi configuration needs host state that does not survive a
+# reboot, plus an environment nobody should have to retype:
+#   * a 2MiB hugepage pool >= 2 pages (buffer determinism — kills the 4K page
+#     lottery; one page per process),
+#   * ASLR off (setarch -R) + ABTRDA3_TX_PAD=8 — the frozen-layout fragile-cell
+#     dodge (certified config of record),
+#   * the X2522 ports admin-UP (they boot DOWN; netplan does not manage them),
+#   * /dev/sfc_char (onload/sfc modules — only present on kernel 6.9.12-hz100).
+# All checks are idempotent: existing state is verified, missing state created.
+EFVI=0
+if grep -Eq '^[[:space:]]*transport[[:space:]]*=[[:space:]]*"ef_vi"' "$CFG"; then
+    EFVI=1
+fi
+LAUNCH=()
+if [ "$EFVI" = "1" ]; then
+    echo "[rtt_run] ef_vi config detected — preflight:"
+    if [ ! -e /dev/sfc_char ]; then
+        echo "[rtt_run] ERROR: /dev/sfc_char missing — onload/sfc modules not loaded (wrong kernel?)" >&2
+        exit 1
+    fi
+    HP=/sys/kernel/mm/hugepages/hugepages-2048kB
+    if [ "$(cat "$HP/free_hugepages")" -lt 2 ]; then
+        NEED=$(( $(cat "$HP/nr_hugepages") + 2 - $(cat "$HP/free_hugepages") ))
+        echo "[rtt_run]   2M hugepages: reserving (pool -> $NEED)"
+        echo "$NEED" | sudo tee "$HP/nr_hugepages" >/dev/null
+        if [ "$(cat "$HP/free_hugepages")" -lt 2 ]; then
+            echo "[rtt_run] ERROR: could not reserve 2x 2MiB hugepages" >&2
+            exit 1
+        fi
+    fi
+    echo "[rtt_run]   2M hugepages: $(cat "$HP/free_hugepages") free — OK"
+    # Bring the config's interfaces up and wait for carrier (admin-DOWN at boot).
+    for ifc in $(grep -E '^[[:space:]]*interface[[:space:]]*=' "$CFG" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u); do
+        if [ ! -d "/sys/class/net/$ifc" ]; then
+            echo "[rtt_run] ERROR: interface '$ifc' from the config does not exist" >&2
+            exit 1
+        fi
+        sudo ip link set "$ifc" up
+        for _ in $(seq 1 100); do
+            [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" = "1" ] && break
+            sleep 0.1
+        done
+        if [ "$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null)" != "1" ]; then
+            echo "[rtt_run] ERROR: $ifc has no carrier after 10s (DAC seated?)" >&2
+            exit 1
+        fi
+        echo "[rtt_run]   link $ifc: up, carrier OK"
+    done
+    LAUNCH=(setarch x86_64 -R)
+    echo "[rtt_run]   layout freeze: setarch x86_64 -R (ASLR off)"
+fi
+
 # Stop the server gently: SIGINT -> its handler -> cooperative stop -> destructors
 # (this is what restores NIC/XDP state). Escalate only if it refuses. Idempotent.
 stop_server() {
@@ -64,6 +117,10 @@ trap 'echo; echo "[rtt_run] interrupted"; stop_server; exit 130' INT TERM
 # variables that tune libciul's CTPIO writer and the ef_vi backend. Forward
 # them explicitly as sudo command-line assignments (those survive env_reset).
 mapfile -t ENVPASS < <(env | grep -E '^(EF_VI_|ABTRDA3_)[A-Za-z0-9_]*=')
+# ef_vi default: the certified TX pad, unless the caller set their own.
+if [ "$EFVI" = "1" ] && ! printf '%s\n' "${ENVPASS[@]}" | grep -q '^ABTRDA3_TX_PAD='; then
+    ENVPASS+=("ABTRDA3_TX_PAD=8")
+fi
 
 echo "[rtt_run] app=$APP"
 echo "[rtt_run] cfg=$CFG"
@@ -71,7 +128,7 @@ if [ "${#ENVPASS[@]}" -gt 0 ]; then
     echo "[rtt_run] env passthrough: ${ENVPASS[*]}"
 fi
 echo "[rtt_run] ===== SERVER (background) ====="
-sudo "${ENVPASS[@]}" "$APP" --server --config "$CFG" &
+sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --server --config "$CFG" &
 
 echo "[rtt_run] waiting ${WAIT}s for the server to come up (override: WAIT=<sec>)…"
 sleep "$WAIT"
@@ -83,9 +140,9 @@ fi
 
 echo "[rtt_run] ===== CLIENT ====="
 if [ -n "$COUNT" ]; then
-    sudo "${ENVPASS[@]}" "$APP" --client --config "$CFG" --count "$COUNT"
+    sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG" --count "$COUNT"
 else
-    sudo "${ENVPASS[@]}" "$APP" --client --config "$CFG"
+    sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG"
 fi
 rc=$?
 
