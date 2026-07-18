@@ -21,13 +21,12 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
 
-#include <fmt/core.h>
+
 #include <fmt/format.h>
 
 #include "../common/RxFrame.hpp"
@@ -150,6 +149,7 @@ class EtherFabricVirtualInterface {
   static constexpr bool HAS_TX = (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
 
   static_assert((NbTxBufs & (NbTxBufs - 1)) == 0, "NbTxBufs must be a power of two");
+  static_assert((NbRxBufs & (NbRxBufs - 1)) == 0, "NbRxBufs must be a power of two (payload-poll FIFO cursor wraps with & mask)");
   static_assert(NbRxBufs % 8 == 0, "EF10 pushes RX descriptors in multiples of 8");
   static_assert(BufSize >= 64, "slot must hold a minimum ethernet frame");
 
@@ -213,6 +213,14 @@ private:
   inline void handleDiscard(std::uint32_t id, unsigned subtype) noexcept;
   [[nodiscard]] bool readMac() noexcept;
 
+
+  [[gnu::always_inline]] bool evqHasEvent() const noexcept {
+    const std::uint32_t off = m_vi.ep_state->evq.evq_ptr & m_vi.evq_mask;
+    const volatile std::uint64_t* slot = reinterpret_cast<const volatile std::uint64_t*>(m_vi.evq_base + off);
+    const std::uint64_t v = *slot;
+    return (static_cast<std::uint32_t>(v) != 0xFFFFFFFFu) && (static_cast<std::uint32_t>(v >> 32) != 0xFFFFFFFFu);
+  }
+
   std::string                 m_ifname;
   std::array<std::uint8_t, 6> m_mac{};
 
@@ -247,6 +255,7 @@ private:
   std::uint32_t m_txPad{0};
   std::uint32_t m_txBase{NbRxBufs + kTxGuardSlots};
   std::uint32_t m_txLen{0};
+  std::uint8_t* m_txPtr{nullptr};        // acquire() computes txSlot() once; commit() reuses it
 
   std::uint64_t m_ctpioWins{0};
   std::uint64_t m_ctpioFallbacks{0};
@@ -490,13 +499,14 @@ inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize,
   }
   m_txSlot = m_txHead & (NbTxBufs - 1);
   m_txLen  = frameLen;
-  return txSlot(m_txSlot);
+  m_txPtr  = txSlot(m_txSlot);
+  return m_txPtr;
 }
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::commit() noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (UseCtpio) {
-    ef_vi_transmit_ctpio(&m_vi, txSlot(m_txSlot), m_txLen, CtThreshold);
+    ef_vi_transmit_ctpio(&m_vi, m_txPtr, m_txLen, CtThreshold);
     for (;;) {
       const int rc = ef_vi_transmit_ctpio_fallback(&m_vi, m_txDma[m_txSlot],
                                                    static_cast<int>(m_txLen),
@@ -538,23 +548,18 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (kEfViRxPayloadPoll) {
-    // Spin target: the next-in-FIFO buffer's ethertype. volatile — the write
-    // comes from NIC DMA, invisible to the compiler; without it this load gets
-    // hoisted out of the caller's spin loop and never sees the frame land.
     std::uint8_t* buf = rxSlot(m_rxNextIdx);
-    const volatile std::uint16_t* marker =
-        reinterpret_cast<const volatile std::uint16_t*>(buf + m_rxPrefix + 12);
+    const volatile std::uint16_t* marker = reinterpret_cast<const volatile std::uint16_t*>(buf + m_rxPrefix + 12);
     if (*marker != 0) [[unlikely]] {
       m_heldId    = m_rxNextIdx;
-      m_rxNextIdx = (m_rxNextIdx + 1) % NbRxBufs;
+      m_rxNextIdx = (m_rxNextIdx + 1) & (NbRxBufs - 1);
       ++m_rxPollHits;
       return { .data   = { buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix) },
                .sec    = 0,
                .nsec   = 0,
                .status = 1 };
     }
-    // Miss: housekeeping only — TX completions, counters, the idle RX push.
-    // RX events are consumed as no-ops inside pollEvent in this mode.
+
     RxEv ev;
     (void)pollEvent(ev, true);
     return {};
@@ -571,17 +576,7 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
-  // Decoupled re-post: init writes the descriptor with NO doorbell. The push
-  // (every 8th descriptor, EF10 batch rule) fires from the IDLE spin instead —
-  // ef_vi_receive_post's every-8th doorbell was phase-locked to the TX slot
-  // rotation and its MMIO write, landing adjacent to a CTPIO burst, tore the
-  // aperture write stream (noncontig poisons pinned to one slot per role:
-  // server slot 7 / client slot 0, 94-98% of all fallbacks). The valve only
-  // matters for RxOnly under sustained load (never idle); RxTx roles idle
-  // every round. receive_push posts floor-8 batches and no-ops when empty.
   if constexpr (kEfViRxPayloadPoll) {
-    // Clear the poll marker before the buffer goes back to the NIC — a stale
-    // ethertype from this frame would false-fire the next lap of the ring.
     std::memset(rxSlot(m_heldId) + m_rxPrefix + 12, 0, 2);
   }
   ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
@@ -717,21 +712,29 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
       }
     }
     if (pass > 0) return false;
-    m_nEv   = ef_eventq_poll(&m_vi, m_evs, kEvPollBatch);
-    m_evIdx = 0;
-    if (m_nEv == 0) [[likely]] {
+    // Fast empty path: skip the out-of-line ef_eventq_poll call entirely when
+    // the EVQ head slot says no event exists (see evqHasEvent()). The refill
+    // below runs only when there is real work.
+    if (!evqHasEvent()) [[likely]] {
       if constexpr (HAS_RX) {
-        // Idle: the wall configuration's push placement (first empty poll).
-        // A TX-quiescent gate (m_txHead == m_txTail) was tried and fixed the
-        // client's phase-lock on the no-guard layout but re-phased the server's
-        // doorbell into a two-slot curse — the doorbell triggers a DELAYED
-        // NIC-side descriptor fetch, so CPU-side timing can only move the
-        // collision, not remove it. wantRx excludes the TX-side drain.
+        // Idle RX push: the doorbell fires from the quiet spin, keeping its
+        // MMIO write (and the NIC's delayed descriptor fetch it triggers) away
+        // from release()'s position nanoseconds behind a CTPIO burst. Under
+        // the in_order CTPIO writer (config of record) doorbell phase cannot
+        // tear a burst at all — this placement is now about PCIe tidiness,
+        // not correctness. wantRx excludes the TX-side drain.
         if (wantRx && m_rxPendingPush >= 8) {
           ef_vi_receive_push(&m_vi);
           m_rxPendingPush &= 7;
         }
       }
+      return false;
+    }
+    m_nEv   = ef_eventq_poll(&m_vi, m_evs, kEvPollBatch);
+    m_evIdx = 0;
+    if (m_nEv == 0) [[unlikely]] {
+      // evqHasEvent raced a half-written event — absent by the full test;
+      // the next spin iteration picks it up.
       return false;
     }
   }

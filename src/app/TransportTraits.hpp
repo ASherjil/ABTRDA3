@@ -1,23 +1,19 @@
 #pragma once
 
-// TransportTraits — ONE traits struct per transport, so TransportDispatch can be
-// written exactly once. The transport is chosen at RUNTIME (a TOML string) but is a
-// COMPILE-TIME template param (DPDK<DpdkMode::TxOnly>, AFXDP<...>); that boundary is
-// crossed ONCE, in withTransport(). All static + inline, monomorphized per transport:
-// no virtuals, no type erasure, nothing on the hot path.
+// TransportTraits — one traits struct per transport; TransportDispatch is written once.
+// Transport is chosen at RUNTIME (TOML string) but is a COMPILE-TIME template param; the
+// boundary is crossed once, in withTransport(). All static + inline, monomorphized:
+// no virtuals, nothing on the hot path.
 //
-// TO ADD A TRANSPORT: write a traits struct + add one line to withTransport().
+// TO ADD A TRANSPORT: write a traits struct + one line in withTransport().
 //
-// The CRTP base supplies the defaults; a traits struct overrides only what differs:
-//   kName / kPairedRxTx / kSingleCapable   TOML string; needs SEPARATE Tx+Rx objects
-//                                          for Server/Client; supports --single
+// The CRTP base supplies defaults; override only what differs:
+//   kName / kPairedRxTx / kSingleCapable   TOML string; separate Tx+Rx objects; --single ok
 //   TxOnly / RxOnly / RxTx                 per-mode transport types
-//   makeTx / makeRx / makeRxTx             construct one. Returns a PRVALUE => guaranteed
-//                                          copy elision, so even move-deleted types (Verbs) work
-//   makeSingleTx / makeSingleRx            --single may need OTHER types (default: makeTx/makeRx)
+//   makeTx / makeRx / makeRxTx             construct one (prvalue => elision; move-deleted ok)
+//   makeSingleTx / makeSingleRx            --single overrides (default: makeTx/makeRx)
 //   init / banner / preflight              bring up; log; run-once precondition
-//   withAux                                keep auxiliary machinery alive for the run
-//   withSinglePair                         the --single lifecycle
+//   withAux / withSinglePair               auxiliary machinery; the --single lifecycle
 
 #include "TestConfig.hpp"
 #include "RingConcepts.hpp"
@@ -35,16 +31,12 @@
 #include "NicTuner.hpp"
 #include "common/HugePageHelpers.hpp"
 
-#include <fmt/core.h>
-
 #include <pthread.h>
 #include <sched.h>
-
 #include <chrono>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <utility>
 
 // ── CRTP base: the defaults every traits struct inherits ────────────────────
 template<class Self>
@@ -129,46 +121,31 @@ struct PacketMmapTraits : TransportBase<PacketMmapTraits> {
     }
 };
 
-// ── i40e RX write-back policy (SILICON, not per-transport) ──────────────────
-// The XXV710 honors the per-queue ITR even in pure polling mode: it gates when completed RX
-// descriptors are DMA'd back to host RAM. Applies to EVERY stack that touches this NIC —
-// DPDK (vfio), DPDK-over-AF_XDP, and native AF_XDP (kernel-bound) — so it lives up here,
-// above the traits that use it.
-//
-// NoITR (QINT_RQCTL.ITR_INDX = 3). Datasheet 332464 §8.3.3.1.4.2, verbatim: "The receive
-// descriptors could be reported instantly for each packet by setting the ITR_INDX to NoITR."
-// DPDK binds the data path with I40E_ITR_INDEX_DEFAULT (0 — a real ITR, 32us interval) at
-// i40e_ethdev.c:2473 and uses I40E_ITR_INDEX_NONE (3) ONLY for FDIR (i40e_fdir.c:233).
-//
-// MEASURED (XXV710, one frame in flight, 2x2 on the two knobs — 32M samples on the last row):
-//   ITR interval 32us (PMD default) + ITR_INDX 0 -> ~30us    stock DPDK
-//   ITR interval 0    (ITR cleared) + ITR_INDX 0 ->  9.028us
-//   ITR interval 0    (ITR cleared) + ITR_INDX 3 ->  9.027us
-//   ITR interval 32us (PMD default) + ITR_INDX 3 ->  9.029us  <== NoITR ALONE. Interval moot.
-// NoITR genuinely detaches the queue from the ITR. It and interval-zero are two routes to the
-// SAME floor: either alone suffices, together they are redundant, and NEITHER goes below ~9us
-// — so the ~9us floor is silicon (2 serialized PCIe reads/TX + MAC/PHY), NOT write-back
-// gating. We prefer NoITR: ONE write instead of two, and immune to anything re-arming the
-// interval — which matters most on the KERNEL path, where adaptive ITR rewrites the INTERVAL
-// (never the INDEX) behind our back. The write IS honored post-start: a positive control
-// (i40eItrProbe — point the queue at a 20us ITR index) took the median 9.03 -> 20.65us.
+// ── i40e RX write-back policy (silicon-wide: DPDK, DPDK-over-AF_XDP, native AF_XDP) ──
+// The XXV710 gates RX-descriptor write-back on the per-queue ITR even in pure polling.
+// Fix = NoITR (QINT_RQCTL.ITR_INDX = 3): datasheet 332464 §8.3.3.1.4.2 "descriptors...
+// reported instantly". DPDK uses index 3 only for FDIR, never the data path.
+// Measured 2x2 (XXV710, one frame in flight):
+//   interval 32us + INDX 0 -> ~30us (stock)   interval 0 + INDX 0 -> 9.028us
+//   interval 0    + INDX 3 -> 9.027us         interval 32us + INDX 3 -> 9.029us
+// Either knob alone reaches the same ~9us silicon floor. NoITR preferred: one write,
+// immune to adaptive ITR rewriting the interval on the kernel path. Positive control:
+// kI40eItrProbe (20us index) moved the median 9.03 -> 20.65us.
 inline constexpr bool kI40eNoItr = true;
 
-// Diagnostic only (see above). Flip on to re-demonstrate that BAR0 writes reach this silicon.
+// Diagnostic: re-demonstrate that BAR0 writes reach the silicon.
 inline constexpr bool          kI40eItrProbe         = false;
-inline constexpr std::uint32_t kI40eItrProbeIdx      = 1;    // free: NoITR leaves index 0 alone
+inline constexpr std::uint32_t kI40eItrProbeIdx      = 1;    // NoITR leaves index 0 alone
 inline constexpr std::uint32_t kI40eItrProbeInterval = 10;   // x2us = 20us
 
-// Belt-and-braces ITR-INTERVAL clear (pci::i40eClearItr) ON TOP of NoITR. Redundant: NoITR
-// alone measures 9.029us with the interval left at the PMD's 32us default. Kept callable, OFF.
+// ITR-interval clear on top of NoITR — measured redundant. Kept callable, OFF.
 inline constexpr bool kI40eAlsoClearItr = false;
 
 static_assert(!(kI40eNoItr && kI40eItrProbe), "NoITR and the ITR probe both write ITR_INDX");
 static_assert(kI40eNoItr || kI40eAlsoClearItr || kI40eItrProbe,
               "i40e with neither NoITR nor the ITR clear sits at the PMD's 32us default (~30us RTT)");
 
-// Apply + verify, on ANY stack. `bdf` must already be resolved (post-vfio-unbind a renamed
-// port like "xxv0" cannot be re-derived from its name).
+// Apply + verify on any stack. `bdf` must be pre-resolved (netdev gone after vfio unbind).
 inline void i40eApplyWritebackPolicy(const std::string& bdf, std::string_view ifname,
                                      const char* tag) {
     if (kI40eAlsoClearItr) pci::i40eClearItr(bdf, ifname);
@@ -178,10 +155,9 @@ inline void i40eApplyWritebackPolicy(const std::string& bdf, std::string_view if
 }
 
 // ── af_xdp ──────────────────────────────────────────────────────────────────
-// Direction is a compile-time param, so each role gets a MINIMAL socket (TxOnly skips
-// FILL/XSKMAP/steering; RxOnly skips the TX ring) and the TX kick policy can differ by
-// type: RxTx + the --single TX socket kick UNCONDITIONALLY (NeedWakeup=false); TxGen
-// keeps the cheaper gated kick.
+// Direction is compile-time: each role gets a minimal socket (TxOnly skips FILL/XSKMAP,
+// RxOnly skips the TX ring). Kick policy differs by type: RxTx + --single kick
+// unconditionally (NeedWakeup=false); TxGen keeps the cheaper gated kick.
 struct AfxdpTraits : TransportBase<AfxdpTraits> {
     static constexpr std::string_view kName = "af_xdp";
 
@@ -209,22 +185,15 @@ struct AfxdpTraits : TransportBase<AfxdpTraits> {
         const bool  isI40e = pci::boundToI40e(role.interface);
         const std::string bdf = isI40e ? pci::resolveBdf(role.interface) : std::string{};
 
-        // PRE-BIND read. An `ethtool -C rx-usecs 50` lands in PFINT_ITRN immediately, yet by
-        // the time we look after the bind it reads 0 — so SOMETHING between here and there
-        // zeroes it. This line pins down whether that something is the XSK bind itself (which
-        // would mean AF_XDP never depended on ambient ITR state) or something earlier.
+        // Pre-bind ITR read: pins down that the XSK bind itself zeroes PFINT_ITRN.
         if (isI40e) pci::reportItr(bdf, role.interface, "AFXDP-ITR pre-bind");
 
         if (!xsk.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend))
             return false;
-        // Coalescing MUST be zeroed AFTER the bind — xsk_socket__create() resets it, so
-        // NicTuner cannot do it during pre-bind construction.
+        // AFTER the bind — xsk_socket__create() resets coalescing.
         if (cfg.nicTunerMode != NicTunerMode::Off)
             NicTuner::setCoalescingZero(role.interface.c_str());
-        // i40e: SET the write-back policy, don't just report it. NoITR detaches the queue from
-        // the ITR entirely, so it holds regardless of what the interval says — and unlike an
-        // interval clear it cannot be undone by the kernel's adaptive ITR. Must run AFTER
-        // xsk.init(): the bind reconfigures the queue pair and rewrites QINT_RQCTL.
+        // AFTER xsk.init() — the bind reconfigures the queue pair and rewrites QINT_RQCTL.
         if (isI40e) i40eApplyWritebackPolicy(bdf, role.interface, "AFXDP-ITR post-bind");
         return true;
     }
@@ -238,42 +207,43 @@ struct AfxdpTraits : TransportBase<AfxdpTraits> {
 // ── dpdk ────────────────────────────────────────────────────────────────────
 // The DPDK class is PMD-agnostic; ALL driver-specific policy lives here.
 
-// igc runs at 1 GbE: the 2.5GBASE-T PHY costs ~2.4us/traversal of FIXED pipeline
-// latency. Measured A/B: 17.108 -> 13.388us RTT. Flip + rebuild for native 2.5G.
-// docs/Benchmarks.md §5.2.
+// igc at 1 GbE: the 2.5GBASE-T PHY costs ~2.4us fixed latency per traversal.
+// Measured A/B: 17.108 -> 13.388us RTT. docs/Benchmarks.md §5.2.
 inline constexpr bool kIgcAdvertise1GOnly = true;
 
-// mlx5 latency devargs (A/B-tested on ConnectX-4 Lx): legacy per-queue TxQ alloc
-// (consecutive-umem fails on the 2nd single-queue port in-process); FULL Tx inlining at
-// 1 queue — the frame rides inside the WQE, no payload DMA read (-520ns uniform, and it
-// is what makes setTxInlineReuse valid); plain 64B CQEs, no RX decompression.
-// sq_db_nc=0 (WC doorbell mapping) was A/B'd and is a NULL: median moved 1ns. The cost is
-// the NIC's DMA read-back of the WQE (BlueFlame), not how the CPU writes the doorbell.
+// mlx5 latency devargs (A/B on CX4 Lx): legacy per-queue TxQ alloc (consecutive-umem
+// fails on the 2nd single-queue port in-process); full Tx inlining at 1 queue — frame
+// rides in the WQE, no payload DMA read (-520ns; prerequisite for setTxInlineReuse);
+// plain 64B CQEs. sq_db_nc=0 was a null (1ns): the cost is the WQE DMA read-back
+// (BlueFlame), not the doorbell write.
 inline constexpr const char* kMlx5LatencyDevargs =
     "txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0";
 
-// mlx5 RX ring: 64, not the 256 default. mlx5 bulk-refills min(64, NbRxDesc>>2) mbufs at the
-// TOP of rx_burst, so a 256 ring pays a 64-mbuf refill INSIDE a poll while the echo is in
-// flight; 64 cuts that to 16. Measured (30s A/B, CX4): P99.9 3.793 -> 3.648us (-145ns),
-// median UNMOVED at 3.379, Vector SSE retained. mlx5 ONLY — i40e's vector rearm threshold is
-// a compile-time 64, so a 64-entry ring would leave it no headroom.
+// 64, not the 256 default: mlx5 bulk-refills min(64, NbRxDesc>>2) mbufs at the top of
+// rx_burst — 256 pays a 64-mbuf refill mid-poll, 64 pays 16. Measured (30s, CX4):
+// P99.9 -145ns, median unmoved, Vector SSE retained. mlx5 ONLY — i40e's vector rearm
+// threshold is a compile-time 64, leaving a 64-ring no headroom.
 inline constexpr std::uint16_t kMlx5NbRxDesc = 64;
 
-// sfc latency devargs (X2522). perf_profile defaults to THROUGHPUT — hardware/evq
-// moderation tuned for bulk, pure added latency in a ping-pong — so low-latency must be
-// asked for explicitly. rx ef10 = the native X2 datapath (what auto picks; pinned for
-// determinism). tx ef10_simple = the fastest TX datapath: no multi-seg, one mempool,
-// neglects mbuf refcounts — all fine for single-seg frames from one pool with a fresh
-// mbuf per send. Do NOT pair it with setTxInlineReuse: the reuse trick keeps a
-// high-refcount mbuf the PMD must decrement-not-free, exactly what ef10_simple skips;
-// and unlike mlx5 there is no full-inline TX, so the NIC DMA-reads the buffer anyway
-// (the reuse win does not exist here — DPDK/sfc has no CTPIO; that gap IS ef_vi's win).
+// sfc latency devargs (X2522). perf_profile defaults to throughput; low-latency
+// (license-gated INIT_EVQ on Medford2) enables RX/event cut-through, disables RX
+// batching. rx ef10 = native X2 datapath, pinned for determinism. tx ef10_simple =
+// fastest TX (single-seg, one mempool, ignores refcounts) — do NOT pair with
+// setTxInlineReuse (needs refcounts), and there is no full-inline TX here anyway
+// (no CTPIO in the PMD; that gap IS ef_vi's win). stats_update_period_ms=0 kills the
+// default 1Hz MC stats DMA push (same disturbance class as MCDI temp reads).
 inline constexpr const char* kSfcLatencyDevargs =
-    "perf_profile=low-latency,rx_datapath=ef10,tx_datapath=ef10_simple";
+    "perf_profile=low-latency,rx_datapath=ef10,tx_datapath=ef10_simple,"
+    "stats_update_period_ms=0";
 
-// BEFORE prepare(): set the knobs and resolve the BDF while the netdev still exists (the
-// vfio unbind removes it, and renamed ports like "xxv0" cannot be re-derived after).
-// setDevargs must land before prepare() registers the BDF.
+// 64, not 256 — same lever as kMlx5NbRxDesc: ef10 refills when free >= max(fill/8, 8)
+// and pays the whole backlog inside one rx_burst; fill 256 = 32-mbuf bursts, 64 = 8.
+// The EF10 hardware ring stays at its 512 minimum regardless (nb_rx_desc only sets the
+// fill level) — no headroom risk with one frame in flight.
+inline constexpr std::uint16_t kSfcNbRxDesc = 64;
+
+// BEFORE prepare(): set knobs + resolve the BDF while the netdev still exists (vfio
+// unbind removes it). setDevargs must land before prepare() registers the BDF.
 template<class Nic>
 [[nodiscard]] inline std::string dpdkPreInit(Nic& nic, const RoleConfig& role) {
     const std::string bdf = pci::resolveBdf(role.interface);
@@ -288,14 +258,13 @@ template<class Nic>
     }
     if (role.driver == "sfc" && !role.dpdkAfxdpPmd) {
         nic.setDevargs(kSfcLatencyDevargs);  // no inline reuse — see kSfcLatencyDevargs
+        nic.setNbRxDesc(kSfcNbRxDesc);       // shrinks the in-poll refill burst 32 -> 8
     }
     return bdf;
 }
 
-// AFTER dev_start (a reset during start would wipe these). "i40e" covers BOTH the vfio PMD and
-// DPDK-over-AF_XDP on a kernel-bound i40e — same silicon, same write-back throttle, same policy
-// (i40eApplyWritebackPolicy, shared with native AF_XDP). The BDF is passed EXPLICITLY: after a
-// vfio unbind a renamed port ("xxv0") cannot be re-derived from its name.
+// AFTER dev_start (a reset during start wipes these). "i40e" covers both the vfio PMD
+// and DPDK-over-AF_XDP — same silicon, same policy. BDF passed explicitly (see above).
 inline void dpdkPostInitFixes(const std::string& bdf, const RoleConfig& role) {
     if (role.driver == "i40e")
         i40eApplyWritebackPolicy(bdf, role.interface, "DPDK-ITR");
@@ -334,10 +303,9 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
                      roleName, role.interface, role.driver, role.cpuCore);
     }
 
-    // DPDK needs its OWN --single lifecycle: EAL is process-global, so BOTH ports must be
-    // registered (prepare) before the first init() triggers the one rte_eal_init; and a
-    // loopback link only comes up once BOTH PHYs are up, so start both (init(false) = no
-    // link wait), then wait both. One hot-path core drives both ports. KDI §3.
+    // DPDK's own --single lifecycle: EAL is process-global — register BOTH ports before
+    // the first init() triggers rte_eal_init; a loopback link needs both PHYs up, so
+    // start both (init(false) = no link wait), then wait both. One core drives both. KDI §3.
     template<class Fn>
     static int withSinglePair(const TestConfig& cfg, Fn&& fn) {
         TxOnly tx(cfg.client.interface, cfg.recHotPathCore, cfg.client.driver);
@@ -378,10 +346,8 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
 };
 
 // ── verbs ───────────────────────────────────────────────────────────────────
-// RAW_PACKET QP on mlx5 — the sub-2us path: same dispatch as DPDK minus the ethdev/mbuf
-// layer, on identical silicon. mlx5-only (Intel has no verbs provider); the port stays
-// on the kernel driver and must be admin-UP. driver/lcore are ignored (the RDMA device
-// is resolved from the netdev name).
+// RAW_PACKET QP on mlx5 — the sub-2us path: DPDK's dispatch minus ethdev/mbuf, same
+// silicon. mlx5-only; port stays on the kernel driver, admin-UP; driver/lcore ignored.
 struct VerbsTraits : TransportBase<VerbsTraits> {
     static constexpr std::string_view kName = "verbs";
 
@@ -404,19 +370,20 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
 };
 
 // ── ef_vi ────────────────────────────────────────────────────────────────────
-// Solarflare/AMD kernel bypass on the X2522 (EF10) — CTPIO TX writes the frame
-// through a write-combined MMIO aperture straight into the NIC TX FIFO. Same
-// shape as verbs: bifurcated (kernel sfc keeps the port, must be admin-UP), no
-// EAL/vfio, driver/lcore ignored. Needs onload + sfc_char + sfc_resource loaded
-// and root. The DPDK comparison on this NIC is the sfc PMD, which DOES need a
-// vfio-pci bind — the two cannot hold the card at once.
-// CTPIO cut-through threshold in bytes: >= frame_len = store-and-forward for that frame
-// (at frame_size 64 the default 64 is already S&F — no underrun/poison possible);
+// Solarflare/AMD kernel bypass on the X2522 (EF10): CTPIO TX writes the frame through
+// a write-combined MMIO aperture straight into the NIC TX FIFO. Bifurcated like verbs
+// (kernel sfc keeps the port, admin-UP), no EAL/vfio; driver/lcore ignored. Needs
+// onload + sfc_char + sfc_resource and root. The DPDK comparison (sfc PMD) needs a
+// vfio bind — the two cannot hold the card at once.
+
+// Cut-through threshold (bytes buffered before emit): >= frame_len = store-and-forward
+// for that frame (frame 64 @ threshold 64 => no underrun/poison possible);
 // EF_VI_CTPIO_CT_THRESHOLD_SNF (0xffff) = S&F at every size. Live lever at 128B frames.
 inline constexpr unsigned kEfViCtThreshold = 64;
-// false = plain DMA-descriptor sends through the same ef_vi VI: our own
-// doorbell+NIC-read baseline on this silicon, isolating CTPIO's contribution
-// from the PMD-vs-ef_vi software difference.
+// false = DMA-descriptor sends through the same VI (doorbell + NIC buffer read) — the
+// sfc-PMD datapath class. A/B 2026-07-16: CTPIO 1.854us median / DMA 3.417 / DPDK-sfc
+// 3.503 => CTPIO-vs-DMA (1.563us RTT) is the datapath; DMA-vs-DPDK (86ns) is the DPDK
+// framework tax. docs/Benchmarks.md.
 inline constexpr bool kEfViUseCtpio = true;
 
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
@@ -478,10 +445,9 @@ struct I210Traits : TransportBase<I210Traits> {
 };
 
 // ── cadence_gem (custom PMD) ────────────────────────────────────────────────
-// Same one-duplex-object shape as the I210, PLUS a TAP bridge: the PMD owns the hardware,
-// so kernel traffic (NFS/SSH/ARP) is bridged from Q_SLOW (Q0) to a TAP device while Q_HOT
-// (Q1) carries our traffic and never touches the kernel. The bridge must outlive the
-// benchmark -> withAux.
+// One-duplex-object shape like I210, plus a TAP bridge: the PMD owns the hardware, so
+// kernel traffic (NFS/SSH/ARP) bridges Q_SLOW (Q0) <-> a TAP while Q_HOT (Q1) carries
+// ours. The bridge must outlive the benchmark -> withAux.
 struct GemTraits : TransportBase<GemTraits> {
     static constexpr std::string_view kName          = "cadence_gem";
     static constexpr bool             kSingleCapable = false;
@@ -516,17 +482,14 @@ struct GemTraits : TransportBase<GemTraits> {
                      roleName, role.interface, driverOf(role), role.interface);
     }
 
-    // Destruction order at scope exit is exactly what we need:
-    //   ~tapThread -> request_stop() + join()  ~tap -> close the tun fd
-    //   ~nic (caller's scope) -> disable RX/TX, rebind macb, end0 reappears
+    // Scope-exit order: ~tapThread (stop+join) -> ~tap (close tun fd) -> ~nic (rebind).
     template<class Nic, class Fn>
     static void withAux(Nic& nic, const TestConfig&, const RoleConfig& role, Fn&& fn) {
         auto&             slow    = nic.slowPath();
         const std::string tapName = "tap_" + role.interface;
         TapBridge         tap(slow, slow, tapName);
 
-        // The TAP needs the NIC's L3 identity, or the kernel won't recognise bridged
-        // traffic (wrong MAC) and has no address/route to reply on — SSH/NFS/ICMP drop.
+        // The TAP needs the NIC's MAC/addr/route or the kernel drops bridged replies.
         (void)tap.setupAlias(nic.macAddress(), nic.savedAddr(), nic.savedGateway());
 
         std::jthread tapThread = spawnTapBridgeThread(tap);
@@ -534,8 +497,7 @@ struct GemTraits : TransportBase<GemTraits> {
     }
 
 private:
-    // `tap` MUST outlive the returned jthread, so the CALLER owns it. Here: set the thread
-    // attributes (SCHED_OTHER, clear the inherited pin) and spawn.
+    // `tap` must outlive the returned jthread => the caller owns it.
     template<TxRing Tx, RxRing Rx>
     [[nodiscard]] static std::jthread spawnTapBridgeThread(TapBridge<Tx, Rx>& tap) {
         auto t = std::jthread([&tap](std::stop_token st) {
@@ -549,9 +511,8 @@ private:
 
             tap(st);
         });
-        // The child inherits our pinned-core affinity and fights the hot loop for that one
-        // core until it runs the prologue above — yield long enough for it to migrate, or
-        // it starves during the run and Q0 fills up un-drained.
+        // The child inherits our pinned-core affinity — yield until it migrates, or it
+        // fights the hot loop and Q0 fills un-drained.
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return t;
     }

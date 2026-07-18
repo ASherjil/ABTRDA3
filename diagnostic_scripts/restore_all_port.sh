@@ -100,7 +100,8 @@ verify_dev() {
     [ -d "$dev/net" ] && nic="$(ls "$dev/net" 2>/dev/null | head -1)"
 
     if [ -n "$nic" ]; then
-        ip link set "$nic" up 2>/dev/null
+        # housekeeping core: the watchdog timer must never arm on isolated cores
+        taskset -c 2 ip link set "$nic" up 2>/dev/null
         local carrier="?" c
         for _ in $(seq 1 12); do          # up to ~6s for the link to settle
             c="$(cat "/sys/class/net/$nic/carrier" 2>/dev/null || echo 0)"
@@ -131,6 +132,20 @@ for group in "${TARGETS[@]}"; do
     done
 done
 
+# ---- IRQ re-pin BEFORE bringing links up. Order matters twice over: (1) the
+# rebind allocates fresh MSI-X vectors spread across ALL cores incl. isolated
+# 5-7; (2) when the link comes up, the netdev TX watchdog timer arms FROM
+# SOFTIRQ CONTEXT ON THE IRQ'S CORE — and timer wheel bases are sticky, so a
+# timer armed on an isolated core kicks it (nohz CAL IPI) every 5s FOREVER.
+# Pinning first makes both the IRQs and the timers land on housekeeping.
+echo
+echo "=== re-pinning IRQs off the isolated cores (before link-up) ==="
+if [ -x /usr/local/sbin/pin-irqs.sh ]; then
+    /usr/local/sbin/pin-irqs.sh
+else
+    echo "[restore] WARNING: /usr/local/sbin/pin-irqs.sh missing — pin manually!"
+fi
+
 echo
 echo "=== result ==="
 for bdf in "${ALL_BDFS[@]}"; do
@@ -152,4 +167,19 @@ for bdf in "${ALL_BDFS[@]}"; do
         val="$(cat "$t" 2>/dev/null)" || continue
         printf "%s  %-30s %3d C\n" "$bdf" "$label" "$((val / 1000))"
     done
+done
+
+# ---- verify isolated cores are clean (the pin ran BEFORE link-up above).
+# Expected residue: nvme q6-q8 only (kernel-managed per-CPU, unmovable, and
+# harmless — they fire only on the CPU that issued the I/O).
+echo
+echo "=== verifying isolated cores are clean ==="
+for i in /proc/irq/[0-9]*; do
+    a="$(cat "$i/smp_affinity_list" 2>/dev/null)" || continue
+    case ",$a," in
+        *[5-7]*)
+            n="$(ls "$i" 2>/dev/null | grep -vE 'affinity|node|spurious' | head -1)"
+            echo "[restore]   still on isolated cores: irq ${i##*/} aff=$a dev=$n"
+            ;;
+    esac
 done

@@ -42,6 +42,24 @@ APP="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
 APP_DIR="$(dirname "$APP")"
 [ -f "$CFG" ] || { echo "[rtt_run] ERROR: config '$CFG' not found" >&2; exit 1; }
 CFG="$(cd "$(dirname "$CFG")" && pwd)/$(basename "$CFG")"
+
+# Guard against the same-named-config trap (editing one copy while running
+# another): warn if other tomls with this basename exist in the repo, and echo
+# the loaded file's governing settings so every run self-documents its intent.
+mapfile -t DUPES < <(find "$SCRIPT_DIR/.." -name "$(basename "$CFG")" -not -path '*/build/*' -type f 2>/dev/null)
+if [ "${#DUPES[@]}" -gt 1 ]; then
+    echo "[rtt_run] WARNING: ${#DUPES[@]} configs named '$(basename "$CFG")' exist in the repo:" >&2
+    for d in "${DUPES[@]}"; do
+        r="$(realpath "$d")"
+        if [ "$r" = "$CFG" ]; then
+            echo "[rtt_run]   RUNNING  : $r" >&2
+        else
+            echo "[rtt_run]   NOT used : $r" >&2
+        fi
+    done
+fi
+echo "[rtt_run] config settings ($CFG):"
+grep -nE '^[[:space:]]*(transport|duration_sec|output)[[:space:]]*=' "$CFG" | sed 's/^/[rtt_run]   line /'
 # Run from the binary's dir so AF_XDP's af_xdp_kern.o (CWD-relative) resolves.
 cd "$APP_DIR" || { echo "[rtt_run] ERROR: cannot cd to $APP_DIR" >&2; exit 1; }
 
@@ -121,12 +139,46 @@ mapfile -t ENVPASS < <(env | grep -E '^(EF_VI_|ABTRDA3_)[A-Za-z0-9_]*=')
 if [ "$EFVI" = "1" ] && ! printf '%s\n' "${ENVPASS[@]}" | grep -q '^ABTRDA3_TX_PAD='; then
     ENVPASS+=("ABTRDA3_TX_PAD=8")
 fi
+# ef_vi default: the in_order CTPIO writer — the certified config of record.
+# libciul's default 'paced' writer keeps WC-buffer eviction ordered only
+# PROBABILISTICALLY (timing gaps calibrated per-process); any mid-frame stall
+# lets two half-filled WC buffers reorder => noncontig tear => fallback (and
+# a per-run lottery: same config drew 21..21500 fallbacks). in_order (sfence
+# per 64B block) makes ordering ARCHITECTURAL: zero fallbacks in 450M+
+# samples, stragglers gone, run-to-run determinism, for ~+15ns median. Our
+# ~60B frames cross ONE write-buffer boundary — the vendor's "poor throughput"
+# caveat is about 1500B frames. Override per-run with EF_VI_CTPIO_MODE=<mode>.
+if [ "$EFVI" = "1" ] && ! printf '%s\n' "${ENVPASS[@]}" | grep -q '^EF_VI_CTPIO_MODE='; then
+    ENVPASS+=("EF_VI_CTPIO_MODE=in_order")
+fi
 
 echo "[rtt_run] app=$APP"
 echo "[rtt_run] cfg=$CFG"
 if [ "${#ENVPASS[@]}" -gt 0 ]; then
     echo "[rtt_run] env passthrough: ${ENVPASS[*]}"
 fi
+# Host-noise bracketing: pure procfs reads (NO tracing — enabling trace events
+# text_pokes the kernel and broadcasts sync_core IPIs to every core, which is
+# itself the noise). Deltas printed after the run attribute any max outlier.
+noise_snap() {
+    awk '/^ *(LOC|CAL|TLB|RES|IWI):/ {printf "%s %s %s %s\n", $1, $7, $8, $9}' /proc/interrupts
+}
+NOISE_BEFORE="$(noise_snap)"
+# Mid-run steady-state window: the full-run deltas above include BOTH process
+# startups and teardowns (lifecycle IPIs — the CAL count is duration-INVARIANT,
+# so it is suspected lifecycle). A window at t=20..45s of the client contains
+# zero lifecycle activity: any CAL/LOC landing in it is a true mid-measurement
+# visitor (the 3.5-3.9us max suspect). Unpinned background job = housekeeping
+# cores; pure procfs reads; zero perturbation of the isolated cores.
+MIDA="$(mktemp)"
+MIDB="$(mktemp)"
+midsnap_job() {
+    sleep 20
+    noise_snap > "$MIDA"
+    sleep 25
+    noise_snap > "$MIDB"
+}
+
 echo "[rtt_run] ===== SERVER (background) ====="
 sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --server --config "$CFG" &
 
@@ -139,15 +191,27 @@ if ! pgrep -f "abtrda3_test --server" >/dev/null 2>&1; then
 fi
 
 echo "[rtt_run] ===== CLIENT ====="
+midsnap_job &
+MIDPID=$!
 if [ -n "$COUNT" ]; then
     sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG" --count "$COUNT"
 else
     sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG"
 fi
 rc=$?
+kill "$MIDPID" 2>/dev/null
 
 echo "[rtt_run] client exited (rc=$rc) — stopping server (SIGINT, clean shutdown)…"
 stop_server
 trap - INT TERM
+echo "[rtt_run] host-noise deltas over the run (CPU5/CPU6/CPU7; LOC=tick CAL=IPI):"
+paste <(echo "$NOISE_BEFORE") <(noise_snap) | awk '{printf "[rtt_run]   %-5s cpu5 +%d  cpu6 +%d  cpu7 +%d\n", $1, $6-$2, $7-$3, $8-$4}'
+if [ -s "$MIDA" ] && [ -s "$MIDB" ]; then
+    echo "[rtt_run] mid-run steady-state deltas (client t=20..45s — NO lifecycle in window):"
+    paste "$MIDA" "$MIDB" | awk '{printf "[rtt_run]   %-5s cpu5 +%d  cpu6 +%d  cpu7 +%d\n", $1, $6-$2, $7-$3, $8-$4}'
+else
+    echo "[rtt_run] mid-run steady-state window: n/a (client ran < 45s)"
+fi
+rm -f "$MIDA" "$MIDB"
 echo "[rtt_run] done (client rc=$rc)"
 exit "$rc"

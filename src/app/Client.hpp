@@ -29,8 +29,7 @@
 #include "Profiling.hpp"
 
 #include <fmt/core.h>
-
-#include <arpa/inet.h>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stop_token>
@@ -83,12 +82,15 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     const std::uint64_t start    = tsc::now();
     [[maybe_unused]] prof::CycleStats txStats;   // debug-only; gated, elided in release
     [[maybe_unused]] prof::CycleStats rxStats;   // debug-only; gated, elided in release
-    // Debug-only outlier log: dump the first N round-trips above a threshold with
-    // their time-since-start, so we can see whether the spikes cluster (settling)
-    // or spread (steady-state system events). I/O only fires on the rare outlier,
-    // AFTER the sample is recorded, so it can't perturb the recorded value.
-    [[maybe_unused]] const std::uint64_t outlierThreshCyc =
-        static_cast<std::uint64_t>(sh.tscHz * 10e-6);   // 10 us
+
+
+    [[maybe_unused]] double outlierUs = 2.5;
+    if constexpr (prof::kDebugProfiling) {
+        if (const char* e = std::getenv("ABTRDA3_OUTLIER_US")) {
+            outlierUs = std::atof(e);
+        }
+    }
+    [[maybe_unused]] const std::uint64_t outlierThreshCyc = static_cast<std::uint64_t>(sh.tscHz * outlierUs * 1e-6);
     [[maybe_unused]] int outlierLogged = 0;
 
     while (tsc::now() - start < durationCyc && !stop.stop_requested()) {
