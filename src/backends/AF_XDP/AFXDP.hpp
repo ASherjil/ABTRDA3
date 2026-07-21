@@ -188,7 +188,6 @@ private:
 
   bool            m_copyMode{false};
   bool            m_customBpf{false};
-  bool            m_txKickAlways{false};
 
   // NAPI regime: the two init() flags, resolved once into the values pushed to
   // sysfs (netdev-wide) and netlink (per-NAPI). All 0 == deferral OFF.
@@ -457,6 +456,15 @@ inline bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::send(std:
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
 void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M != AFXDPMode::RxOnly) {
+  // A TX frame owns exactly [frameNb * FrameSize, +FrameSize) — the same chunk
+  // acquire() hands out. A template larger than the chunk would run into the next
+  // frame and corrupt every one of them, so refuse it here rather than transmit
+  // garbage (same treatment as a mis-sized FILL ring in xskPopulateFillRing).
+  if (frameTemplate.size() > FrameSize) {
+    fmt::print(stderr, "[AFXDP] prefillRing: template {}B exceeds frame size {}B — aborting\n",
+               frameTemplate.size(), FrameSize);
+    std::abort();
+  }
   for (std::uint32_t i = 0; i < TX_POOL_FRAMES; i++) {
     std::uint64_t addr = static_cast<std::uint64_t>(i) * FrameSize;
     std::memcpy(m_umem.buffer + addr, frameTemplate.data(), frameTemplate.size());
@@ -785,24 +793,35 @@ void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::loadXdpProgram(c
 
 template<AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize, bool NeedWakeup>
 void AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::moveFrom(AFXDP& o) noexcept {
-  m_interface     = o.m_interface;
-  m_queueId       = o.m_queueId;
-  m_bpfProgPath   = o.m_bpfProgPath;
-  m_umem          = o.m_umem;
-  m_xsk           = o.m_xsk;
-  m_xdpProg       = std::exchange(o.m_xdpProg, nullptr);
-  m_ifindex       = std::exchange(o.m_ifindex, 0);
-  m_fd            = std::exchange(o.m_fd, -1);
-  m_copyMode      = o.m_copyMode;
-  m_customBpf     = o.m_customBpf;
-  m_txKickAlways  = o.m_txKickAlways;
-  m_pendingRxAddr = o.m_pendingRxAddr;
-  m_pendingTxAddr = o.m_pendingTxAddr;
-  m_pendingTxLen  = o.m_pendingTxLen;
-  m_txFrameNb     = o.m_txFrameNb;
-  o.m_umem.umem   = nullptr;
-  o.m_umem.buffer = nullptr;
-  o.m_xsk.xsk     = nullptr;
+  // EVERY member must be carried across. m_pendingFqIdx in particular: it is the
+  // FILL slot tryReceive() reserved and release() writes to, so dropping it makes
+  // a move between those two calls recycle the frame into slot 0 instead — silent
+  // ring corruption. The NAPI regime fields must come too or a moved-from socket
+  // misreports the deferral it is actually running.
+  m_interface        = o.m_interface;
+  m_queueId          = o.m_queueId;
+  m_bpfProgPath      = o.m_bpfProgPath;
+  m_bindMode         = std::move(o.m_bindMode);
+  m_umem             = o.m_umem;
+  m_xsk              = o.m_xsk;
+  m_xdpProg          = std::exchange(o.m_xdpProg, nullptr);
+  m_ifindex          = std::exchange(o.m_ifindex, 0);
+  m_fd               = std::exchange(o.m_fd, -1);
+  m_copyMode         = o.m_copyMode;
+  m_customBpf        = o.m_customBpf;
+  m_enableDeferral   = o.m_enableDeferral;
+  m_enableIrqSuspend = o.m_enableIrqSuspend;
+  m_napiDefer        = o.m_napiDefer;
+  m_napiGro          = o.m_napiGro;
+  m_napiSusp         = o.m_napiSusp;
+  m_pendingRxAddr    = o.m_pendingRxAddr;
+  m_pendingFqIdx     = o.m_pendingFqIdx;
+  m_pendingTxAddr    = o.m_pendingTxAddr;
+  m_pendingTxLen     = o.m_pendingTxLen;
+  m_txFrameNb        = o.m_txFrameNb;
+  o.m_umem.umem      = nullptr;
+  o.m_umem.buffer    = nullptr;
+  o.m_xsk.xsk        = nullptr;
 }
 
 #endif // ABTRDA3_AFXDP_HPP
