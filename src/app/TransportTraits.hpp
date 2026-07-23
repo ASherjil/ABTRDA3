@@ -18,19 +18,30 @@
 //   init / banner / preflight              bring up; log; run-once precondition
 //   withAux / withSinglePair               auxiliary machinery; the --single lifecycle
 
+// packet_mmap + af_xdp always compile; the other four exist only when their
+// ABTRDA3_WITH_* CMake option is ON (which defines the matching ABTRDA3_HAVE_*).
 #include "TestConfig.hpp"
 #include "RingConcepts.hpp"
 #include "SocketOps.hpp"
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
 #include "AFXDP.hpp"
-#include "DPDK.hpp"
-#include "Verbs.hpp"
-#include "EtherFabricVirtualInterface.hpp"
-#include "Intel_I210.hpp"
 #include "PciHelpers.hpp"
 #include "NicTuner.hpp"
+
+#if defined(ABTRDA3_HAVE_DPDK)
+#include "DPDK.hpp"
+#endif
+#if defined(ABTRDA3_HAVE_VERBS)
+#include "Verbs.hpp"
+#endif
+#if defined(ABTRDA3_HAVE_EFVI)
+#include "EtherFabricVirtualInterface.hpp"
+#endif
+#if defined(ABTRDA3_HAVE_I210)
+#include "Intel_I210.hpp"
 #include "common/HugePageHelpers.hpp"
+#endif
 
 #include <string>
 #include <string_view>
@@ -201,6 +212,7 @@ struct AfxdpTraits : TransportBase<AfxdpTraits> {
     }
 };
 
+#if defined(ABTRDA3_HAVE_DPDK)
 // ── dpdk ────────────────────────────────────────────────────────────────────
 // The DPDK class is PMD-agnostic; ALL driver-specific policy lives here.
 
@@ -341,7 +353,9 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
         return 0;
     }
 };
+#endif  // ABTRDA3_HAVE_DPDK
 
+#if defined(ABTRDA3_HAVE_VERBS)
 // ── verbs ───────────────────────────────────────────────────────────────────
 // RAW_PACKET QP on mlx5 — the sub-2us path: DPDK's dispatch minus ethdev/mbuf, same
 // silicon. mlx5-only; port stays on the kernel driver, admin-UP; driver/lcore ignored.
@@ -365,7 +379,9 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
         fmt::println("[{}] Transport: verbs on {} (RAW_PACKET QP)", roleName, role.interface);
     }
 };
+#endif  // ABTRDA3_HAVE_VERBS
 
+#if defined(ABTRDA3_HAVE_EFVI)
 // ── ef_vi ────────────────────────────────────────────────────────────────────
 // Solarflare/AMD kernel bypass on the X2522 (EF10): CTPIO TX writes the frame through
 // a write-combined MMIO aperture straight into the NIC TX FIFO. Bifurcated like verbs
@@ -403,7 +419,9 @@ struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
         fmt::println("[{}] Transport: ef_vi on {} (CTPIO)", roleName, role.interface);
     }
 };
+#endif  // ABTRDA3_HAVE_EFVI
 
+#if defined(ABTRDA3_HAVE_I210)
 // ── intel_i210 (custom PMD) ─────────────────────────────────────────────────
 // One duplex object serves every mode. No --single (that needs two ports in one process).
 struct I210Traits : TransportBase<I210Traits> {
@@ -440,3 +458,4 @@ struct I210Traits : TransportBase<I210Traits> {
                      roleName, role.interface, driverOf(role));
     }
 };
+#endif  // ABTRDA3_HAVE_I210

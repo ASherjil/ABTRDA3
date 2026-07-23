@@ -55,14 +55,35 @@ inline void dispatchMode(Tx& tx, Rx& rx, RunMode mode, const TestConfig& cfg,
 
 // ── The runtime -> compile-time boundary: the ONLY place transports are named ──
 // Calls fn(std::type_identity<Traits>{}); fn must return int for every traits type.
+// Opt-in transports only exist when their ABTRDA3_WITH_* CMake option was ON;
+// a name that IS a transport but was compiled out gets a rebuild hint, not "unknown".
 template<class Fn>
 [[nodiscard]] inline int withTransport(std::string_view name, Fn&& fn) {
     if (name == PacketMmapTraits::kName) return fn(std::type_identity<PacketMmapTraits>{});
     if (name == AfxdpTraits::kName)      return fn(std::type_identity<AfxdpTraits>{});
+#if defined(ABTRDA3_HAVE_DPDK)
     if (name == DpdkTraits::kName)       return fn(std::type_identity<DpdkTraits>{});
+#endif
+#if defined(ABTRDA3_HAVE_VERBS)
     if (name == VerbsTraits::kName)      return fn(std::type_identity<VerbsTraits>{});
+#endif
+#if defined(ABTRDA3_HAVE_EFVI)
     if (name == EtherFabricTraits::kName) return fn(std::type_identity<EtherFabricTraits>{});
+#endif
+#if defined(ABTRDA3_HAVE_I210)
     if (name == I210Traits::kName)       return fn(std::type_identity<I210Traits>{});
+#endif
+    // Compiled-in names already returned above, so reaching one of these means
+    // this binary was built without it.
+    for (std::string_view gated : {"dpdk", "verbs", "ef_vi", "intel_i210"}) {
+        if (name == gated) {
+            fmt::println(stderr,
+                         "Error: transport '{}' is not compiled into this binary — "
+                         "reconfigure with -DABTRDA3_WITH_ALL=ON (or the matching "
+                         "-DABTRDA3_WITH_DPDK/VERBS/EFVI/I210=ON) and rebuild", name);
+            return 1;
+        }
+    }
     fmt::println(stderr, "Error: unknown transport '{}'", name);
     return 1;
 }

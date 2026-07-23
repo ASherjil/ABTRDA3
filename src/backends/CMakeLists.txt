@@ -14,21 +14,15 @@ add_library(abtrda3 STATIC
         PacketMmap/PacketMmapRx.cpp
         PacketMmap/PacketMmapTx.cpp
 
-    # DPDK transport: the hot path is header-only (DPDK.hpp, a template), but the
-    # process-global EAL base is a plain class -> compiled ONCE here.
-        DPDK/DPDKEal.cpp
-
     # AF_XDP transport is header-only (AFXDP.hpp); no .cpp here.
+    # Opt-in transports (dpdk/verbs/ef_vi/intel_i210) add their sources,
+    # include dirs and deps in their ABTRDA3_WITH_* blocks below.
 )
 
 target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/common>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/PacketMmap>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/IGBCustomPMD>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/EtherFabricVirtualInterface>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -36,6 +30,8 @@ target_compile_features(abtrda3 PUBLIC cxx_std_20)
 
 target_link_libraries(abtrda3
     PRIVATE abtrda3_flags
+    # ABTEdge in EVERY build: common/PciHelpers.hpp uses its BackendBase MMIO
+    # (i40e ITR/NoITR, igc EEE clear) on the always-on AF_XDP path too.
     PUBLIC  abtedge_backend
     PUBLIC  fmt::fmt
 )
@@ -68,46 +64,77 @@ pkg_check_modules(LIBXDP REQUIRED IMPORTED_TARGET libxdp)
 target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBXDP)
 
 # =============================================================================
-# DPDK transport — header-only DPDK.hpp over libdpdk (PMDs i40e/igc/mlx5).
-# Required dependency (like libxdp): install DPDK 25.11 LTS, plus rdma-core for
-# the Mellanox/mlx5 (ConnectX-4) PMD. PUBLIC: DPDK.hpp emits rte_* calls into
-# every consumer, so they need libdpdk's include path + symbols at link time
-# (same reason libbpf/libxdp are PUBLIC).
+# DPDK transport (opt-in: ABTRDA3_WITH_DPDK) — header-only DPDK.hpp over
+# libdpdk (PMDs i40e/igc/mlx5/sfc); the process-global EAL base (DPDKEal.cpp)
+# is a plain class compiled ONCE here. Install DPDK 25.11 LTS, plus rdma-core
+# for the Mellanox/mlx5 (ConnectX-4) PMD. PUBLIC: DPDK.hpp emits rte_* calls
+# into every consumer, so they need libdpdk's include path + symbols at link
+# time (same reason libbpf/libxdp are PUBLIC).
 # =============================================================================
-pkg_check_modules(LIBDPDK REQUIRED IMPORTED_TARGET libdpdk)
-target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBDPDK)
-message(STATUS "DPDK transport: libdpdk ${LIBDPDK_VERSION}")
+if(ABTRDA3_WITH_DPDK)
+    pkg_check_modules(LIBDPDK REQUIRED IMPORTED_TARGET libdpdk)
+    target_sources(abtrda3 PRIVATE DPDK/DPDKEal.cpp)
+    target_include_directories(abtrda3 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>)
+    target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBDPDK)
+    target_compile_definitions(abtrda3 PUBLIC ABTRDA3_HAVE_DPDK=1)
+    message(STATUS "DPDK transport: libdpdk ${LIBDPDK_VERSION}")
+endif()
 
 # =============================================================================
-# Verbs transport — header-only Verbs.hpp over libibverbs (RAW_PACKET QP,
-# mlx5/RDMA-capable NICs only; rdma-core/libibverbs-dev). PUBLIC for the same
-# reason as libdpdk: the header emits ibv_* calls into its consumers.
+# Verbs transport (opt-in: ABTRDA3_WITH_VERBS) — header-only Verbs.hpp over
+# libibverbs (RAW_PACKET QP, mlx5/RDMA-capable NICs only; rdma-core/
+# libibverbs-dev). PUBLIC for the same reason as libdpdk: the header emits
+# ibv_* calls into its consumers.
 # =============================================================================
-pkg_check_modules(LIBIBVERBS REQUIRED IMPORTED_TARGET libibverbs)
-target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBIBVERBS)
-message(STATUS "Verbs transport: libibverbs ${LIBIBVERBS_VERSION}")
-pkg_check_modules(LIBMLX5 REQUIRED IMPORTED_TARGET libmlx5)
-target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBMLX5)
-message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE poll)")
+if(ABTRDA3_WITH_VERBS)
+    pkg_check_modules(LIBIBVERBS REQUIRED IMPORTED_TARGET libibverbs)
+    target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBIBVERBS)
+    message(STATUS "Verbs transport: libibverbs ${LIBIBVERBS_VERSION}")
+    pkg_check_modules(LIBMLX5 REQUIRED IMPORTED_TARGET libmlx5)
+    target_link_libraries(abtrda3 PUBLIC PkgConfig::LIBMLX5)
+    message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE poll)")
+    target_include_directories(abtrda3 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>)
+    target_compile_definitions(abtrda3 PUBLIC ABTRDA3_HAVE_VERBS=1)
+endif()
 
 # =============================================================================
-# ef_vi transport — header-only EtherFabricVirtualInterface.hpp over libciul
-# (Solarflare/AMD kernel bypass, Onload 9.0.2, X2522). Onload installs
-# libciul1.a + /usr/include/etherfabric WITHOUT a pkg-config file, so this is
-# find_library/find_path rather than the pkg_check_modules used above. PUBLIC
-# for the same reason as libdpdk/libibverbs: the header emits ef_* calls into
-# every consumer. SYSTEM keeps the C headers clear of -Wconversion/-Wpedantic.
+# ef_vi transport (opt-in: ABTRDA3_WITH_EFVI) — header-only
+# EtherFabricVirtualInterface.hpp over libciul (Solarflare/AMD kernel bypass,
+# Onload 9.0.2, X2522). Onload installs libciul1.a + /usr/include/etherfabric
+# WITHOUT a pkg-config file, so this is find_library/find_path rather than the
+# pkg_check_modules used above. PUBLIC for the same reason as libdpdk/
+# libibverbs: the header emits ef_* calls into every consumer. SYSTEM keeps
+# the C headers clear of -Wconversion/-Wpedantic.
 # =============================================================================
-# HINTS: a sibling onload checkout serves machines where Onload is built but
-# not installed (workstation); on installed systems (rtserver) the hints miss
-# and the system paths (/usr/include, /usr/lib) resolve as before.
-find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h
-          HINTS ${CMAKE_SOURCE_DIR}/../onload/src/include REQUIRED)
-find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul
-             HINTS ${CMAKE_SOURCE_DIR}/../onload/build/gnu_x86_64/lib/ciul REQUIRED)
-target_include_directories(abtrda3 SYSTEM PUBLIC ${ETHERFABRIC_INCLUDE_DIR})
-target_link_libraries(abtrda3 PUBLIC ${LIBCIUL_LIBRARY})
-message(STATUS "ef_vi transport: ${LIBCIUL_LIBRARY}")
+if(ABTRDA3_WITH_EFVI)
+    # HINTS: a sibling onload checkout serves machines where Onload is built
+    # but not installed (workstation); on installed systems (rtserver) the
+    # hints miss and the system paths (/usr/include, /usr/lib) resolve as before.
+    find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h
+              HINTS ${CMAKE_SOURCE_DIR}/../onload/src/include REQUIRED)
+    find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul
+                 HINTS ${CMAKE_SOURCE_DIR}/../onload/build/gnu_x86_64/lib/ciul REQUIRED)
+    target_include_directories(abtrda3 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/EtherFabricVirtualInterface>)
+    target_include_directories(abtrda3 SYSTEM PUBLIC ${ETHERFABRIC_INCLUDE_DIR})
+    target_link_libraries(abtrda3 PUBLIC ${LIBCIUL_LIBRARY})
+    target_compile_definitions(abtrda3 PUBLIC ABTRDA3_HAVE_EFVI=1)
+    message(STATUS "ef_vi transport: ${LIBCIUL_LIBRARY}")
+endif()
+
+# =============================================================================
+# Intel I210 register PMD (opt-in: ABTRDA3_WITH_I210) — header-only over the
+# ABTEdge backend, which every build already links (see above). No extra
+# system deps; just the include dir and the enable define.
+# =============================================================================
+if(ABTRDA3_WITH_I210)
+    target_include_directories(abtrda3 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/IGBCustomPMD>)
+    target_compile_definitions(abtrda3 PUBLIC ABTRDA3_HAVE_I210=1)
+    message(STATUS "intel_i210 transport: enabled")
+endif()
 
 # 5. Compile AF_XDP BPF filter (.o file loaded at runtime xdpsock-style).
 #    Output lands NEXT TO the abtrda3_test executable (build/src/app) — the

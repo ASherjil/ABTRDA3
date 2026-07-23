@@ -23,6 +23,12 @@ echo "2) Release"
 echo "3) Release + Profiling  (rdtsc/HW-ts instrumentation, x86_64 only)"
 read -rp "Build type [1/2/3]: " type_choice
 
+# ── 4. Transports ──
+echo ""
+echo "1) Default  (packet_mmap + af_xdp)"
+echo "2) All      (+ DPDK, Verbs, ef_vi, intel_i210 — the rtserver benchmark build)"
+read -rp "Transports [1/2]: " transports_choice
+
 # Resolve preset name
 case "${arch_choice}" in
     1) arch="x86_64" ;;
@@ -43,6 +49,16 @@ if [[ "${type}" == "relprof" && "${arch}" != "x86_64" ]]; then
 fi
 
 preset="${arch}-${type}"
+
+# All-transports maps to the -full presets (ABTRDA3_WITH_ALL=ON); only the
+# x86_64 release/relprof pair has them — the vendor stacks are x86-only here.
+if [[ "${transports_choice}" == "2" ]]; then
+    if [[ "${preset}" != "x86_64-release" && "${preset}" != "x86_64-relprof" ]]; then
+        echo "All-transports needs x86_64 Release or Release+Profiling."; exit 1
+    fi
+    preset="${preset}-full"
+fi
+
 build_dir="build/${preset}"
 
 echo ""
@@ -66,34 +82,3 @@ cmake --build "${build_dir}" -j"$(nproc)"
 
 echo ""
 echo "── Done: ${build_dir} ──"
-
-# ── 4. SCP to remote ──
-echo ""
-echo "── SCP to remote server ──"
-echo "1) Skip"
-echo "2) scp → asherjil@100.72.135.7:~/ABTTiming/ABTRDA3/"
-read -rp "SCP [1/2]: " scp_choice
-
-if [[ "${scp_choice}" == "2" ]]; then
-    remote="asherjil@100.72.135.7:~/ABTTiming/ABTRDA3/"
-    binary="${build_dir}/test/abtrda3_test"
-    config="test/abtrda3_test.toml"
-    bpf="${build_dir}/test/af_xdp_kern.o"
-
-    if [[ ! -f "${binary}" ]]; then
-        echo "ERROR: binary not found: ${binary}"
-        exit 1
-    fi
-    if [[ ! -f "${config}" ]]; then
-        echo "ERROR: config not found: ${config}"
-        exit 1
-    fi
-    if [[ ! -f "${bpf}" ]]; then
-        echo "ERROR: BPF object not found: ${bpf}"
-        exit 1
-    fi
-
-    echo "Transferring abtrda3_test + abtrda3_test.toml + af_xdp_kern.o → ${remote} ..."
-    scp "${binary}" "${config}" "${bpf}" "${remote}"
-    echo "── SCP complete ──"
-fi

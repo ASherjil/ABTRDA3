@@ -55,6 +55,10 @@ ABTRDA3 does the ritual for you and hands back one interface:
 
 ## Build
 
+The default build compiles the two transports available on essentially every Linux
+system — `packet_mmap` and `af_xdp` — and needs only **libxdp** (+ clang for the BPF
+programs; libbpf is fetched and built statically):
+
 ```bash
 cmake -B build/x86_64-release -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64.cmake \
@@ -62,9 +66,19 @@ cmake -B build/x86_64-release -G Ninja \
 cmake --build build/x86_64-release
 ```
 
-Dependencies (found via `pkg-config`): **libdpdk** (25.11 LTS), **libxdp** + **libbpf**,
-and **libibverbs**/**libmlx5** for the verbs backend. C++20 compiler (GCC 13+), and
-`intel_iommu=on iommu=pt` on the kernel command line for the DPDK vfio path.
+The kernel-bypass transports sit on heavyweight vendor stacks, so each is **opt-in**:
+
+| CMake option | Transport | Extra dependency |
+|---|---|---|
+| `-DABTRDA3_WITH_DPDK=ON` | `dpdk` | libdpdk (25.11 LTS); `intel_iommu=on iommu=pt` for the vfio path |
+| `-DABTRDA3_WITH_VERBS=ON` | `verbs` | rdma-core (libibverbs + libmlx5) |
+| `-DABTRDA3_WITH_EFVI=ON` | `ef_vi` | Onload (libciul + etherfabric headers) |
+| `-DABTRDA3_WITH_I210=ON` | `intel_i210` | none (uses the ABTEdge backend every build already has) |
+| `-DABTRDA3_WITH_ALL=ON` | all of the above | — |
+
+`-DABTRDA3_WITH_ALL=ON` (or the `x86_64-release-full` preset) is the full benchmark
+build; selecting a transport in the TOML that isn't compiled in fails at startup with
+the exact reconfigure flag to use. C++20 compiler (GCC 13+) either way.
 
 ## The API — four calls
 
