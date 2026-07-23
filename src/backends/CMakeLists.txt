@@ -23,8 +23,6 @@ target_include_directories(abtrda3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/PacketMmap>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/AF_XDP>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/IGBCustomPMD>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/MacbCustomPMD>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/TapBridge>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/DPDK>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Verbs>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/EtherFabricVirtualInterface>
@@ -97,8 +95,13 @@ message(STATUS "Verbs transport: libmlx5 ${LIBMLX5_VERSION} (mlx5dv direct CQE p
 # for the same reason as libdpdk/libibverbs: the header emits ef_* calls into
 # every consumer. SYSTEM keeps the C headers clear of -Wconversion/-Wpedantic.
 # =============================================================================
-find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h REQUIRED)
-find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul REQUIRED)
+# HINTS: a sibling onload checkout serves machines where Onload is built but
+# not installed (workstation); on installed systems (rtserver) the hints miss
+# and the system paths (/usr/include, /usr/lib) resolve as before.
+find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h
+          HINTS ${CMAKE_SOURCE_DIR}/../onload/src/include REQUIRED)
+find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul
+             HINTS ${CMAKE_SOURCE_DIR}/../onload/build/gnu_x86_64/lib/ciul REQUIRED)
 target_include_directories(abtrda3 SYSTEM PUBLIC ${ETHERFABRIC_INCLUDE_DIR})
 target_link_libraries(abtrda3 PUBLIC ${LIBCIUL_LIBRARY})
 message(STATUS "ef_vi transport: ${LIBCIUL_LIBRARY}")

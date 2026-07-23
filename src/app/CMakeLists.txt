@@ -46,10 +46,3 @@ target_include_directories(abtrda3_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(abtrda3_test PRIVATE
     abtrda3 abtrda3_flags tomlplusplus::tomlplusplus
     SPSCQueue::SPSCQueue hdr_histogram_static)
-
-# TapBridge standalone test — validates TAP fd plumbing without NIC hardware
-add_executable(tap_bridge_test ${CMAKE_SOURCE_DIR}/test/tap_bridge_test.cpp)
-
-target_include_directories(tap_bridge_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-target_link_libraries(tap_bridge_test PRIVATE abtrda3 abtrda3_flags)

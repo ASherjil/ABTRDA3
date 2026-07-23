@@ -157,28 +157,6 @@ echo "[rtt_run] cfg=$CFG"
 if [ "${#ENVPASS[@]}" -gt 0 ]; then
     echo "[rtt_run] env passthrough: ${ENVPASS[*]}"
 fi
-# Host-noise bracketing: pure procfs reads (NO tracing — enabling trace events
-# text_pokes the kernel and broadcasts sync_core IPIs to every core, which is
-# itself the noise). Deltas printed after the run attribute any max outlier.
-noise_snap() {
-    awk '/^ *(LOC|CAL|TLB|RES|IWI):/ {printf "%s %s %s %s\n", $1, $7, $8, $9}' /proc/interrupts
-}
-NOISE_BEFORE="$(noise_snap)"
-# Mid-run steady-state window: the full-run deltas above include BOTH process
-# startups and teardowns (lifecycle IPIs — the CAL count is duration-INVARIANT,
-# so it is suspected lifecycle). A window at t=20..45s of the client contains
-# zero lifecycle activity: any CAL/LOC landing in it is a true mid-measurement
-# visitor (the 3.5-3.9us max suspect). Unpinned background job = housekeeping
-# cores; pure procfs reads; zero perturbation of the isolated cores.
-MIDA="$(mktemp)"
-MIDB="$(mktemp)"
-midsnap_job() {
-    sleep 20
-    noise_snap > "$MIDA"
-    sleep 25
-    noise_snap > "$MIDB"
-}
-
 echo "[rtt_run] ===== SERVER (background) ====="
 sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --server --config "$CFG" &
 
@@ -191,27 +169,15 @@ if ! pgrep -f "abtrda3_test --server" >/dev/null 2>&1; then
 fi
 
 echo "[rtt_run] ===== CLIENT ====="
-midsnap_job &
-MIDPID=$!
 if [ -n "$COUNT" ]; then
     sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG" --count "$COUNT"
 else
     sudo "${ENVPASS[@]}" "${LAUNCH[@]}" "$APP" --client --config "$CFG"
 fi
 rc=$?
-kill "$MIDPID" 2>/dev/null
 
 echo "[rtt_run] client exited (rc=$rc) — stopping server (SIGINT, clean shutdown)…"
 stop_server
 trap - INT TERM
-echo "[rtt_run] host-noise deltas over the run (CPU5/CPU6/CPU7; LOC=tick CAL=IPI):"
-paste <(echo "$NOISE_BEFORE") <(noise_snap) | awk '{printf "[rtt_run]   %-5s cpu5 +%d  cpu6 +%d  cpu7 +%d\n", $1, $6-$2, $7-$3, $8-$4}'
-if [ -s "$MIDA" ] && [ -s "$MIDB" ]; then
-    echo "[rtt_run] mid-run steady-state deltas (client t=20..45s — NO lifecycle in window):"
-    paste "$MIDA" "$MIDB" | awk '{printf "[rtt_run]   %-5s cpu5 +%d  cpu6 +%d  cpu7 +%d\n", $1, $6-$2, $7-$3, $8-$4}'
-else
-    echo "[rtt_run] mid-run steady-state window: n/a (client ran < 45s)"
-fi
-rm -f "$MIDA" "$MIDB"
 echo "[rtt_run] done (client rc=$rc)"
 exit "$rc"

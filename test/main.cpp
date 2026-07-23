@@ -6,8 +6,8 @@
 //   --txgen    TX-only traffic generator
 //   --rxsink   RX-only packet counter
 //
-// Each role selects its own transport in the TOML config so an x86 box
-// (intel_i210) can pair with an ARM64 SoC (cadence_gem).
+// Each role selects its own transport in the TOML config so heterogeneous
+// hosts (e.g. an x86 box and an ARM64 SoC) can pair in one benchmark.
 //
 // Usage:
 //   sudo ./abtrda3_test --server [--config <file>]

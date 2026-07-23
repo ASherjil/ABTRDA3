@@ -12,11 +12,11 @@
 #include <string>
 
 // Per-role settings — server and client can use different transports so we can
-// pair an Intel I210 on one host with a Cadence GEM on another.
+// pair different NICs/hosts in one benchmark.
 struct RoleConfig {
-    std::string                 transport;          // "packet_mmap", "af_xdp", "dpdk", "verbs", "ef_vi", "intel_i210", "cadence_gem"
+    std::string                 transport;          // "packet_mmap", "af_xdp", "dpdk", "verbs", "ef_vi", "intel_i210"
     std::string                 interface;          // e.g. "eno3", "end0"
-    std::string                 driver;             // kernel driver to unbind for PMDs ("igb", "macb", "e1000e")
+    std::string                 driver;             // kernel driver to unbind for PMDs ("igb", "e1000e")
     std::array<std::uint8_t, 6> mac{};
     int                         cpuCore{};
     std::uint32_t               xdpQueueId = 0;

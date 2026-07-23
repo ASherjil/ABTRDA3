@@ -1,6 +1,0 @@
-# Kernel module build artifacts — keep only source, Makefile, and the built .ko
-*
-!gem_uio.c
-!Makefile
-!gem_uio.ko
-!.gitignore

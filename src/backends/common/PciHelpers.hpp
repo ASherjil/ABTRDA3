@@ -7,8 +7,8 @@
 // exists — before the device is unbound from the kernel driver onto vfio-pci,
 // which removes the interface name.
 //
-// (Intel_I210 / Cadence_GEM do NOT use this: they reach the PCIe / AXI bus
-// through the ABTEdge backend, which handles bus access for them.)
+// (Intel_I210 does NOT use this: it reaches the PCIe bus through the ABTEdge
+// backend, which handles bus access for it.)
 //
 #pragma once
 

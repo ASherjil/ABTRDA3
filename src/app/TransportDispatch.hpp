@@ -60,7 +60,6 @@ template<class Fn>
     if (name == VerbsTraits::kName)      return fn(std::type_identity<VerbsTraits>{});
     if (name == EtherFabricTraits::kName) return fn(std::type_identity<EtherFabricTraits>{});
     if (name == I210Traits::kName)       return fn(std::type_identity<I210Traits>{});
-    if (name == GemTraits::kName)        return fn(std::type_identity<GemTraits>{});
     fmt::println(stderr, "Error: unknown transport '{}'", name);
     return 1;
 }

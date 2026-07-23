@@ -25,18 +25,12 @@
 #include "Verbs.hpp"
 #include "EtherFabricVirtualInterface.hpp"
 #include "Intel_I210.hpp"
-#include "Cadence_GEM.hpp"
-#include "TapBridge.hpp"
 #include "PciHelpers.hpp"
 #include "NicTuner.hpp"
 #include "common/HugePageHelpers.hpp"
 
-#include <pthread.h>
-#include <sched.h>
-#include <chrono>
 #include <string>
 #include <string_view>
-#include <thread>
 
 // ── CRTP base: the defaults every traits struct inherits ────────────────────
 template<class Self>
@@ -441,79 +435,5 @@ struct I210Traits : TransportBase<I210Traits> {
     static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
         fmt::println("[{}] Transport: intel_i210 (PMD) on {} (driver={})",
                      roleName, role.interface, driverOf(role));
-    }
-};
-
-// ── cadence_gem (custom PMD) ────────────────────────────────────────────────
-// One-duplex-object shape like I210, plus a TAP bridge: the PMD owns the hardware, so
-// kernel traffic (NFS/SSH/ARP) bridges Q_SLOW (Q0) <-> a TAP while Q_HOT (Q1) carries
-// ours. The bridge must outlive the benchmark -> withAux.
-struct GemTraits : TransportBase<GemTraits> {
-    static constexpr std::string_view kName          = "cadence_gem";
-    static constexpr bool             kSingleCapable = false;
-
-    using RxTx   = Cadence_GEM<GEMDriverMode::RxTx>;
-    using TxOnly = RxTx;
-    using RxOnly = RxTx;
-
-    static std::string_view driverOf(const RoleConfig& role) {
-        return role.driver.empty() ? std::string_view{"macb"} : std::string_view{role.driver};
-    }
-
-    static bool preflight(const TestConfig&, const RoleConfig&) {
-        if (ensureHugepages(16)) return true;
-        fmt::println(stderr, "Error: hugepage allocation failed");
-        return false;
-    }
-
-    static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
-        return RxTx(role.interface, driverOf(role));
-    }
-    static RxTx makeTx(const TestConfig& cfg, const RoleConfig& role) { return makeRxTx(cfg, role); }
-    static RxTx makeRx(const TestConfig& cfg, const RoleConfig& role) { return makeRxTx(cfg, role); }
-
-    template<class Nic>
-    static bool init(Nic& nic, const TestConfig&, const RoleConfig&) {
-        return nic.init();
-    }
-
-    static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
-        fmt::println("[{}] Transport: cadence_gem (PMD) on {} (driver={}, tap=tap_{})",
-                     roleName, role.interface, driverOf(role), role.interface);
-    }
-
-    // Scope-exit order: ~tapThread (stop+join) -> ~tap (close tun fd) -> ~nic (rebind).
-    template<class Nic, class Fn>
-    static void withAux(Nic& nic, const TestConfig&, const RoleConfig& role, Fn&& fn) {
-        auto&             slow    = nic.slowPath();
-        const std::string tapName = "tap_" + role.interface;
-        TapBridge         tap(slow, slow, tapName);
-
-        // The TAP needs the NIC's MAC/addr/route or the kernel drops bridged replies.
-        (void)tap.setupAlias(nic.macAddress(), nic.savedAddr(), nic.savedGateway());
-
-        std::jthread tapThread = spawnTapBridgeThread(tap);
-        fn();
-    }
-
-private:
-    // `tap` must outlive the returned jthread => the caller owns it.
-    template<TxRing Tx, RxRing Rx>
-    [[nodiscard]] static std::jthread spawnTapBridgeThread(TapBridge<Tx, Rx>& tap) {
-        auto t = std::jthread([&tap](std::stop_token st) {
-            sched_param sp{};
-            pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
-
-            cpu_set_t all;
-            CPU_ZERO(&all);
-            for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
-            pthread_setaffinity_np(pthread_self(), sizeof(all), &all);
-
-            tap(st);
-        });
-        // The child inherits our pinned-core affinity — yield until it migrates, or it
-        // fights the hot loop and Q0 fills un-drained.
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        return t;
     }
 };
