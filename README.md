@@ -1,21 +1,22 @@
-# ABTRDA3 — one C++20 API for DPDK, AF_XDP and PACKET_MMAP
+# ABTRDA3 — C++20 API for Solarflare `ef_vi`, DPDK, Verbs, AF_XDP and PACKET_MMAP
 
 **Kernel-bypass networking in C++ without the boilerplate.** Write your packet loop once
-against four lines of API, then pick DPDK, AF_XDP, or `PACKET_MMAP` from a config file —
-no code change, no recompile.
+against four lines of API, then pick `ef_vi`, DPDK, verbs, AF_XDP or `PACKET_MMAP` from a
+config file — no code change, no recompile.
 
-This project was inspired by CERN's Controls Middleware which uses a system called Remote Device Access(RDA). Since I worked in 
-CERN's Accelerator Beams Transfer Group, I named it ABT + RDA3 -> ABTRDA3. 
+This project was inspired by CERN's Controls Middleware which uses a system called Remote Device Access(RDA).
 
-![ConnectX-4 Lx 24h latency: DPDK vs AF_XDP](test/latency_analysis/ConnectX_4_Lx/cx4_dpdk_vs_afxdp_24h.png)
+![Solarflare X2522-Plus 24h latency: ef_vi vs DPDK](test/latency_analysis/X2522_Plus/x2522_efvi_vs_dpdk_24h.png)
 
 *Same NIC, same host, same application code — only the `transport` line in the TOML
 changed. One frame in flight, 64-byte frames, RTT measured with `rdtscp` on an isolated
-core. **DPDK: 3.587 µs median** over 23.3 B packets. **AF_XDP zero-copy: 6.231 µs median**
-over 13.5 B packets. Zero loss in both.*
+core. **ef_vi (CTPIO): 1.866 µs median — 0.93 µs one-way — with a 3.306 µs max** over
+44.3 B packets in 24 h. **DPDK (sfc PMD): 3.506 µs median** over 24.2 B packets. Zero
+loss in both.*
 
-The full campaign — verbs, DPDK, AF_XDP, DPDK-over-AF_XDP across ConnectX-4 Lx (25G),
-XXV710-DA2 (25G) and I225-V (2.5G copper), with tail percentiles out to P99.999 — is in
+The full campaign — verbs, DPDK, AF_XDP, DPDK-over-AF_XDP and ef_vi across the
+Solarflare X2522-Plus (25G), ConnectX-4 Lx (25G), XXV710-DA2 (25G) and I225-V (2.5G
+copper), with tail percentiles out to P99.999 — is in
 **[docs/Benchmarks.md](docs/Benchmarks.md)**. The driver bugs we hit on the way (and how
 we proved them) are in **[docs/Known_driver_issues.md](docs/Known_driver_issues.md)**.
 
@@ -38,9 +39,9 @@ ABTRDA3 does the ritual for you and hands back one interface:
    your packet loop ──│  acquire / commit  +  tryReceive / release  │
                       └────────────────────┬───────────────────────┘
                                            │  C++20 concepts, all inlined
-              ┌────────────────┬───────────┴────────┬────────────────┐
-            DPDK             AF_XDP            PACKET_MMAP         verbs
-      (i40e/igc/mlx5)     (zero-copy)           (no deps)      (RAW_PACKET QP)
+      ┌─────────────────┬──────────────────┼─────────────────┬────────────────┐
+    ef_vi             DPDK              AF_XDP          PACKET_MMAP         verbs
+(CTPIO/X2522)  (i40e/igc/mlx5/sfc)   (zero-copy)         (no deps)    (RAW_PACKET QP)
 ```
 
 - **Zero-cost.** The transport is a template parameter, not a virtual base. Every hot-path
@@ -104,7 +105,13 @@ concept RxRing = requires(T t) {
 ### 1. Construct + init — the only place the transports differ
 
 ```cpp
-// DPDK — any PMD (i40e / igc / mlx5). Binds vfio-pci, inits EAL, sets up mempool + queues.
+// ef_vi — Solarflare/AMD kernel bypass. Allocates the virtual interface, maps the
+// CTPIO aperture, installs the raw-L2 filter. In-order CTPIO writer, cut-through
+// threshold >= frame length: zero fallbacks by construction.
+EtherFabricVirtualInterface<EtherFabricMode::RxTx> vi("enp1s0f0");
+if (!vi.init()) return 1;
+
+// DPDK — any PMD (i40e / igc / mlx5 / sfc). Binds vfio-pci, inits EAL, sets up mempool + queues.
 DPDK<DpdkMode::RxTx> nic("xxv0", /*lcore=*/5, /*driver=*/"i40e");
 if (!nic.init()) return 1;
 
@@ -112,10 +119,6 @@ if (!nic.init()) return 1;
 // steers the queue, applies the NAPI regime, then reads back what the kernel granted.
 AFXDP<AFXDPMode::RxTx> xsk("xxv0", /*queue=*/0);
 if (!xsk.init(/*deferral=*/false, /*irqSuspend=*/false)) return 1;
-
-// PACKET_MMAP — no dependencies, no root-only rebinding, works on any NIC.
-RingConfig cfg{ .interface = "eno1", .direction = RingDirection::RX, .protocol = 0x88B5 };
-PacketMmapRx rx(cfg);
 ```
 
 ### 2. Then the loop is identical, whichever you chose
@@ -246,10 +249,11 @@ of the wire a cost lives on.
 
 | Transport | Backend | Notes |
 |---|---|---|
-| `dpdk` | i40e (XXV710), igc (I225-V), mlx5 (ConnectX-4 Lx) | Lowest latency. vfio-pci pass-through, or bifurcated for mlx5 |
+| `ef_vi` | Solarflare/AMD X2522 (Onload libciul) | The fastest transport measured: CTPIO cut-through TX, **1.866 µs RTT / 0.93 µs one-way** |
+| `dpdk` | i40e (XXV710), igc (I225-V), mlx5 (ConnectX-4 Lx), sfc (X2522) | vfio-pci pass-through, or bifurcated for mlx5 |
 | `af_xdp` | Any driver with native XDP + zero-copy | Kernel stays in the datapath; i40e needs a [one-line busy-poll patch](docs/Known_driver_issues.md) |
 | `packet_mmap` | AF_PACKET / `TPACKET_V2` | No dependencies, no rebinding — the portable baseline |
-| `verbs` | mlx5 RAW_PACKET QP | The sub-2 µs reference point (2.426 µs RTT) |
+| `verbs` | mlx5 RAW_PACKET QP | RDMA userspace path, 2.426 µs RTT on ConnectX-4 Lx |
 | `intel_i210` | Custom poll-mode driver | Bare-metal register PMD built directly on ABTEdge MMIO + DMA — no vendor SDK underneath |
 
 ## Test bench

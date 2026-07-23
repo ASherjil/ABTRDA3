@@ -22,6 +22,9 @@ if xdpsock fails too, the fault is in the driver, not in our code.
   - [2.3 DPDK: RX `WTHRESH = 0` stops write-back, and `imissed` lies](#23-dpdk-rx-wthresh--0-stops-write-back-and-imissed-lies)
   - [2.4 DPDK: the 2.5G PHY is slower than 1G — run the link at 1 GbE](#24-dpdk-the-25g-phy-is-slower-than-1g--run-the-link-at-1-gbe)
 - [3. DPDK EAL — affects every PMD](#3-dpdk-eal--affects-every-pmd)
+- [4. Solarflare X2522 — `sfc` / ef_vi](#4-solarflare-x2522--sfc--ef_vi)
+  - [4.1 CTPIO: the default writer is a fallback lottery — use in_order](#41-ctpio-the-default-writer-is-a-fallback-lottery--use-in_order)
+  - [4.2 The driver's PTP subsystem causes rare µs-scale outliers — compile it out](#42-the-drivers-ptp-subsystem-causes-rare-µs-scale-outliers--compile-it-out)
 
 ---
 
@@ -426,3 +429,82 @@ absorbed by the warmup. Also **bind-once**: `shutdown()` does not restore the ke
 doing it in the destructor **hangs**, because the sysfs unbind blocks until vfio releases the
 device while EAL still holds it (we never call `rte_eal_cleanup`). Recovery if needed:
 `dpdk-devbind --bind=i40e <bdf>`.
+
+---
+
+## 4. Solarflare X2522 — `sfc` / ef_vi
+
+The ef_vi transport uses **CTPIO** (cut-through PIO): the CPU write-combines each frame into a
+NIC MMIO aperture and the NIC starts emitting before the frame is fully written. When a CTPIO
+write goes wrong the NIC poisons the frame and the send silently falls back to the DMA
+descriptor path — the frame still arrives, but ~1 µs later. Both issues below were found
+chasing that tail; both fixes are in the published §6 Benchmarks numbers.
+
+### 4.1 CTPIO: the default writer is a fallback lottery — use in_order
+
+**Symptom.** Same binary, same config, back-to-back runs: the server-side CTPIO fallback rate
+swings **0.02% → 16%** between runs. Each fallback costs ~+1 µs, so the fallback fraction *is*
+the P99+ shelf. (App counters were verified against hardware to the packet:
+`ctpio_wins`/`fallbacks` == ethtool `ctpio_success`/`ctpio_poison` per port.)
+
+**Mechanism.** libciul has three CTPIO copy routines, selected by `EF_VI_CTPIO_MODE`:
+
+- **paced** (default) — inserts timing gaps between 64 B write-combining-buffer flushes so the
+  NIC's cut-through engine is never starved. But the gap length is calibrated for a
+  **hard-coded 10G link** (`ctpio.c`: *"TODO: Supporting 10Gbit link only"*) from a
+  **per-process TSC calibration** — wrong pacing on a 25G link, and a different draw every
+  process start. That is the run-to-run lottery.
+- **fast** — no WC discipline at all. Any adjacent store or coherence activity can evict two
+  half-filled WC buffers out of order; the NIC sees a torn (non-contiguous) frame and poisons
+  it. Median is the best of the three on a lucky run, with an unbounded fallback tail on an
+  unlucky one.
+- **in_order** — an `sfence` per 64 B block. WC eviction order becomes **architectural** rather
+  than probabilistic.
+
+**Fix.** `EF_VI_CTPIO_MODE=in_order`, plus a CTPIO cut-through threshold ≥ frame length (the
+NIC then buffers the whole frame before emitting — no underrun poison either). Cost vs a lucky
+fast run: ~15 ns of median. At 64 B a frame crosses a single WC-buffer boundary, so the
+vendor's throughput caveat about in_order (written for 1500 B frames) does not apply.
+`diagnostic_scripts/rtt_run.sh` exports it by default for ef_vi configs.
+
+**Evidence.** The §6.1 24 h soak: **44.3 billion sends, `ctpio_poison = 0` on both ports.**
+No run at any other mode setting ever achieved zero.
+
+### 4.2 The driver's PTP subsystem causes rare µs-scale outliers — compile it out
+
+**Symptom.** A 24 h ef_vi soak on the stock sfc driver leaves a discrete class of **eight
+isolated outliers between 3.2 and 7.7 µs** over 44.2 B samples, on a host proven clean.
+The identical soak on the same driver minus PTP: **max 3.306 µs, class gone.**
+
+**Mechanism.** The sfc driver runs its PTP machinery even with **no PTP consumer** —
+`/dev/ptp*` never opened, no PHC user: a dedicated PTP channel occupies its own MSI-X vector
+(9 vectors/port instead of 8) and the management controller delivers 4 Hz time-sync events per
+port plus periodic driver work. The discriminator that convicted the kernel driver: the same
+outlier band is **absent under DPDK on the same ports** (vfio — no kernel driver attached).
+
+A second, independent lever in the same driver: the **hardware monitor** (`efx_monitor`) polls
+sensors every 200 ms by default and put outliers on a strict 3 s grid. It is runtime-writable —
+parked via `/etc/modprobe.d`: `options sfc monitor_interval_ms=3600000` (module params reset on
+reload, so the modprobe.d pin is mandatory, and never write 0 — that busy-loops).
+
+**Fix — what exactly was removed.** No source patch: Onload's out-of-tree sfc supports building
+without PTP. `ptp.h` carries static-inline stubs for the whole PTP API; the Makefile hardcodes
+`export CONFIG_SFC_PTP := y`, but a command-line override wins and `config.h` regenerates:
+
+```bash
+cd ~/onload/build/x86_64_linux-$(uname -r)       # the mmake build-tree top
+PATH=~/onload/scripts:$PATH make CONFIG_SFC_PTP= -j8
+sudo cp ...drivers/net/ethernet/sfc/sfc.ko /lib/modules/$(uname -r)/extra/sfc.ko
+sudo depmod -a && sudo onload_tool reload
+```
+
+That compiles `ptp.c` out entirely — the PTP channel, its MSI-X vector, the 4 Hz MC time-sync
+subscription and the periodic work all cease to exist. **Verify which build is loaded:**
+`cat /sys/module/sfc/srcversion` (this bench: stock `9B0DECB84BC3A9B0940A929`, PTP-less
+`E1C5DF64F9375059E04EE84`); 8 MSI-X vectors/port instead of 9; zero `ptp` rows in
+`/proc/interrupts`.
+
+**Result** (24 h A/B, Benchmarks §6.1/§6.2): max **7.679 → 3.306 µs**, median −23 ns, and a
+~75–105 ns wider P99–P99.999 (the PTP-less build runs a broad second mode near 2.1–2.2 µs).
+Trade a 100 ns shelf for a 4.4 µs cut in worst case — for a bounded-latency claim, the
+PTP-less driver wins.

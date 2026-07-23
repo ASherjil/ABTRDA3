@@ -1,17 +1,18 @@
-# Ultra-Low-Latency NIC Benchmarks — DPDK vs AF_XDP vs Verbs
+# Ultra-Low-Latency NIC Benchmarks — DPDK vs AF_XDP vs Verbs vs ef_vi
 
-Closed-loop round-trip latency on identical silicon across three NICs:
-**ConnectX-4 Lx** (mlx5), **Intel XXV710-DA2** (i40e), and **Intel I225-V** (igc).
+Closed-loop round-trip latency on identical silicon across four NICs:
+**Solarflare X2522-Plus** (sfc/ef_vi), **ConnectX-4 Lx** (mlx5),
+**Intel XXV710-DA2** (i40e), and **Intel I225-V** (igc).
 The goal is the comparison asked for constantly online and answered only with
-theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
+theory: *DPDK vs AF_XDP (vs verbs, vs ef_vi) on the same NIC, with real tail
+percentiles.*
 
-> **Status:** ConnectX-4 Lx (§3), Intel XXV710-DA2 (§4) and Intel I225-V (§5) are
-> **complete** — all seven 24 h soaks populated (verbs, DPDK, AF_XDP and
-> DPDK-over-AF_XDP on each 25 G NIC; DPDK on the I225-V). The I225-V is run at
+> **Status:** all four NICs are **complete** — eleven 24 h soaks populated. The
+> Solarflare X2522-Plus (§6) is the campaign headline: **ef_vi at 1.866 µs median
+> RTT with a 3.306 µs max over 44.3 B samples**. The I225-V is run at
 > **1 GbE**, which beats the NIC's native 2.5 GbE for latency (the 2.5GBASE-T PHY
-> paradox, §5.2); AF_XDP on igc is **disqualified by a driver defect** (§5.3). The
-> Solarflare X2522 ef_vi comparison is still pending. Sections 1–2
-> (system/config/methodology) are final.
+> paradox, §5.2); AF_XDP on igc is **disqualified by a driver defect** (§5.3).
+> Sections 1–2 (system/config/methodology) are final.
 
 **Contents**
 
@@ -30,12 +31,19 @@ theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
   - [5.1 DPDK — igc PMD, link at 1 GbE](#51-dpdk--igc-pmd-vfio-pci-link-at-1-gbe)
   - [5.2 The 2.5G paradox](#52-the-25g-paradox--why-this-nic-is-benchmarked-at-1-gbe)
   - [5.3 AF_XDP — disqualified](#53-af_xdp--disqualified-the-driver-cannot-ping-pong)
+- [6. Solarflare X2522-Plus (sfc / ef_vi)](#6-solarflare-x2522-plus-sfc--ef_vi)
+  - [6.1 ef_vi — CTPIO, PTP-less driver](#61-ef_vi--ctpio-ptp-less-driver-the-published-config)
+  - [6.2 ef_vi — stock driver](#62-ef_vi--stock-driver-the-ptp-outlier-class)
+  - [6.3 DPDK — sfc PMD](#63-dpdk--sfc-pmd-vfio-pci)
 - [Hardware photos](#hardware-photos)
 
 ### Results at a glance — 24 h RTT (µs), one frame in flight
 
 | NIC | Transport | Median | P99.999 | Max | Samples |
 |---|---|--:|---:|---:|---:|
+| **Solarflare X2522-Plus** (sfc) | ef_vi CTPIO, PTP-less driver | **1.866** | 2.316 | 3.306 | 44.3 B |
+| **Solarflare X2522-Plus** (sfc) | ef_vi CTPIO, stock driver | **1.889** | 2.211 | 7.679 | 44.2 B |
+| **Solarflare X2522-Plus** (sfc) | DPDK (sfc PMD) | **3.506** | 4.061 | 5.628 | 24.2 B |
 | **ConnectX-4 Lx** (mlx5) | Verbs (RAW_PACKET QP) | **2.426** | 3.272 | 6.080 | 34.0 B |
 | **ConnectX-4 Lx** (mlx5) | DPDK (mlx5 PMD) | **3.587** | 4.322 | 8.691 | 23.3 B |
 | **ConnectX-4 Lx** (mlx5) | AF_XDP | **6.231** | 8.001 | 12.943 | 13.5 B |
@@ -65,6 +73,7 @@ theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
 
 | NIC | Driver | Ports | Link | Notes |
 |---|---|---|---|---|
+| Solarflare X2522-25G-PLUS | `sfc` (Onload OOT) | enp1s0f0, enp1s0f1 | 2 × 25 GbE | ef_vi kernel bypass (CTPIO); AppFlex Plus license; DPDK via `vfio-pci` |
 | Mellanox ConnectX-4 Lx | `mlx5_core` / `mlx5_ib` | cx0, cx1 | 2 × 25 GbE | RDMA-capable (verbs) |
 | Intel XXV710-DA2 | `i40e` | xxv0, xxv1 | 2 × 25 GbE | DPDK via `vfio-pci` |
 | Intel I225-V | `igc` | enp5s0, enp6s0 | 2 × 2.5GBASE-T (RJ45 copper) | Two single-port controllers, PCIe Gen2 ×1 each; DPDK via `vfio-pci`; benchmarked at **1 GbE** (§5.2) |
@@ -72,7 +81,8 @@ theory: *DPDK vs AF_XDP (vs verbs) on the same NIC, with real tail percentiles.*
 > **PCIe topology (Z590-E):** the two 25G add-in NICs run on the CPU PEG bifurcated
 > **×8/×8** — ConnectX-4 Lx (×8) and XXV710-DA2 (×8), each at full bandwidth. The
 > NVMe SSD sits on a **chipset (PCH) M.2** slot, off the CPU PEG, so it does not
-> share the NICs' root complex (no cross-device PCIe contention).
+> share the NICs' root complex (no cross-device PCIe contention). For the §6 X2522
+> runs the XXV710 was removed and the X2522 took its ×8 PEG slot.
 
 ### Hardware
 
@@ -450,6 +460,88 @@ kernel's own `xdpsock -l` freezes at rx=1/tx=1 on igc, while the identical proce
 bounces >1 M hops on i40e and mlx5. Not slow: *unmeasurable*. This also rules out the
 DPDK-over-AF_XDP PMD here (it rides the same `igc.ko` zero-copy path). Full mechanism and
 the 3-NIC xdpsock proof: `Known_driver_issues.md` §2.1.
+
+---
+
+## 6. Solarflare X2522-Plus (sfc / ef_vi)
+
+The kernel-bypass specialist: ef_vi is the userspace API HFT firms run on this
+silicon, and **CTPIO** (cut-through PIO) writes each frame through a write-combined
+MMIO aperture straight into the NIC TX FIFO — no descriptor, no DMA read. The
+published configuration uses the **in-order CTPIO writer** (`EF_VI_CTPIO_MODE=in_order`;
+the default writer is a per-run fallback lottery on 25G, `Known_driver_issues.md` §4.1)
+with the cut-through threshold ≥ frame length, and a **PTP-less build of the sfc
+driver** (§6.2 / `Known_driver_issues.md` §4.2). ef_vi is bifurcated like verbs
+(the kernel driver keeps the port); DPDK takes the same ports over `vfio-pci`.
+
+### 6.1 ef_vi — CTPIO, PTP-less driver (the published config)
+
+| Metric | RTT (µs) |
+|---|---|
+| Min | 1.728 |
+| Median | 1.866 |
+| P99 | 2.173 |
+| P99.9 | 2.202 |
+| P99.99 | 2.273 |
+| P99.999 | 2.316 |
+| Max | 3.306 |
+| Mean | 1.923 |
+| Samples | 44,302,974,059 |
+
+![X2522 ef_vi no-PTP histogram](../test/latency_analysis/X2522_Plus/x2522_plus_rtt_ef_vi_no_ptp_hist.png)
+
+**Sub-microsecond one-way (0.933 µs median) with a 1.58 µs Min→Max span over 44.3
+billion round trips in 24 h** — the fastest and the most bounded distribution in the
+campaign. Zero CTPIO fallbacks (`ctpio_poison` = 0 on both ports): the in-order
+writer makes the fallback rate architectural rather than probabilistic. The max
+beats even DPDK's on the same NIC (3.306 vs 5.628 µs) at half the median.
+
+### 6.2 ef_vi — stock driver (the PTP outlier class)
+
+Identical binary, identical config — only the driver build differs.
+
+| Metric | RTT (µs) |
+|---|---|
+| Min | 1.727 |
+| Median | 1.889 |
+| P99 | 2.098 |
+| P99.9 | 2.128 |
+| P99.99 | 2.156 |
+| P99.999 | 2.211 |
+| Max | 7.679 |
+| Mean | 1.927 |
+| Samples | 44,207,100,128 |
+
+![X2522 ef_vi stock histogram](../test/latency_analysis/X2522_Plus/x2522_plus_rtt_ef_vi_hist.png)
+
+The body ends by ~3 µs; beyond it sit **eight isolated outliers between 3.2 and
+7.7 µs** — the sfc driver's PTP subsystem, which runs even with no PTP consumer.
+Compiling PTP out of the driver removes the class entirely (§6.1: max 7.679 → 3.306)
+at the cost of a ~75–105 ns wider P99–P99.999. Choose by workload: the stock driver
+has the tighter shelf, the PTP-less driver the bounded worst case. Mechanism and
+build recipe: `Known_driver_issues.md` §4.2.
+
+### 6.3 DPDK — sfc PMD (vfio-pci)
+
+| Metric | RTT (µs) |
+|---|---|
+| Min | 3.342 |
+| Median | 3.506 |
+| P99 | 3.878 |
+| P99.9 | 3.949 |
+| P99.99 | 4.006 |
+| P99.999 | 4.061 |
+| Max | 5.628 |
+| Mean | 3.542 |
+| Samples | 24,159,194,165 |
+
+![X2522 DPDK histogram](../test/latency_analysis/X2522_Plus/x2522_plus_rtt_dpdk_hist.png)
+
+The sfc PMD has no CTPIO — TX goes out through the descriptor/DMA path — and that
+one datapath difference is essentially the entire 1.64 µs median gap to §6.1. Run
+with `perf_profile=low-latency` devargs (RX/event cut-through, no RX batching) and
+the MC stats push disabled; with the kernel driver detached (vfio) the PTP outlier
+class of §6.2 is absent here, which is what first isolated it to the driver.
 
 ---
 
