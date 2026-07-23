@@ -13,6 +13,9 @@ scripts/
 # Reference copy of the kernel xdpsock sample (kept on disk, not versioned)
 xdpsock.c
 
+# Third-party paper (reference reading only — not ours to redistribute)
+AF_XDP.pdf
+
 # Latency analysis — track plots and scripts, not raw data
 test/latency_analysis/*.txt
 

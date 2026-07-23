@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 #ifndef ABTRDA3_VERBS_HPP
 #define ABTRDA3_VERBS_HPP
 

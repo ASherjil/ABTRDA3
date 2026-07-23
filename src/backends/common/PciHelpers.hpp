@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 //
 // PciHelpers — generic PCI / sysfs lookups shared across transports.
 //

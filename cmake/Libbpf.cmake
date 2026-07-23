@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 # =============================================================================
 # Libbpf.cmake — Fetch and build libbpf v1.5.0 as a static library
 # =============================================================================

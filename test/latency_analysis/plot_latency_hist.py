@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
 # plot_latency_hist.py — one latency histogram (frequency vs latency) from a
 # HdrHistogram per-bucket CSV (value_us,count). Small stats box top-right.
 # x-tick spacing AUTO-scales to the data range (~12 labels) unless --xmajor is given.

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
 # rtt_run.sh — one-command RTT (Server + Client) on a single host.
 #
 # Starts --server in the background, waits a few seconds for it to come up, runs

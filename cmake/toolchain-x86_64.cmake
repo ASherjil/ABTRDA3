@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 # =============================================================================
 # x86_64 Toolchain — CERN CDK Debian 12, with fallback to local compiler
 # =============================================================================

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
 # plot_latency_compare.py — N HdrHistogram per-bucket CSVs (value_us,count) as ONE
 # figure of side-by-side panels sharing a common x-axis, so distributions are compared
 # by eye without flipping between images. Same binning/stats as plot_latency_hist.py.

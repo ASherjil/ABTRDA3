@@ -1,0 +1,8 @@
+ABTRDA3
+Copyright 2026 Areeb Sherjil
+
+The BPF programs src/backends/AF_XDP/af_xdp_kern.c and
+src/backends/bpf/xdp_filter.bpf.c, and the kernel patch
+patches/i40e-afxdp-busypoll.patch, are licensed GPL-2.0 (see the
+License section of README.md) and are not part of the Apache-2.0
+covered work.

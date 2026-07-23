@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 //
 // Intel I210 Ethernet Controller Register Map
 // Reference: Intel I210 Datasheet, Document 333016, Revision 3.7

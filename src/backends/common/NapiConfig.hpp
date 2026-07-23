@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 //
 // NapiConfig — shared AF_XDP / NAPI control-plane helpers, used by BOTH the
 // native AFXDP transport and the DPDK net_af_xdp path so the two stacks

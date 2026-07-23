@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
 # efvi_eflatency_bench.sh — vendor ground-truth RTT benchmark for the X2522 (ef_vi).
 #
 # Runs Onload's eflatency (CTPIO, all ULL tricks) across the two X2522 ports.

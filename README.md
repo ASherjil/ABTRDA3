@@ -236,7 +236,7 @@ of the wire a cost lives on.
 | `af_xdp` | Any driver with native XDP + zero-copy | Kernel stays in the datapath; i40e needs a [one-line busy-poll patch](docs/Known_driver_issues.md) |
 | `packet_mmap` | AF_PACKET / `TPACKET_V2` | No dependencies, no rebinding — the portable baseline |
 | `verbs` | mlx5 RAW_PACKET QP | The sub-2 µs reference point (2.426 µs RTT) |
-| `intel_i210`, `cadence_gem` | Custom poll-mode drivers | Bare-metal register PMDs; the GEM one bridges kernel traffic over TAP so SSH/NFS survive the unbind |
+| `intel_i210` | Custom poll-mode driver | Bare-metal register PMD built directly on ABTEdge MMIO + DMA — no vendor SDK underneath |
 
 ## Test bench
 
@@ -245,3 +245,28 @@ All published numbers come from one machine: Intel i9-11900K (SMT off, C-states 
 poll cores and every device IRQ steered off them. The two ports of each NIC are cabled
 back to back, so a frame's whole journey is silicon and wire — no switch in the path.
 Methodology, kernel command line and BIOS settings: [docs/Benchmarks.md](docs/Benchmarks.md) §2.
+
+## License
+
+ABTRDA3 is licensed under the [Apache License 2.0](LICENSE) (SPDX: `Apache-2.0`).
+Every first-party source file carries an SPDX identifier.
+
+**GPL-2.0 exceptions.** Three files interact with the Linux kernel and are licensed
+GPL-2.0, marked by their own SPDX headers:
+
+| File | Why GPL |
+|---|---|
+| `src/backends/AF_XDP/af_xdp_kern.c` | XDP/BPF program, loaded into the kernel at runtime |
+| `src/backends/bpf/xdp_filter.bpf.c` | XDP/BPF EtherType filter, same runtime-load model |
+| `patches/i40e-afxdp-busypoll.patch` | Patch against the GPL-2.0 in-kernel `i40e` driver |
+
+The BPF programs are compiled to standalone `.o` objects and loaded into the kernel at
+runtime — they are never linked into the Apache-2.0 binary. This is the same
+userspace/BPF license split used by Cilium and the other major XDP projects. The `i40e`
+patch modifies the kernel itself, so it can only ever be GPL-2.0.
+
+**Dependencies** are fetched at configure time or system-installed, never vendored:
+[ABTEdge](https://github.com/ASherjil/ABTEdge) (Apache-2.0), {fmt} (MIT),
+toml++ (MIT), rigtorp/SPSCQueue (MIT), HdrHistogram_c (BSD-2-Clause + CC0),
+libbpf and libxdp (LGPL-2.1 OR BSD-2-Clause), DPDK (BSD-3-Clause), rdma-core /
+libibverbs (GPL-2.0 OR Linux-OpenIB), and Onload's userspace `libciul` (BSD-2-Clause).

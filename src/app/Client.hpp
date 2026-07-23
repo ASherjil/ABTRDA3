@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Areeb Sherjil
+
 #pragma once
 
 // run_client — cross-host RTT ping-pong ORIGINATOR, DURATION-bounded.

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Areeb Sherjil
 # restore_intel_ports.sh — rebind NIC ports from vfio-pci back to their kernel
 # driver after a DPDK run, and bring every benchmark port up in one go.
 #
