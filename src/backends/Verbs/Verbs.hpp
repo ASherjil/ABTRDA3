@@ -435,6 +435,9 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
 
 template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 inline bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::send(std::span<const std::uint8_t> frame) noexcept requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx) {
+  if (frame.size() > m_maxInline || frame.size() > MaxFrame) [[unlikely]] {
+    return false;
+  }
   auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
   std::memcpy(dst, frame.data(), frame.size());
   commit();

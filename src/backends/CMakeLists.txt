@@ -41,10 +41,10 @@ target_link_libraries(abtrda3
 # =============================================================================
 
 # 1. Fetch + build libbpf (provides libbpf::libbpf IMPORTED target)
-include(${CMAKE_SOURCE_DIR}/cmake/Libbpf.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/Libbpf.cmake)
 
 # 2. Compile XDP filter program and embed as C header
-include(${CMAKE_SOURCE_DIR}/cmake/BpfCompile.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/BpfCompile.cmake)
 bpf_compile(
     TARGET     abtrda3
     SOURCE     "${CMAKE_CURRENT_SOURCE_DIR}/bpf/xdp_filter.bpf.c"
@@ -113,9 +113,9 @@ if(ABTRDA3_WITH_EFVI)
     # but not installed (workstation); on installed systems (rtserver) the
     # hints miss and the system paths (/usr/include, /usr/lib) resolve as before.
     find_path(ETHERFABRIC_INCLUDE_DIR etherfabric/ef_vi.h
-              HINTS ${CMAKE_SOURCE_DIR}/../onload/src/include REQUIRED)
+              HINTS ${PROJECT_SOURCE_DIR}/../onload/src/include REQUIRED)
     find_library(LIBCIUL_LIBRARY NAMES ciul1 ciul
-                 HINTS ${CMAKE_SOURCE_DIR}/../onload/build/gnu_x86_64/lib/ciul REQUIRED)
+                 HINTS ${PROJECT_SOURCE_DIR}/../onload/build/gnu_x86_64/lib/ciul REQUIRED)
     target_include_directories(abtrda3 PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/EtherFabricVirtualInterface>)
     target_include_directories(abtrda3 SYSTEM PUBLIC ${ETHERFABRIC_INCLUDE_DIR})
