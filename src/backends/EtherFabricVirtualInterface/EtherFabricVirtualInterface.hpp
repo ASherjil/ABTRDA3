@@ -580,7 +580,10 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
 inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (kEfViRxPayloadPoll) {
-    std::memset(rxSlot(m_heldId) + m_rxPrefix + 12, 0, 2);
+    std::uint8_t* slot = rxSlot(m_heldId);
+    std::memset(slot + m_rxPrefix + 12, 0, 2);
+    asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot)));
+    asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot + 64)));
   }
   ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
   ++m_rxPendingPush;
