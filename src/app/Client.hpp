@@ -57,10 +57,17 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
 
     // Shared SPSC surface + histogram thread on its OWN isolated core. The hot
     // loop is the sole producer; HistThread is the sole consumer (txDone unused).
-    constexpr bool kHwTs = requires (Tx& t) { t.hwRoundTrip(); };
-    const double   tscHz = tsc::calibrateHz();
-    Shared         sh(cfg);
+    constexpr bool kHwTs = requires (Tx& t, Rx& r) {
+        r.hwRxTimestamp();
+        t.pollTxTimestamp();
+    };
+    const double tscHz = tsc::calibrateHz();
+    Shared       sh(cfg);
     sh.tscHz = kHwTs ? 4.0e9 : tscHz;
+    if constexpr (kHwTs) {
+        sh.decode    = &Tx::hwRoundTrip;
+        sh.decodeArg = rx.hwRxTimestampCorrection();
+    }
 
     HistThread   hist(sh, cfg.outputPath, cfg.clientDurationSec,
                     kHwTs ? "Round-Trip (NIC hardware timestamps)" : "Round-Trip",
@@ -100,7 +107,8 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     }
     [[maybe_unused]] const std::uint64_t outlierThreshCyc = static_cast<std::uint64_t>(sh.tscHz * outlierUs *
                                                                                        1e-6);
-    [[maybe_unused]] int           outlierLogged    = 0;
+    [[maybe_unused]] int                 outlierLogged    = 0;
+    [[maybe_unused]] std::uint64_t       hwTxMissing      = 0;
 
     for (;;) {
         const std::uint64_t loopTsc = tsc::now();
@@ -144,7 +152,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         bool          received = false;
         std::uint32_t spins    = 0;
         while (true) {
-            if (const RxFrame rxf = rx.tryReceive(); !rxf.data.empty()) [[unlikely]] {
+            if (const std::span<const std::uint8_t> rxf = rx.tryReceive(); !rxf.empty()) [[unlikely]] {
                 [[maybe_unused]] std::uint64_t t2 = 0;
                 if constexpr (!kHwTs) {
                     t2 = tsc::now();   // take the timestamp at the earliest point
@@ -153,18 +161,33 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
                 if constexpr (prof::kDebugProfiling) {
                     rxStart = prof::cycles();
                 }
-                if (rxf.data.size() >= kFrameMinBytes &&
-                    std::memcmp(rxf.data.data(), cfg.client.mac.data(), 6) == 0) [[likely]] {
-                    const std::uint32_t rxSeq = loadU<std::uint32_t>(rxf.data.data() + kOffSeq);
+                if (rxf.size() >= kFrameMinBytes && std::memcmp(rxf.data(), cfg.client.mac.data(), 6) == 0)
+                    [[likely]] {
+                    const std::uint32_t rxSeq = loadU<std::uint32_t>(rxf.data() + kOffSeq);
                     if (rxSeq == seqNet) [[likely]] {   // our echo
                         rx.release();
-                        if (warmup < kWarmupDiscard) {
+                        if constexpr (kHwTs) {
+                            const std::uint32_t sendIdx = static_cast<std::uint32_t>(sent - 1);
+                            auto                txTs    = tx.pollTxTimestamp();
+                            while (txTs && txTs->seq != sendIdx) {
+                                txTs = tx.pollTxTimestamp();
+                            }
+                            if (warmup < kWarmupDiscard) {
+                                ++warmup;   // cold-start: measured but not recorded
+                            } else if (txTs) [[likely]] {
+                                const std::uint64_t sample =
+                                    (static_cast<std::uint64_t>(rx.hwRxTimestamp()) << 32) | txTs->minor;
+                                if (!sh.toHist.try_push(sample)) [[unlikely]] {
+                                    sh.pushFailures.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                ++recorded;
+                            } else {
+                                ++hwTxMissing;
+                            }
+                        } else if (warmup < kWarmupDiscard) {
                             ++warmup;   // cold-start: measured but not recorded
                         } else {
-                            std::uint64_t sample = t2 - t1;
-                            if constexpr (kHwTs) {
-                                sample = tx.hwRoundTrip();
-                            }
+                            const std::uint64_t sample = t2 - t1;
                             if (!sh.toHist.try_push(sample)) [[unlikely]] {
                                 sh.pushFailures.fetch_add(1, std::memory_order_relaxed);
                             }
@@ -212,4 +235,7 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
 
     fmt::print(stderr, "[Client] sent={} recorded={} timeouts={} warmup_discarded={} push_fail={}\n", sent,
                recorded, timeouts, warmup, sh.pushFailures.load(std::memory_order_relaxed));
+    if constexpr (kHwTs) {
+        fmt::print(stderr, "[Client] hw_ts tx_missing={}\n", hwTxMissing);
+    }
 }

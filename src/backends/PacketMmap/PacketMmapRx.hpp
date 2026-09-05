@@ -9,10 +9,10 @@
 #define ABTRDA3_PACKETMMAPRX_H
 
 #include <atomic>
+#include <span>
 
 #include <linux/if_packet.h>
 
-#include "RxFrame.hpp"
 #include "SocketOps.hpp"
 
 class PacketMmapRx {
@@ -27,12 +27,12 @@ public:
     ~PacketMmapRx() = default;
 
     // HOT PATH - non-blocking, returns empty span if no frame ready.
-    // The returned RxFrame::data points into the ring. Valid until release().
+    // The returned span points into the ring. Valid until release().
     // A block may contain multiple packets. tryReceive() returns them one at a
     // time; release() advances to the next packet, releasing the block back to
     // the kernel only after the last packet is consumed.
     [[nodiscard, gnu::always_inline]]
-    RxFrame tryReceive() noexcept {
+    std::span<const std::uint8_t> tryReceive() noexcept {
         // If we're already inside a block, return the current packet
         tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(m_nextFrame);
 
@@ -44,12 +44,7 @@ public:
         }
 
         // Data is ready! Return pointer to payload
-        return {
-            .data   = {reinterpret_cast<const std::uint8_t*>(hdr) + hdr->tp_mac, hdr->tp_snaplen},
-            .sec    = hdr->tp_sec,
-            .nsec   = hdr->tp_nsec,
-            .status = loadedStatus   // we reuse the previosuly loaded value
-        };
+        return {reinterpret_cast<const std::uint8_t*>(hdr) + hdr->tp_mac, hdr->tp_snaplen};
     }
 
     // HOT PATH - advance to next packet in block, or release block if last.

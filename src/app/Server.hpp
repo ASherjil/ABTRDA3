@@ -23,7 +23,7 @@ inline constexpr bool kapplyCTPIOFence = true;
 
 template <TxRing Tx, RxRing Rx>
 inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_token& stop) {
-    std::uint64_t                           packet_count = 0;
+    std::uint64_t                     packet_count = 0;
     [[maybe_unused]] prof::CycleStats reflectStats;   // debug-only; gated, elided in release
 
     std::vector<std::uint8_t> tmpl(cfg.frameSize, 0);
@@ -33,13 +33,18 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
     tmpl[13] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
     tx.prefillRing(tmpl);
 
-    constexpr bool                    kHwTs = requires (Tx& t) { t.hwTurnaround(); };
+    constexpr bool kHwTs = requires (Tx& t, Rx& r) {
+        r.hwRxTimestamp();
+        t.pollTxTimestamp();
+    };
     std::optional<Shared>       sh;
     std::optional<HistThread>   hist;
     std::optional<std::jthread> tHist;
     if constexpr (kHwTs) {
         sh.emplace(cfg);
-        sh->tscHz = 4.0e9;
+        sh->tscHz     = 4.0e9;
+        sh->decode    = &Tx::hwTurnaround;
+        sh->decodeArg = rx.hwRxTimestampCorrection();
         hist.emplace(*sh, cfg.serverHwTimestampOutputPath, cfg.clientDurationSec,
                      "Tick-to-Trade (NIC hardware timestamps: RX stamp -> TX stamp)",
                      /*reportOneWayHalf=*/false);
@@ -51,15 +56,32 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
                    cfg.serverHwTimestampRecorderCore);
     }
 
-    [[maybe_unused]] std::uint64_t hwWarmup = 0;
+    [[maybe_unused]] std::uint64_t hwWarmup      = 0;
+    [[maybe_unused]] std::uint32_t rxInFlight    = 0;
+    [[maybe_unused]] std::uint32_t txSeqInFlight = 0;
 
     // Outer loop checks stop token; inner loop spins tight without atomic reads
     bool stopping = false;
     while (!stopping) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
-            const RxFrame rxf = rx.tryReceive();
-            if (rxf.data.empty()) {
+            const std::span<const std::uint8_t> rxf = rx.tryReceive();
+            if (rxf.empty()) {
+                if constexpr (kHwTs) {
+                    if (const auto txTs = tx.pollTxTimestamp(); txTs && txTs->seq == txSeqInFlight)
+                        [[unlikely]] {
+                        if (hwWarmup < kWarmupDiscard) {
+                            ++hwWarmup;
+                        } else if (!sh->toHist.try_push((static_cast<std::uint64_t>(rxInFlight) << 32) |
+                                                        txTs->minor)) [[unlikely]] {
+                            sh->pushFailures.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
                 continue;
+            }
+            if constexpr (kHwTs) {
+                rxInFlight    = rx.hwRxTimestamp();
+                txSeqInFlight = static_cast<std::uint32_t>(packet_count);
             }
 
             // CPU-cost bracket: packet in hand -> reply posted (excludes the poll wait).
@@ -82,7 +104,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
                 break;
             }
 
-            std::memcpy(dst + 14, &rxf.data[14], 12);
+            std::memcpy(dst + 14, rxf.data() + 14, 12);
 
             if constexpr (kapplyCTPIOFence) {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -90,14 +112,6 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
 
             rx.release();
             tx.commit();
-
-            if constexpr (kHwTs) {
-                if (hwWarmup < kWarmupDiscard) {
-                    ++hwWarmup;
-                } else if (!sh->toHist.try_push(tx.hwTurnaround())) [[unlikely]] {
-                    sh->pushFailures.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
 
             if constexpr (prof::kDebugProfiling) {
                 reflectStats.record(prof::cycles() - reflectStart);

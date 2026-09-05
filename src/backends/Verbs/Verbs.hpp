@@ -21,8 +21,6 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
-#include "../common/RxFrame.hpp"
-
 // =============================================================================
 // Verbs — raw-verbs (libibverbs RAW_PACKET QP) ultra-low-latency transport.
 //
@@ -169,7 +167,7 @@ public:
         requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
     [[nodiscard, gnu::always_inline, gnu::hot]]
-    inline RxFrame tryReceive() noexcept
+    inline std::span<const std::uint8_t> tryReceive() noexcept
         requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
 
     [[gnu::always_inline, gnu::hot]]
@@ -448,7 +446,8 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
     requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx)
 {
     ibv_sge     sge{.addr = reinterpret_cast<std::uintptr_t>(m_buf), .length = m_txLen, .lkey = m_mr->lkey};
-    ibv_send_wr wr;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot path: every field set below
+    ibv_send_wr wr;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot
+                      // path: every field set below
     wr.sg_list    = &sge;
     wr.num_sge    = 1;
     wr.opcode     = IBV_WR_SEND;
@@ -463,7 +462,8 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
     }
 
     if (m_unreaped >= 2) [[unlikely]] {
-        ibv_wc wc;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot path: out-param of ibv_poll_cq
+        ibv_wc wc;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot
+                     // path: out-param of ibv_poll_cq
         if (ibv_poll_cq(m_sendCq, 1, &wc) > 0) {
             --m_unreaped;
         }
@@ -492,7 +492,8 @@ inline bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
 
 template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
           std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline RxFrame Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::tryReceive() noexcept
+inline std::span<const std::uint8_t>
+Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::tryReceive() noexcept
     requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx)
 {
     std::uint8_t*      entry  = m_cqBuf + static_cast<std::size_t>(m_cqCi & (m_cqeCnt - 1)) * m_cqeSz;
@@ -513,7 +514,7 @@ inline RxFrame Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFr
         return {};
     }
     m_lastSlot = slot;
-    return {.data = {rxSlot(m_lastSlot), be32toh(cqe->byte_cnt)}, .sec = 0, .nsec = 0, .status = 1};
+    return {rxSlot(m_lastSlot), be32toh(cqe->byte_cnt)};
 }
 
 template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,

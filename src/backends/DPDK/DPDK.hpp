@@ -22,7 +22,6 @@
 #include "DPDKEal.hpp"
 #include "NapiConfig.hpp"
 #include "PciHelpers.hpp"
-#include "RxFrame.hpp"
 
 // =============================================================================
 // DPDK — one PMD-AGNOSTIC transport for every NIC, through rte_ethdev. Satisfies
@@ -107,7 +106,7 @@ public:
         requires (M == DpdkMode::TxOnly || M == DpdkMode::RxTx);
 
     [[nodiscard, gnu::always_inline, gnu::hot]]
-    inline RxFrame tryReceive() noexcept
+    inline std::span<const std::uint8_t> tryReceive() noexcept
         requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx);
 
     [[gnu::always_inline, gnu::hot]]
@@ -520,7 +519,8 @@ void DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::prefil
 
 template <DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,
           std::uint16_t BurstSize, std::uint32_t NumMbufs, std::uint16_t MaxFrame>
-inline RxFrame DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::tryReceive() noexcept
+inline std::span<const std::uint8_t>
+DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFrame>::tryReceive() noexcept
     requires (M == DpdkMode::RxOnly || M == DpdkMode::RxTx)
 {
     if (m_rxIdx >= m_rxCount) [[unlikely]] {
@@ -531,10 +531,7 @@ inline RxFrame DPDK<M, QueueId, NbRxDesc, NbTxDesc, BurstSize, NumMbufs, MaxFram
         }
     }
     m_pendingRx = m_rxBurst[m_rxIdx];
-    return {.data   = {rte_pktmbuf_mtod(m_pendingRx, const std::uint8_t*), rte_pktmbuf_pkt_len(m_pendingRx)},
-            .sec    = 0,
-            .nsec   = 0,
-            .status = 1};
+    return {rte_pktmbuf_mtod(m_pendingRx, const std::uint8_t*), rte_pktmbuf_pkt_len(m_pendingRx)};
 }
 
 template <DpdkMode M, std::uint16_t QueueId, std::uint16_t NbRxDesc, std::uint16_t NbTxDesc,

@@ -250,8 +250,8 @@ public:
         std::uint32_t graceEmpty = 0;
 
         while (true) {
-            const RxFrame f = m_rx.tryReceive();
-            if (f.data.empty()) {
+            const std::span<const std::uint8_t> f = m_rx.tryReceive();
+            if (f.empty()) {
                 // After Tx is done, stop once the ring has stayed empty for a
                 // bounded grace window (the last in-flight frames have arrived).
                 if (m_sh.txDone.load(std::memory_order_acquire)) {
@@ -265,11 +265,11 @@ public:
 
             const std::uint64_t t1 = tsc::now();   // arrival timestamp
 
-            const std::uint8_t* packet = f.data.data();
+            const std::uint8_t* packet = f.data();
 
             // Runt guard: a stray sub-26B frame must not let the stamp load read
             // past the buffer. Our frames are >= 64, so this is never taken.
-            if (f.data.size() < kFrameMinBytes) [[unlikely]] {
+            if (f.size() < kFrameMinBytes) [[unlikely]] {
                 m_rx.release();
                 continue;
             }

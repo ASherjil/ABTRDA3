@@ -547,8 +547,8 @@ inline void printXskProcessValidation(const char* ifname, bool deferralExpected,
     }
     bool found = false;
     while (dirent* de = ::readdir(dir)) {
-        char* end = nullptr;
-        const long  fd  = std::strtol(de->d_name, &end, 10);
+        char*      end = nullptr;
+        const long fd  = std::strtol(de->d_name, &end, 10);
         if (end == de->d_name) {
             continue;
         }

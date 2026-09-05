@@ -28,7 +28,6 @@
 #include "I210Registers.hpp"
 #include "InterfaceDiscovery.hpp"
 #include "PCIeBackend.hpp"
-#include "RxFrame.hpp"
 
 enum class DriverMode : std::uint8_t {
     RxOnly,
@@ -193,7 +192,7 @@ public:
 
     // Receive functions on the hot path - START
     [[nodiscard, gnu::always_inline, gnu::hot]]
-    inline RxFrame tryReceive() noexcept
+    inline std::span<const std::uint8_t> tryReceive() noexcept
         requires (HAS_RX)
     {
         // DPDK-style multi-level prefetch (igb_rxtx.c:886-921):
@@ -216,12 +215,7 @@ public:
         // a compiler barrier only (strong memory model); matches igb's dma_rmb().
         asm volatile("" ::: "memory");
 
-        return {
-            .data   = {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), m_rxRing[m_rxTail].wb.length},
-            .sec    = 0,
-            .nsec   = 0,
-            .status = 1   // non-zero = frame present
-        };
+        return {m_rxBuffer.ptrAt<std::uint8_t>(m_rxTail * BuffSize), m_rxRing[m_rxTail].wb.length};
     }
 
     [[gnu::always_inline, gnu::hot]]

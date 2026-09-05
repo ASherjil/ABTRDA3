@@ -34,7 +34,6 @@
 #include <xdp/xsk.h>
 
 #include "../common/NapiConfig.hpp"
-#include "../common/RxFrame.hpp"
 
 #ifndef SO_BUSY_POLL
 #define SO_BUSY_POLL 46
@@ -130,7 +129,7 @@ public:
     [[nodiscard]] bool isCopyMode() const noexcept;
 
     [[nodiscard, gnu::always_inline, gnu::hot]]
-    inline RxFrame tryReceive() noexcept
+    inline std::span<const std::uint8_t> tryReceive() noexcept
         requires (M != AFXDPMode::TxOnly);
 
     [[gnu::always_inline, gnu::hot]]
@@ -383,7 +382,8 @@ bool AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::isCopyMode() con
 
 template <AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize,
           bool NeedWakeup>
-inline RxFrame AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::tryReceive() noexcept
+inline std::span<const std::uint8_t>
+AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::tryReceive() noexcept
     requires (M != AFXDPMode::TxOnly)
 {
     __u32              idx  = 0;
@@ -400,11 +400,7 @@ inline RxFrame AFXDP<M, NumRxFrames, NumTxFrames, FrameSize, NeedWakeup>::tryRec
 
     const xdp_desc* desc = xsk_ring_cons__rx_desc(&m_xsk.rx, idx);
     m_pendingRxAddr      = desc->addr;
-    return {.data   = {static_cast<std::uint8_t*>(xsk_umem__get_data(m_umem.buffer, m_pendingRxAddr)),
-                       desc->len},
-            .sec    = 0,
-            .nsec   = 0,
-            .status = 1};
+    return {static_cast<const std::uint8_t*>(xsk_umem__get_data(m_umem.buffer, m_pendingRxAddr)), desc->len};
 }
 
 template <AFXDPMode M, std::uint32_t NumRxFrames, std::uint32_t NumTxFrames, std::uint32_t FrameSize,

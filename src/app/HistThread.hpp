@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -46,6 +47,8 @@ struct Shared {
     std::atomic<std::uint64_t>        pushFailures{0};   // producer -> SPSC overflow tally
     const TestConfig&                 cfg;               // read-only after construction
     double                            tscHz{0.0};        // calibrated ONCE before threads start
+    std::optional<std::uint64_t> (*decode)(std::uint64_t, std::uint32_t){nullptr};   // raw sample -> value
+    std::uint32_t decodeArg{0};
 
     explicit Shared(const TestConfig& c)
         : toHist(c.recQueueCapacity),
@@ -97,6 +100,7 @@ inline void HistThread::run(const std::stop_token& stop) {
     }
 
     std::uint64_t       recorded = 0;
+    std::uint64_t       dropped  = 0;
     const std::uint64_t startTsc = tsc::now();
     const std::uint64_t hbCyc    = static_cast<std::uint64_t>(tscHz) * 600;   // 10 min
     std::uint64_t       nextHb   = hbCyc;
@@ -128,11 +132,23 @@ inline void HistThread::run(const std::stop_token& stop) {
 
         // Warmup discard happens at the PRODUCER (it never pushes cold-start frames),
         // so every sample delivered here is already steady-state.
-        hdr_record_value(h, static_cast<std::int64_t>(cyc));   // raw cycles
+        std::uint64_t sample = cyc;
+        if (m_sh.decode != nullptr) {
+            const std::optional<std::uint64_t> decoded = m_sh.decode(cyc, m_sh.decodeArg);
+            if (!decoded) {
+                ++dropped;
+                continue;
+            }
+            sample = *decoded;
+        }
+        hdr_record_value(h, static_cast<std::int64_t>(sample));
         ++recorded;
     }
 
     report(h, recorded, tscHz);
+    if (dropped != 0) {
+        fmt::println(stderr, "[SingleRec/Hist] dropped={} (rejected by the sample decoder)", dropped);
+    }
     hdr_close(h);
 }
 

@@ -32,13 +32,13 @@ inline void run_rxsink(Rx& rx, const TestConfig& cfg, const std::stop_token& sto
 
     while (true) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
-            const RxFrame rxf = rx.tryReceive();
-            if (rxf.data.empty()) [[likely]] {
+            const std::span<const std::uint8_t> rxf = rx.tryReceive();
+            if (rxf.empty()) [[likely]] {
                 continue;
             }
 
             // Perform a simple check, is this packet meant for us ? Check its dst mac address
-            if (std::memcmp(rxf.data.data(), ourMac.data(), 6) == 0) {
+            if (std::memcmp(rxf.data(), ourMac.data(), 6) == 0) {
                 accepted++;
             } else {
                 rejected++;
