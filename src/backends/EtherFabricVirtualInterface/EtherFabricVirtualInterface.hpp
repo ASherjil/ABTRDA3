@@ -23,6 +23,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <span>
@@ -146,7 +147,7 @@ enum class EtherFabricMode : std::uint8_t { RxOnly, TxOnly, RxTx };
 //     (visible as unexpected_events). RxTx ping-pong misses every round.
 inline constexpr bool kEfViRxPayloadPoll = true;
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8, std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true>
+template<EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8, std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true, bool HwTimestamps = false>
 class EtherFabricVirtualInterface {
   static constexpr bool HAS_RX = (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
   static constexpr bool HAS_TX = (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
@@ -204,6 +205,18 @@ public:
   inline void release() noexcept
       requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
 
+  [[nodiscard, gnu::always_inline]]
+  std::uint64_t hwRoundTrip() const noexcept
+      requires (HwTimestamps && M == EtherFabricMode::RxTx) {
+    return m_lastRxTs - m_lastTxTs;
+  }
+
+  [[nodiscard, gnu::always_inline]]
+  std::uint64_t hwTurnaround() const noexcept
+      requires (HwTimestamps && M == EtherFabricMode::RxTx) {
+    return m_lastTxTs - m_prevRxTs;
+  }
+
 private:
   struct RxEv {
     std::uint32_t id;
@@ -213,6 +226,7 @@ private:
   [[gnu::always_inline]] std::uint8_t* rxSlot(std::uint32_t i) const noexcept;
   [[gnu::always_inline]] std::uint8_t* txSlot(std::uint32_t s) const noexcept;
   [[gnu::hot]] inline bool pollEvent(RxEv& out, bool wantRx) noexcept;
+  [[gnu::hot]] inline void readRxTimestamp(const std::uint8_t* prefixBase) noexcept;
   inline void handleDiscard(std::uint32_t id, unsigned subtype) noexcept;
   [[nodiscard]] bool readMac() noexcept;
 
@@ -270,21 +284,30 @@ private:
   std::uint64_t m_rxDropped{0};
   std::uint64_t m_txErrors{0};
   std::uint64_t m_evUnexpected{0};
+
+  std::uint64_t m_lastRxTs{0};
+  std::uint64_t m_prevRxTs{0};
+  std::uint64_t m_lastTxTs{0};
+  std::uint16_t m_rxSyncFlags{0};
+  std::uint16_t m_txSyncFlags{0};
+  std::uint64_t m_txTsEvents{0};
+  std::uint64_t m_txTsInvalid{0};
+  std::uint64_t m_rxTsInvalid{0};
 };
 
 // =============================================================================
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
   : m_ifname{ifname} {}
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::~EtherFabricVirtualInterface() {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::~EtherFabricVirtualInterface() {
   shutdown();
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::init() noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::init() noexcept {
   if (!readMac()) return false;
 
   const unsigned ifindex = if_nametoindex(m_ifname.c_str());
@@ -315,7 +338,32 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     viFlags = static_cast<enum ef_vi_flags>(viFlags | EF_VI_TX_CTPIO);
   }
 
+  if constexpr (HwTimestamps) {
+    unsigned long cap = 0;
+    if constexpr (HAS_RX) {
+      if (ef_vi_capabilities_get(m_dh, static_cast<int>(ifindex), EF_VI_CAP_HW_RX_TIMESTAMPING, &cap) != 0 || cap == 0) {
+        fmt::println(stderr, "[ef_vi] {}: NIC does not report HW RX timestamping", m_ifname);
+        return false;
+      }
+      viFlags = static_cast<enum ef_vi_flags>(viFlags | EF_VI_RX_TIMESTAMPS);
+    }
+    if constexpr (HAS_TX) {
+      if (ef_vi_capabilities_get(m_dh, static_cast<int>(ifindex), EF_VI_CAP_HW_TX_TIMESTAMPING, &cap) != 0 || cap == 0) {
+        fmt::println(stderr, "[ef_vi] {}: NIC does not report HW TX timestamping", m_ifname);
+        return false;
+      }
+      viFlags = static_cast<enum ef_vi_flags>(viFlags | EF_VI_TX_TIMESTAMPS);
+    }
+  }
+
   int rc = ef_vi_alloc_from_pd(&m_vi, m_dh, &m_pd, m_dh, -1, -1, -1, nullptr, -1, viFlags);
+  if constexpr (HwTimestamps) {
+    if (rc == -ENOKEY) {
+      fmt::println(stderr, "[ef_vi] {}: ef_vi_alloc_from_pd -ENOKEY — the adapter is not licensed to", m_ifname);
+      fmt::println(stderr, "        subscribe to time-sync events (firmware EPERM). Check: sudo sfkey --adapter={} --report", m_ifname);
+      return false;
+    }
+  }
   if (rc == -EPERM) {
     fmt::println(stderr, "[ef_vi] {}: firmware forces RX event merging — retrying with EF_VI_RX_EVENT_MERGE (throughput mode, NOT the latency config)", m_ifname);
     viFlags = static_cast<enum ef_vi_flags>(viFlags | EF_VI_RX_EVENT_MERGE);
@@ -405,13 +453,19 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
       if (ef_vi_receive_post(&m_vi, m_rxDma[i], static_cast<ef_request_id>(i)) != 0) break;
     }
     m_rxPrefix = ef_vi_receive_prefix_len(&m_vi);
+    if constexpr (HwTimestamps) {
+      if (m_rxPrefix == 0) {
+        fmt::println(stderr, "[ef_vi] {}: RX timestamps requested but prefix_len==0 — refusing to run", m_ifname);
+        return false;
+      }
+    }
   }
 
   // The mode libciul's CTPIO writer will use — read from OUR environment, the
   // same place ef_vi_transmit_ctpio reads it. Prints the truth even when a
   // launcher script (sudo env_reset!) silently strips the variable.
   const char* ctpioModeEnv = std::getenv("EF_VI_CTPIO_MODE");
-  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge txpad={} ctpio_mode={} rx={}{}",
+  fmt::println(stderr, "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge txpad={} hw_ts={} ctpio_mode={} rx={}{}",
                m_ifname, ef_vi_version_str(),
                m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                NbRxBufs, NbTxBufs,
@@ -419,14 +473,15 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                UseCtpio ? CtThreshold : 0U,
                m_rxPrefix,
                m_txPad,
+               HwTimestamps ? (HAS_RX && HAS_TX ? "rx+tx" : (HAS_RX ? "rx" : "tx")) : "off",
                ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)",
                kEfViRxPayloadPoll ? "payload-poll" : "evq",
                m_evMerge ? " [EVENT-MERGE FORCED]" : "");
   return true;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::shutdown() noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::shutdown() noexcept {
   if (m_haveVi) {
     if constexpr (HAS_TX) {
       if constexpr (UseCtpio) {
@@ -454,6 +509,16 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                      m_ifname, m_rxPollHits, m_rxEvReconciled);
       }
     }
+    if constexpr (HwTimestamps) {
+      if constexpr (HAS_RX) {
+        fmt::println(stderr, "[ef_vi] {}: hw_ts rx_invalid={} last_rx_sync_flags=0x{:x}",
+                     m_ifname, m_rxTsInvalid, m_rxSyncFlags);
+      }
+      if constexpr (HAS_TX) {
+        fmt::println(stderr, "[ef_vi] {}: hw_ts tx_events={} tx_invalid={} last_tx_sync_flags=0x{:x}",
+                     m_ifname, m_txTsEvents, m_txTsInvalid, m_txSyncFlags);
+      }
+    }
     ef_vi_free(&m_vi, m_dh);
     m_haveVi = false;
   }
@@ -479,21 +544,21 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::macAddress() const noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::macAddress() const noexcept {
   return m_mac;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
     std::memcpy(txSlot(s), frameTemplate.data(),
                 std::min<std::size_t>(frameTemplate.size(), BufSize));
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::acquire(std::uint32_t frameLen) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::acquire(std::uint32_t frameLen) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   if (frameLen > BufSize) [[unlikely]] return nullptr;
   if (m_txHead - m_txTail >= NbTxBufs) [[unlikely]] {
     RxEv scratch;
@@ -506,8 +571,8 @@ inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize,
   return m_txPtr;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::commit() noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::commit() noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (UseCtpio) {
     ef_vi_transmit_ctpio(&m_vi, m_txPtr, m_txLen, CtThreshold);
     for (;;) {
@@ -539,8 +604,8 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   ++m_txHead;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::send(std::span<const std::uint8_t> frame) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::send(std::span<const std::uint8_t> frame) noexcept requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx) {
   auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
   if (dst == nullptr) [[unlikely]] return false;
   std::memcpy(dst, frame.data(), frame.size());
@@ -548,8 +613,8 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   return true;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::tryReceive() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (kEfViRxPayloadPoll) {
     std::uint8_t* buf = rxSlot(m_rxNextIdx);
     const volatile std::uint16_t* marker = reinterpret_cast<const volatile std::uint16_t*>(buf + m_rxPrefix + 12);
@@ -557,6 +622,9 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
       m_heldId    = m_rxNextIdx;
       m_rxNextIdx = (m_rxNextIdx + 1) & (NbRxBufs - 1);
       ++m_rxPollHits;
+      if constexpr (HwTimestamps) {
+        readRxTimestamp(buf);
+      }
       return { .data   = { buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix) },
                .sec    = 0,
                .nsec   = 0,
@@ -570,6 +638,9 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
     RxEv ev;
     if (!pollEvent(ev, true)) [[likely]] return {};
     m_heldId = ev.id;
+    if constexpr (HwTimestamps) {
+      readRxTimestamp(rxSlot(ev.id));
+    }
     return { .data   = { rxSlot(ev.id) + m_rxPrefix, ev.len - static_cast<std::uint32_t>(m_rxPrefix) },
              .sec    = 0,
              .nsec   = 0,
@@ -577,8 +648,8 @@ inline RxFrame EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThr
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::release() noexcept requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx) {
   if constexpr (kEfViRxPayloadPoll) {
     std::uint8_t* slot = rxSlot(m_heldId);
     std::memset(slot + m_rxPrefix + 12, 0, 2);
@@ -593,18 +664,31 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::rxSlot(std::uint32_t i) const noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
+  ef_precisetime ts{};
+  const int rc = ef_vi_receive_get_precise_timestamp(&m_vi, prefixBase, &ts);
+  if (rc != 0 || (ts.tv_sec == 0 && ts.tv_nsec == 0)) [[unlikely]] {
+    ++m_rxTsInvalid;
+    return;
+  }
+  m_prevRxTs    = m_lastRxTs;
+  m_lastRxTs    = (static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec) * 4 + (ts.tv_nsec_frac >> 14);
+  m_rxSyncFlags = ts.tv_flags;
+}
+
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::rxSlot(std::uint32_t i) const noexcept {
   return m_mem + static_cast<std::size_t>(i) * BufSize;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::txSlot(std::uint32_t s) const noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::txSlot(std::uint32_t s) const noexcept {
   return m_mem + static_cast<std::size_t>(m_txBase + s) * BufSize;
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
   ++m_rxDiscards;
   if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) ++m_rxCrcBad;
   if constexpr (kEfViRxPayloadPoll) {
@@ -623,8 +707,8 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 // left at the cursor head for tryReceive() when !wantRx (the TX-side drain
 // must never eat a frame). One eventq_poll refill per call keeps the empty
 // path (the hottest code here — the app spins on it) at a handful of insns.
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::pollEvent(RxEv& out, bool wantRx) noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::pollEvent(RxEv& out, bool wantRx) noexcept {
   for (int pass = 0; ; ++pass) {
     while (m_evIdx < m_nEv) {
       ef_event& ev = m_evs[m_evIdx];
@@ -661,6 +745,34 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
           }
         } else {
           m_ctpioFallbacks += static_cast<std::uint64_t>(n);
+        }
+        ++m_evIdx;
+        break;
+      }
+      case EF_EVENT_TYPE_TX_WITH_TIMESTAMP: {
+        if constexpr (HwTimestamps && HAS_TX) {
+          ++m_txTail;
+          ++m_txTsEvents;
+          const std::uint64_t sec  = EF_EVENT_TX_WITH_TIMESTAMP_SEC(ev);
+          const std::uint64_t nsec = EF_EVENT_TX_WITH_TIMESTAMP_NSEC(ev);
+          if (sec == 0 && nsec == 0) [[unlikely]] {
+            ++m_txTsInvalid;
+          } else {
+            m_lastTxTs    = (sec * 1000000000ULL + nsec) * 4 + (static_cast<std::uint64_t>(EF_EVENT_TX_WITH_TIMESTAMP_NSEC_FRAC16(ev)) >> 14);
+            m_txSyncFlags = static_cast<std::uint16_t>(EF_EVENT_TX_WITH_TIMESTAMP_SYNC_FLAGS(ev));
+          }
+          if constexpr (UseCtpio) {
+            if (EF_EVENT_TX_CTPIO(ev)) {
+              ++m_ctpioWins;
+            } else {
+              ++m_ctpioFallbacks;
+              ++m_fallbackPerSlot[static_cast<std::uint32_t>(EF_EVENT_TX_WITH_TIMESTAMP_RQ_ID(ev)) & (NbTxBufs - 1)];
+            }
+          } else {
+            ++m_ctpioFallbacks;
+          }
+        } else {
+          ++m_evUnexpected;
         }
         ++m_evIdx;
         break;
@@ -746,8 +858,8 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
   }
 }
 
-template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio>::readMac() noexcept {
+template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::readMac() noexcept {
   const std::string p = "/sys/class/net/" + m_ifname + "/address";
   FILE* f = std::fopen(p.c_str(), "r");
   if (!f) {

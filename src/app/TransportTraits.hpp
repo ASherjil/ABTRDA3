@@ -399,12 +399,14 @@ inline constexpr unsigned kEfViCtThreshold = 64;
 // framework tax. docs/Benchmarks.md.
 inline constexpr bool kEfViUseCtpio = true;
 
+inline constexpr bool kEfViHwTimestamps = true;
+
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
 
-    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
-    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
-    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio>;
+    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
+    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
+    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
 
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
     static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }

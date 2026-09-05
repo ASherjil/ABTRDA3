@@ -5,12 +5,17 @@
 
 #include "RingConcepts.hpp"
 #include "TestConfig.hpp"
+#include "HistThread.hpp"
+#include "SingleRecorder.hpp"
 #include "Profiling.hpp"
 
+#include <fmt/core.h>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <optional>
 #include <stop_token>
+#include <thread>
 #include <vector>
 
 inline constexpr bool kapplyCTPIOFence = true;
@@ -27,8 +32,31 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     tmpl[13] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
     tx.prefillRing(tmpl);
 
+    constexpr bool kHwTs = requires (Tx& t) {
+        t.hwTurnaround();
+    };
+    std::optional<Shared>       sh;
+    std::optional<HistThread>   hist;
+    std::optional<std::jthread> tHist;
+    if constexpr (kHwTs) {
+        sh.emplace(cfg);
+        sh->tscHz = 4.0e9;
+        hist.emplace(*sh, cfg.serverOutputPath, cfg.clientDurationSec,
+                     "Tick-to-Trade (NIC hardware timestamps: RX stamp -> TX stamp)",
+                     /*reportOneWayHalf=*/false);
+        tHist.emplace([&] {
+            pinThread(cfg.serverRecorderCore);
+            hist->run(stop);
+        });
+        fmt::print(stderr, "[Server] tick-to-trade: NIC hardware timestamps, recorder on core {}\n",
+                   cfg.serverRecorderCore);
+    }
+
+    [[maybe_unused]] std::uint64_t hwWarmup = 0;
+
     // Outer loop checks stop token; inner loop spins tight without atomic reads
-    while (true) {
+    bool stopping = false;
+    while (!stopping) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
             RxFrame rxf = rx.tryReceive();
             if (rxf.data.empty()){
@@ -46,9 +74,13 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
             while (!dst) {
                 if (stop.stop_requested())[[unlikely]]{
                     rx.release();
-                    return;
+                    stopping = true;
+                    break;
                 }
                 dst = tx.acquire(cfg.frameSize);
+            }
+            if (stopping) [[unlikely]] {
+                break;
             }
 
             std::memcpy(dst + 14, &rxf.data[14], 12);
@@ -59,6 +91,14 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
 
             rx.release();
             tx.commit();
+
+            if constexpr (kHwTs) {
+                if (hwWarmup < kWarmupDiscard) {
+                    ++hwWarmup;
+                } else if (!sh->toHist.try_push(tx.hwTurnaround())) [[unlikely]] {
+                    sh->pushFailures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
 
             if constexpr (prof::kDebugProfiling) {
                 reflectStats.record(prof::cycles() - reflectStart);
@@ -71,8 +111,17 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         }
     }
 
+    if constexpr (kHwTs) {
+        while (!sh->toHist.try_push(kEndSentinel));
+        tHist->join();
+    }
+
     std::printf("\n[Server] Reflected %lu packets.\n", packet_count);
     if constexpr (prof::kDebugProfiling) {
         reflectStats.report("server reflect (rx->tx)", prof::tscHz());
+    }
+    if constexpr (kHwTs) {
+        fmt::print(stderr, "[Server] hw_ts warmup_discarded={} push_fail={}\n",
+                   hwWarmup, sh->pushFailures.load(std::memory_order_relaxed));
     }
 }
