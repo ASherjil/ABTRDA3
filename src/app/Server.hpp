@@ -41,15 +41,15 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     if constexpr (kHwTs) {
         sh.emplace(cfg);
         sh->tscHz = 4.0e9;
-        hist.emplace(*sh, cfg.serverOutputPath, cfg.clientDurationSec,
+        hist.emplace(*sh, cfg.serverHwTimestampOutputPath, cfg.clientDurationSec,
                      "Tick-to-Trade (NIC hardware timestamps: RX stamp -> TX stamp)",
                      /*reportOneWayHalf=*/false);
         tHist.emplace([&] {
-            pinThread(cfg.serverRecorderCore);
+            pinThread(cfg.serverHwTimestampRecorderCore);
             hist->run(stop);
         });
         fmt::print(stderr, "[Server] tick-to-trade: NIC hardware timestamps, recorder on core {}\n",
-                   cfg.serverRecorderCore);
+                   cfg.serverHwTimestampRecorderCore);
     }
 
     [[maybe_unused]] std::uint64_t hwWarmup = 0;

@@ -50,8 +50,8 @@ struct TestConfig {
     std::uint64_t clientDurationSec  = 60;
     int           clientRecorderCore = 4;
 
-    int           serverRecorderCore = 3;
-    std::string   serverOutputPath;
+    int           serverHwTimestampRecorderCore = 0;
+    std::string   serverHwTimestampOutputPath;
 
     std::uint32_t mmapBlockSize   = 4096;
     std::uint32_t mmapBlockNumber = 512;
@@ -126,8 +126,8 @@ inline TestConfig loadConfig(const char* path) {
     cfg.clientCount        = static_cast<std::uint32_t>(tbl["client"]["count"].value_or(10));
     cfg.clientDurationSec  = static_cast<std::uint64_t>(tbl["client"]["duration_sec"].value_or(60));
     cfg.clientRecorderCore = tbl["client"]["recorder_core"].value_or(4);
-    cfg.serverRecorderCore = tbl["server"]["recorder_core"].value_or(3);
-    cfg.serverOutputPath   = tbl["server"]["output"].value_or(std::string{});
+    cfg.serverHwTimestampRecorderCore = tbl["server"]["server_hw_timestamp_recorder_core"].value_or(0);
+    cfg.serverHwTimestampOutputPath   = tbl["server"]["server_hw_timestamp_output"].value_or(std::string{});
 
     cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096));
     cfg.mmapBlockNumber = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_number"].value_or(512));

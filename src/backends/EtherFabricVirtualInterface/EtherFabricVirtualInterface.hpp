@@ -34,6 +34,7 @@
 #include <fmt/format.h>
 
 #include "../common/RxFrame.hpp"
+#include "../common/Profiling.hpp"
 
 // =============================================================================
 // EtherFabricVirtualInterface — ef_vi (Solarflare/AMD kernel bypass) transport.
@@ -158,6 +159,10 @@ class EtherFabricVirtualInterface {
   static_assert(BufSize >= 64, "slot must hold a minimum ethernet frame");
 
   static constexpr int kEvPollBatch = 8;
+
+  static constexpr std::uint32_t kRxPrefixTsOffset = 10;
+  static constexpr std::uint32_t kOneSecQns        = 4000000000u;
+  static constexpr std::uint32_t kQnsOverrun       = 20;
   static_assert(kEvPollBatch >= EF_VI_EVENT_POLL_MIN_EVS);
 
   // One unused guard slot on EACH side of the TX region. Measured (2x 5-min
@@ -208,13 +213,21 @@ public:
   [[nodiscard, gnu::always_inline]]
   std::uint64_t hwRoundTrip() const noexcept
       requires (HwTimestamps && M == EtherFabricMode::RxTx) {
-    return m_lastRxTs - m_lastTxTs;
+    std::int64_t d = static_cast<std::int64_t>(m_lastRxTs) - static_cast<std::int64_t>(m_lastTxTs);
+    if (d < 0) [[unlikely]] {
+      d += kOneSecQns;
+    }
+    return static_cast<std::uint64_t>(d);
   }
 
   [[nodiscard, gnu::always_inline]]
   std::uint64_t hwTurnaround() const noexcept
       requires (HwTimestamps && M == EtherFabricMode::RxTx) {
-    return m_lastTxTs - m_prevRxTs;
+    std::int64_t d = static_cast<std::int64_t>(m_lastTxTs) - static_cast<std::int64_t>(m_prevRxTs);
+    if (d < 0) [[unlikely]] {
+      d += kOneSecQns;
+    }
+    return static_cast<std::uint64_t>(d);
   }
 
 private:
@@ -285,10 +298,14 @@ private:
   std::uint64_t m_txErrors{0};
   std::uint64_t m_evUnexpected{0};
 
-  std::uint64_t m_lastRxTs{0};
-  std::uint64_t m_prevRxTs{0};
-  std::uint64_t m_lastTxTs{0};
-  std::uint16_t m_rxSyncFlags{0};
+  std::uint32_t m_lastRxTs{0};
+  std::uint32_t m_prevRxTs{0};
+  std::uint32_t m_lastTxTs{0};
+  std::uint32_t m_rxTsCorrection{0};
+  std::uint32_t m_rxTsNoStamp{0xFFFFFFFFu};
+  std::uint64_t m_tsVerified{0};
+  std::uint64_t m_tsMismatch{0};
+  std::uint64_t m_tsLibFail{0};
   std::uint16_t m_txSyncFlags{0};
   std::uint64_t m_txTsEvents{0};
   std::uint64_t m_txTsInvalid{0};
@@ -458,6 +475,12 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
         fmt::println(stderr, "[ef_vi] {}: RX timestamps requested but prefix_len==0 — refusing to run", m_ifname);
         return false;
       }
+      if (m_vi.ts_format != TS_FORMAT_SECONDS_QTR_NANOSECONDS) {
+        fmt::println(stderr, "[ef_vi] {}: adapter timestamp format {} is not quarter-nanoseconds — refusing to run", m_ifname, static_cast<int>(m_vi.ts_format));
+        return false;
+      }
+      m_rxTsCorrection = static_cast<std::uint32_t>(m_vi.rx_ts_correction);
+      m_rxTsNoStamp    = 0xFFFFFFFFu + m_rxTsCorrection;
     }
   }
 
@@ -511,8 +534,12 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     }
     if constexpr (HwTimestamps) {
       if constexpr (HAS_RX) {
-        fmt::println(stderr, "[ef_vi] {}: hw_ts rx_invalid={} last_rx_sync_flags=0x{:x}",
-                     m_ifname, m_rxTsInvalid, m_rxSyncFlags);
+        fmt::println(stderr, "[ef_vi] {}: hw_ts rx_invalid={} rx_ts_correction={}",
+                     m_ifname, m_rxTsInvalid, static_cast<std::int32_t>(m_rxTsCorrection));
+        if constexpr (prof::kDebugProfiling) {
+          fmt::println(stderr, "[ef_vi] {}: hw_ts verify: checked={} mismatch={} lib_fail={}",
+                       m_ifname, m_tsVerified, m_tsMismatch, m_tsLibFail);
+        }
       }
       if constexpr (HAS_TX) {
         fmt::println(stderr, "[ef_vi] {}: hw_ts tx_events={} tx_invalid={} last_tx_sync_flags=0x{:x}",
@@ -666,15 +693,36 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
 inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
-  ef_precisetime ts{};
-  const int rc = ef_vi_receive_get_precise_timestamp(&m_vi, prefixBase, &ts);
-  if (rc != 0 || (ts.tv_sec == 0 && ts.tv_nsec == 0)) [[unlikely]] {
-    ++m_rxTsInvalid;
-    return;
+  std::uint32_t minor;
+  std::memcpy(&minor, prefixBase + kRxPrefixTsOffset, sizeof minor);
+  minor += m_rxTsCorrection;
+  if (minor >= kOneSecQns) [[unlikely]] {
+    if (minor < kOneSecQns + kQnsOverrun + 2) {
+      minor -= kOneSecQns;
+    } else if (minor != m_rxTsNoStamp) {
+      minor += kOneSecQns;
+    } else {
+      ++m_rxTsInvalid;
+      return;
+    }
   }
-  m_prevRxTs    = m_lastRxTs;
-  m_lastRxTs    = (static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec) * 4 + (ts.tv_nsec_frac >> 14);
-  m_rxSyncFlags = ts.tv_flags;
+  if constexpr (prof::kDebugProfiling) {
+    ef_precisetime ts{};
+    if (ef_vi_receive_get_precise_timestamp(&m_vi, prefixBase, &ts) != 0) {
+      ++m_tsLibFail;
+    } else {
+      ++m_tsVerified;
+      const std::uint32_t lib = static_cast<std::uint32_t>(ts.tv_nsec) * 4u + (static_cast<std::uint32_t>(ts.tv_nsec_frac) >> 14);
+      if (lib != minor) {
+        if (m_tsMismatch < 8) {
+          fmt::println(stderr, "[ef_vi] {}: hw_ts MISMATCH lib={} bypass={}", m_ifname, lib, minor);
+        }
+        ++m_tsMismatch;
+      }
+    }
+  }
+  m_prevRxTs = m_lastRxTs;
+  m_lastRxTs = minor;
 }
 
 template<EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize, unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
@@ -753,12 +801,12 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         if constexpr (HwTimestamps && HAS_TX) {
           ++m_txTail;
           ++m_txTsEvents;
-          const std::uint64_t sec  = EF_EVENT_TX_WITH_TIMESTAMP_SEC(ev);
-          const std::uint64_t nsec = EF_EVENT_TX_WITH_TIMESTAMP_NSEC(ev);
+          const std::uint32_t sec  = EF_EVENT_TX_WITH_TIMESTAMP_SEC(ev);
+          const std::uint32_t nsec = EF_EVENT_TX_WITH_TIMESTAMP_NSEC(ev);
           if (sec == 0 && nsec == 0) [[unlikely]] {
             ++m_txTsInvalid;
           } else {
-            m_lastTxTs    = (sec * 1000000000ULL + nsec) * 4 + (static_cast<std::uint64_t>(EF_EVENT_TX_WITH_TIMESTAMP_NSEC_FRAC16(ev)) >> 14);
+            m_lastTxTs    = nsec * 4u + (static_cast<std::uint32_t>(EF_EVENT_TX_WITH_TIMESTAMP_NSEC_FRAC16(ev)) >> 14);
             m_txSyncFlags = static_cast<std::uint16_t>(EF_EVENT_TX_WITH_TIMESTAMP_SYNC_FLAGS(ev));
           }
           if constexpr (UseCtpio) {
