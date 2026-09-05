@@ -3,19 +3,20 @@
 
 #pragma once
 
-#include <fmt/core.h>
-
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stop_token>
+#include <thread>
+
 #include <pthread.h>
 #include <sched.h>
-#include <stop_token>
 #include <sys/mman.h>
-#include <thread>
+
+#include <fmt/core.h>
 
 // =============================================================================
 // RuntimeSetup — runtime environment for the hot path
@@ -37,14 +38,17 @@ public:
         // Step 1 — mlockall (can hang on NFS-rooted systems if pages need
         // to be faulted over the network).
         fmt::println(stderr, "[RT] step 1/5 mlockall(MCL_CURRENT | MCL_FUTURE)…");
-        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
             fmt::println(stderr, "[RT] step 1/5 mlockall FAILED: {}", std::strerror(errno));
-        else
+        } else {
             fmt::println(stderr, "[RT] step 1/5 mlockall OK");
+        }
 
         // Step 2 — signal handler (SIGINT → cooperative stop).
         fmt::println(stderr, "[RT] step 2/5 install SIGINT handler…");
-        std::signal(SIGINT, [](int) { s_stop.request_stop(); });
+        std::signal(SIGINT, [](int) {
+            s_stop.request_stop();
+        });
         fmt::println(stderr, "[RT] step 2/5 SIGINT handler OK");
 
         // Step 3 — watchdog thread. It pins itself to core 0 at SCHED_OTHER.
@@ -79,7 +83,9 @@ public:
         setSchedOther();
     }
 
-    [[nodiscard]] std::stop_token stopToken() const { return s_stop.get_token(); }
+    [[nodiscard]] static std::stop_token stopToken() {
+        return s_stop.get_token();
+    }
 
 private:
     // File-scope stop source shared with the signal handler
@@ -97,8 +103,7 @@ private:
             sp.sched_priority = 0;
             sched_setscheduler(0, SCHED_OTHER, &sp);
 
-            fmt::println(stderr, "[Watchdog] running on core 0 (SCHED_OTHER), will fire in {} s",
-                         timeoutSec);
+            fmt::println(stderr, "[Watchdog] running on core 0 (SCHED_OTHER), will fire in {} s", timeoutSec);
 
             std::this_thread::sleep_for(std::chrono::seconds(timeoutSec));
             if (!s_stop.stop_requested()) {
@@ -114,9 +119,9 @@ private:
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(core, &cpuset);
-        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
-            fmt::println(stderr, "[Warn] sched_setaffinity(core {}) failed: {}",
-                         core, std::strerror(errno));
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+            fmt::println(stderr, "[Warn] sched_setaffinity(core {}) failed: {}", core, std::strerror(errno));
+        }
     }
 
     // Run the hot thread under SCHED_OTHER (prio 0). On an isolated core a single
@@ -125,7 +130,8 @@ private:
     static void setSchedOther() {
         sched_param sp{};
         sp.sched_priority = 0;
-        if (sched_setscheduler(0, SCHED_OTHER, &sp) != 0)
+        if (sched_setscheduler(0, SCHED_OTHER, &sp) != 0) {
             fmt::println(stderr, "[Warn] SCHED_OTHER failed: {}", std::strerror(errno));
+        }
     }
 };

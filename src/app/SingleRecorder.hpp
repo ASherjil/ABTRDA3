@@ -39,13 +39,6 @@
 // The run is bounded by DURATION (TSC cycles), so the same binary does a 60 s
 // smoke test or a 24 h soak by changing one TOML field.
 
-#include "HistThread.hpp"   // Shared, HistThread, kEndSentinel — the recorder side
-#include "RingConcepts.hpp"
-#include "TestConfig.hpp"
-#include "TscClock.hpp"
-
-#include <fmt/core.h>
-
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -59,6 +52,13 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sched.h>
+
+#include <fmt/core.h>
+
+#include "HistThread.hpp"   // Shared, HistThread, kEndSentinel — the recorder side
+#include "RingConcepts.hpp"
+#include "TestConfig.hpp"
+#include "TscClock.hpp"
 
 // Frames discarded at the START by RxThread (NIC/link cold-start, before the Rx is
 // at speed) — never pushed to the histogram, so they never skew the percentiles. At
@@ -75,18 +75,18 @@ inline constexpr std::size_t kOffSrcMac     = 6;
 inline constexpr std::size_t kOffEtherType  = 12;
 inline constexpr std::size_t kOffSeq        = 14;   // uint32, network order
 inline constexpr std::size_t kOffTxStamp    = 18;   // uint64, native (same host)
-inline constexpr std::size_t kFrameMinBytes = kOffTxStamp + sizeof(std::uint64_t);  // 26
+inline constexpr std::size_t kFrameMinBytes = kOffTxStamp + sizeof(std::uint64_t);   // 26
 
 // Unaligned store/load helpers. memcpy with a COMPILE-TIME-CONSTANT size is NOT a
 // function call — GCC/Clang lower it to a single (un)aligned mov, i.e. the exact
 // store/load you would hand-write. This is the correct, optimal idiom; a
 // reinterpret_cast<T*> access is the same speed but UB (strict aliasing + unaligned).
-template<typename T>
+template <typename T>
 [[gnu::always_inline]] inline void storeU(std::uint8_t* p, T v) noexcept {
     std::memcpy(p, &v, sizeof(T));
 }
 
-template<typename T>
+template <typename T>
 [[gnu::always_inline]] inline T loadU(const std::uint8_t* p) noexcept {
     T v;
     std::memcpy(&v, p, sizeof(T));
@@ -127,11 +127,11 @@ struct AntiReplay {
         if (!have) {
             have = true;
             last = seq;
-            return true;                                // first frame sets the baseline
+            return true;   // first frame sets the baseline
         }
         const std::int32_t diff = static_cast<std::int32_t>(seq - last);
         if (diff <= 0) {
-            ++dropped;                                  // stale echo / duplicate / reorder
+            ++dropped;   // stale echo / duplicate / reorder
             return false;
         }
         lost += static_cast<std::uint64_t>(diff - 1);   // 0 if in order, else the gap size
@@ -141,20 +141,23 @@ struct AntiReplay {
 };
 
 // ── Tx: stream frames, each carrying seq + its own send timestamp ────────────
-template<TxRing Tx>
+template <TxRing Tx>
 class TxThread {
 public:
-    TxThread(Shared& sh, Tx& tx) : m_sh(sh), m_tx(tx) {}
+    TxThread(Shared& sh, Tx& tx)
+        : m_sh(sh),
+          m_tx(tx) {
+    }
 
-    void run(std::uint64_t durationCyc, std::stop_token stop) {
+    void run(std::uint64_t durationCyc, const std::stop_token& stop) {
         const TestConfig& cfg = m_sh.cfg;
 
         // Guard a sane frame size (>= 14B hdr + 4B seq + 8B stamp). Also gives GCC
         // the range fact that silences a -Wstringop-overflow false positive on the
         // &tmpl[kOffSrcMac] write below (it otherwise assumes frameSize may be 0).
         if (cfg.frameSize < kFrameMinBytes) {
-            fmt::print(stderr, "[SingleRec/Tx] frame_size {} < {} — aborting\n",
-                       cfg.frameSize, kFrameMinBytes);
+            fmt::print(stderr, "[SingleRec/Tx] frame_size {} < {} — aborting\n", cfg.frameSize,
+                       kFrameMinBytes);
             m_sh.txDone.store(true, std::memory_order_release);
             return;
         }
@@ -171,11 +174,12 @@ public:
         const std::uint64_t intervalNs = static_cast<std::uint64_t>(cfg.sendIntervalUs) * 1000ULL;
         // Split the (constant) interval into whole seconds + remainder once, so the
         // per-send timespec carry is O(1) and correct for intervals >= 1s.
-        const long          paceSec    = static_cast<long>(intervalNs / 1'000'000'000ULL);
-        const long          paceNsec   = static_cast<long>(intervalNs % 1'000'000'000ULL);
-        timespec nextSend{};
-        if (intervalNs > 0)
+        const long paceSec  = static_cast<long>(intervalNs / 1'000'000'000ULL);
+        const long paceNsec = static_cast<long>(intervalNs % 1'000'000'000ULL);
+        timespec   nextSend{};
+        if (intervalNs > 0) {
             clock_gettime(CLOCK_MONOTONIC, &nextSend);
+        }
 
         std::uint32_t       seq   = 0;
         const std::uint64_t start = tsc::now();
@@ -183,23 +187,24 @@ public:
         while (tsc::now() - start < durationCyc && !stop.stop_requested()) {
             // Optional pacing (send_interval_us). 0 => max rate (back-to-back).
             if (intervalNs > 0) {
-                nextSend.tv_sec  += paceSec;
+                nextSend.tv_sec += paceSec;
                 nextSend.tv_nsec += paceNsec;
                 if (nextSend.tv_nsec >= 1'000'000'000L) {   // both addends < 1e9 => at most one carry
-                    nextSend.tv_sec  += 1;
+                    nextSend.tv_sec += 1;
                     nextSend.tv_nsec -= 1'000'000'000L;
                 }
                 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &nextSend, nullptr);
             }
 
             std::uint8_t* dst = m_tx.acquire(cfg.frameSize);
-            if (!dst) [[unlikely]]
+            if (!dst) [[unlikely]] {
                 continue;
+            }
 
             storeU<std::uint32_t>(dst + kOffSeq, htonl(seq));   // seq, network order
 
-            const std::uint64_t t0 = tsc::now();               // send timestamp (in-band)
-            storeU<std::uint64_t>(dst + kOffTxStamp, t0);       // native order (same host)
+            const std::uint64_t t0 = tsc::now();            // send timestamp (in-band)
+            storeU<std::uint64_t>(dst + kOffTxStamp, t0);   // native order (same host)
             m_tx.commit();
             ++seq;
         }
@@ -214,10 +219,13 @@ private:
 };
 
 // ── Rx: verify, stamp arrival, compute latency, push to the SPSC ────────────
-template<RxRing Rx>
+template <RxRing Rx>
 class RxThread {
 public:
-    RxThread(Shared& sh, Rx& rx) : m_sh(sh), m_rx(rx) {}
+    RxThread(Shared& sh, Rx& rx)
+        : m_sh(sh),
+          m_rx(rx) {
+    }
 
     void run() {
         const TestConfig& cfg = m_sh.cfg;
@@ -230,8 +238,8 @@ public:
         std::array<std::uint8_t, 16> hdr = {0};
         std::memcpy(&hdr[kOffDstMac], cfg.server.mac.data(), 6);
         std::memcpy(&hdr[kOffSrcMac], cfg.client.mac.data(), 6);
-        hdr[kOffEtherType]     = static_cast<std::uint8_t>(cfg.etherType >> 8);
-        hdr[kOffEtherType + 1] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
+        hdr[kOffEtherType]           = static_cast<std::uint8_t>(cfg.etherType >> 8);
+        hdr[kOffEtherType + 1]       = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
         const std::uint64_t expHdrLo = loadU<std::uint64_t>(hdr.data() + kOffDstMac);   // bytes 0..7
         const std::uint64_t expHdrHi = loadU<std::uint64_t>(hdr.data() + kOffSrcMac);   // bytes 6..13
 
@@ -242,19 +250,20 @@ public:
         std::uint32_t graceEmpty = 0;
 
         while (true) {
-            RxFrame f = m_rx.tryReceive();
+            const RxFrame f = m_rx.tryReceive();
             if (f.data.empty()) {
                 // After Tx is done, stop once the ring has stayed empty for a
                 // bounded grace window (the last in-flight frames have arrived).
                 if (m_sh.txDone.load(std::memory_order_acquire)) {
-                    if (++graceEmpty >= kGraceEmptyPolls)
+                    if (++graceEmpty >= kGraceEmptyPolls) {
                         break;
+                    }
                 }
                 continue;
             }
             graceEmpty = 0;
 
-            const std::uint64_t t1 = tsc::now();           // arrival timestamp
+            const std::uint64_t t1 = tsc::now();   // arrival timestamp
 
             const std::uint8_t* packet = f.data.data();
 
@@ -270,17 +279,17 @@ public:
             const std::uint64_t hdrLo = loadU<std::uint64_t>(packet + kOffDstMac);   // bytes 0..7
             const std::uint64_t hdrHi = loadU<std::uint64_t>(packet + kOffSrcMac);   // bytes 6..13
             if (((hdrLo ^ expHdrLo) | (hdrHi ^ expHdrHi)) != 0) [[unlikely]] {
-                m_rx.release();                            // not ours — drop
+                m_rx.release();   // not ours — drop
                 continue;
             }
 
             const std::uint32_t seqNet = loadU<std::uint32_t>(packet + kOffSeq);
             const std::uint64_t t0     = loadU<std::uint64_t>(packet + kOffTxStamp);
-            m_rx.release();                                 // done with the buffer
+            m_rx.release();   // done with the buffer
 
             const std::uint32_t seq = ntohl(seqNet);
             if (!gate.accept(seq, lost, dropped)) {
-                continue;                                   // stale / dup / reorder — not recorded
+                continue;   // stale / dup / reorder — not recorded
             }
 
             if (inWarmup(lost, dropped)) {
@@ -295,12 +304,11 @@ public:
 
         // In-band end marker. The SPSC is FIFO, so Hist pops every real sample
         // before this — spin until it fits (Hist is draining, space frees).
-        while (!m_sh.toHist.try_push(kEndSentinel));
+        while (!m_sh.toHist.try_push(kEndSentinel))
+            ;
 
-        fmt::print(stderr,
-                   "[SingleRec/Rx] recorded={} lost={} dropped={} push_fail={}\n",
-                   recorded, lost, dropped,
-                   m_sh.pushFailures.load(std::memory_order_relaxed));
+        fmt::print(stderr, "[SingleRec/Rx] recorded={} lost={} dropped={} push_fail={}\n", recorded, lost,
+                   dropped, m_sh.pushFailures.load(std::memory_order_relaxed));
     }
 
 private:
@@ -310,10 +318,10 @@ private:
             return false;
         }
         if (++m_warmupSeen == kWarmupDiscard) {
-            fmt::print(stderr,
+            fmt::print(
+                stderr,
                 "[SingleRec/Rx] warmup done — recorded={} lost={} dropped={} push_fail={} (counters reset)\n",
-                m_warmupSeen, lost, dropped,
-                m_sh.pushFailures.load(std::memory_order_relaxed));
+                m_warmupSeen, lost, dropped, m_sh.pushFailures.load(std::memory_order_relaxed));
             lost    = 0;
             dropped = 0;
             m_sh.pushFailures.store(0, std::memory_order_relaxed);
@@ -330,19 +338,20 @@ private:
 };
 
 // ── Coordinator: owns the shared surface + the three threads + lifecycle ─────
-template<TxRing Tx, RxRing Rx>
+template <TxRing Tx, RxRing Rx>
 class Bench {
 public:
     Bench(const TestConfig& cfg, Tx& tx, Rx& rx)
         : m_sh(cfg),
           m_tx(m_sh, tx),
           m_rx(m_sh, rx),
-          m_hist(m_sh, cfg.outputPath, cfg.recDurationSec) {}
+          m_hist(m_sh, cfg.outputPath, cfg.recDurationSec) {
+    }
 
-    void run(std::uint64_t durationSec, std::stop_token stop) {
+    void run(std::uint64_t durationSec, const std::stop_token& stop) {
         // Calibrate the TSC once (here, before any thread starts); both the Tx
         // duration bound and the Hist cycles->ns conversion read this rate.
-        m_sh.tscHz = tsc::calibrateHz();
+        m_sh.tscHz                 = tsc::calibrateHz();
         const std::uint64_t durCyc = static_cast<std::uint64_t>(m_sh.tscHz) * durationSec;
 
         // Consumers up first; each thread self-pins to its isolated core (SCHED_OTHER).
@@ -350,11 +359,11 @@ public:
             pinThread(m_sh.cfg.recRecorderCore);
             m_hist.run(stop);
         });
-        m_tRx = std::jthread([this] {
+        m_tRx   = std::jthread([this] {
             pinThread(m_sh.cfg.recRxCore);
             m_rx.run();
         });
-        m_tTx = std::jthread([this, durCyc, stop] {
+        m_tTx   = std::jthread([this, durCyc, stop] {
             pinThread(m_sh.cfg.recHotPathCore);
             m_tx.run(durCyc, stop);
         });

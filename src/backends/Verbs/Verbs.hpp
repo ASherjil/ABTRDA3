@@ -4,22 +4,22 @@
 #ifndef ABTRDA3_VERBS_HPP
 #define ABTRDA3_VERBS_HPP
 
-#include <infiniband/verbs.h>
-#include <infiniband/mlx5dv.h>
-
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
-#include <endian.h>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <dirent.h>
+#include <endian.h>
+
 #include <fmt/core.h>
+#include <infiniband/mlx5dv.h>
+#include <infiniband/verbs.h>
 
 #include "../common/RxFrame.hpp"
 
@@ -124,411 +124,478 @@
 //   * shutdown() order: flow -> QP -> CQs -> MR -> buffer -> PD -> device.
 // =============================================================================
 
-enum class VerbsMode : std::uint8_t { RxOnly, TxOnly, RxTx };
+enum class VerbsMode : std::uint8_t {
+    RxOnly,
+    TxOnly,
+    RxTx
+};
 
-template<VerbsMode M, std::uint8_t PortNum = 1, std::uint16_t SqDepth = 256, std::uint16_t RqDepth = 8192, std::uint16_t SignalEvery = 64, std::uint16_t MaxInline = 128, std::uint16_t MaxFrame = 2048>
+template <VerbsMode M, std::uint8_t PortNum = 1, std::uint16_t SqDepth = 256, std::uint16_t RqDepth = 8192,
+          std::uint16_t SignalEvery = 64, std::uint16_t MaxInline = 128, std::uint16_t MaxFrame = 2048>
 class Verbs {
-  static constexpr bool HAS_RX = (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
-  static constexpr bool HAS_TX = (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
+    static constexpr bool HAS_RX = (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
+    static constexpr bool HAS_TX = (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
-  static_assert((SignalEvery & (SignalEvery - 1)) == 0, "SignalEvery must be a power of two");
-  static_assert(SignalEvery * 4 <= SqDepth, "SQ must hold several signal periods");
+    static_assert((SignalEvery & (SignalEvery - 1)) == 0, "SignalEvery must be a power of two");
+    static_assert(SignalEvery * 4 <= SqDepth, "SQ must hold several signal periods");
 
 public:
-  explicit Verbs(std::string_view ifname) noexcept;
-  ~Verbs();
+    explicit Verbs(std::string_view ifname) noexcept;
+    ~Verbs();
 
-  Verbs(const Verbs&)            = delete;
-  Verbs& operator=(const Verbs&) = delete;
-  Verbs(Verbs&&)                 = delete;
-  Verbs& operator=(Verbs&&)      = delete;
+    Verbs(const Verbs&)            = delete;
+    Verbs& operator=(const Verbs&) = delete;
+    Verbs(Verbs&&)                 = delete;
+    Verbs& operator=(Verbs&&)      = delete;
 
-  [[nodiscard]] bool init() noexcept;
-  void shutdown() noexcept;
+    [[nodiscard]] bool init() noexcept;
+    void               shutdown() noexcept;
 
-  [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept;
+    [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept;
 
-  void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
-      requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
+    void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
+        requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
-  [[nodiscard, gnu::always_inline, gnu::hot]]
-  inline std::uint8_t* acquire(std::uint32_t frameLen) noexcept
-      requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
+    [[nodiscard, gnu::always_inline, gnu::hot]]
+    inline std::uint8_t* acquire(std::uint32_t frameLen) noexcept
+        requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
-  [[gnu::always_inline, gnu::hot]]
-  inline void commit() noexcept
-      requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
+    [[gnu::always_inline, gnu::hot]]
+    inline void commit() noexcept
+        requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
-  [[nodiscard, gnu::always_inline, gnu::hot]]
-  inline bool send(std::span<const std::uint8_t> frame) noexcept
-      requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
+    [[nodiscard, gnu::always_inline, gnu::hot]]
+    inline bool send(std::span<const std::uint8_t> frame) noexcept
+        requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx);
 
-  [[nodiscard, gnu::always_inline, gnu::hot]]
-  inline RxFrame tryReceive() noexcept
-      requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
+    [[nodiscard, gnu::always_inline, gnu::hot]]
+    inline RxFrame tryReceive() noexcept
+        requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
 
-  [[gnu::always_inline, gnu::hot]]
-  inline void release() noexcept
-      requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
+    [[gnu::always_inline, gnu::hot]]
+    inline void release() noexcept
+        requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx);
 
 private:
-  [[gnu::always_inline]] std::uint8_t* rxSlot(std::uint16_t s) const noexcept;
-  void prewriteRq() noexcept;
-  void qpErr(const char* st) const noexcept;
-  [[nodiscard]] static std::string ibdevFromNetdev(const std::string& ifname) noexcept;
-  [[nodiscard]] bool readMac() noexcept;
+    [[nodiscard]] [[gnu::always_inline]] std::uint8_t* rxSlot(std::uint16_t s) const noexcept;
+    void                                               prewriteRq() noexcept;
+    void                                               qpErr(const char* st) const noexcept;
+    [[nodiscard]] static std::string                   ibdevFromNetdev(const std::string& ifname) noexcept;
+    [[nodiscard]] bool                                 readMac() noexcept;
 
-  std::string                 m_ifname;
-  std::array<std::uint8_t, 6> m_mac{};
+    std::string                 m_ifname;
+    std::array<std::uint8_t, 6> m_mac{};
 
-  ibv_context*  m_ctx{nullptr};
-  ibv_pd*       m_pd{nullptr};
-  ibv_cq*       m_sendCq{nullptr};
-  ibv_cq*       m_recvCq{nullptr};
-  ibv_qp*       m_qp{nullptr};
-  ibv_mr*       m_mr{nullptr};
-  ibv_flow*     m_flow{nullptr};
-  std::uint8_t* m_buf{nullptr};
+    ibv_context*  m_ctx{nullptr};
+    ibv_pd*       m_pd{nullptr};
+    ibv_cq*       m_sendCq{nullptr};
+    ibv_cq*       m_recvCq{nullptr};
+    ibv_qp*       m_qp{nullptr};
+    ibv_mr*       m_mr{nullptr};
+    ibv_flow*     m_flow{nullptr};
+    std::uint8_t* m_buf{nullptr};
 
-  std::uint32_t m_maxInline{0};
-  std::uint32_t m_txLen{0};
-  std::uint64_t m_txCount{0};
-  std::uint32_t m_unreaped{0};
-  std::uint16_t m_lastSlot{0};
+    std::uint32_t m_maxInline{0};
+    std::uint32_t m_txLen{0};
+    std::uint64_t m_txCount{0};
+    std::uint32_t m_unreaped{0};
+    std::uint16_t m_lastSlot{0};
 
-  std::uint8_t*               m_cqBuf{nullptr};
-  volatile std::uint32_t*     m_cqDbrec{nullptr};
-  std::uint32_t               m_cqeCnt{0};
-  std::uint32_t               m_cqeSz{0};
-  std::uint32_t               m_cqCi{0};
-  std::uint8_t*               m_rqBuf{nullptr};
-  volatile std::uint32_t*     m_rqDbrec{nullptr};
-  std::uint32_t               m_rqWqeCnt{0};
-  std::uint32_t               m_rqStride{0};
-  std::uint32_t               m_rqHead{0};
+    std::uint8_t*           m_cqBuf{nullptr};
+    volatile std::uint32_t* m_cqDbrec{nullptr};
+    std::uint32_t           m_cqeCnt{0};
+    std::uint32_t           m_cqeSz{0};
+    std::uint32_t           m_cqCi{0};
+    std::uint8_t*           m_rqBuf{nullptr};
+    volatile std::uint32_t* m_rqDbrec{nullptr};
+    std::uint32_t           m_rqWqeCnt{0};
+    std::uint32_t           m_rqStride{0};
+    std::uint32_t           m_rqHead{0};
 };
 
 // =============================================================================
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::Verbs(std::string_view ifname) noexcept
-  : m_ifname{ifname} {}
+    : m_ifname{ifname} {
+}
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::~Verbs() {
-  shutdown();
+    shutdown();
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::init() noexcept {
-  ::setenv("MLX5_SINGLE_THREADED", "1", 0);
-  ::setenv("MLX5_STALL_CQ_POLL",   "0", 0);
+    ::setenv("MLX5_SINGLE_THREADED", "1", 0);
+    ::setenv("MLX5_STALL_CQ_POLL", "0", 0);
 
-  const std::string ibdev = ibdevFromNetdev(m_ifname);
-  if (ibdev.empty()) {
-    fmt::println(stderr, "[Verbs] {}: no RDMA device (mlx5 only — check "
-                         "/sys/class/net/{}/device/infiniband)", m_ifname, m_ifname);
-    return false;
-  }
-  if (!readMac()) return false;
-
-  int num = 0;
-  ibv_device** list = ibv_get_device_list(&num);
-  for (int i = 0; i < num; ++i)
-    if (ibdev == ibv_get_device_name(list[i])) {
-      m_ctx = ibv_open_device(list[i]);
-      break;
+    const std::string ibdev = ibdevFromNetdev(m_ifname);
+    if (ibdev.empty()) {
+        fmt::println(stderr,
+                     "[Verbs] {}: no RDMA device (mlx5 only — check "
+                     "/sys/class/net/{}/device/infiniband)",
+                     m_ifname, m_ifname);
+        return false;
     }
-  ibv_free_device_list(list);
-  if (!m_ctx) {
-    fmt::println(stderr, "[Verbs] {}: open '{}' failed", m_ifname, ibdev);
-    return false;
-  }
+    if (!readMac()) {
+        return false;
+    }
 
-  m_pd = ibv_alloc_pd(m_ctx);
-  if (!m_pd) {
-    fmt::println(stderr, "[Verbs] {}: alloc_pd failed", m_ifname);
-    return false;
-  }
+    int          num  = 0;
+    ibv_device** list = ibv_get_device_list(&num);
+    for (int i = 0; i < num; ++i) {
+        if (ibdev == ibv_get_device_name(list[i])) {
+            m_ctx = ibv_open_device(list[i]);
+            break;
+        }
+    }
+    ibv_free_device_list(list);
+    if (!m_ctx) {
+        fmt::println(stderr, "[Verbs] {}: open '{}' failed", m_ifname, ibdev);
+        return false;
+    }
 
-  m_sendCq = ibv_create_cq(m_ctx, SqDepth, nullptr, nullptr, 0);
-  m_recvCq = ibv_create_cq(m_ctx, RqDepth, nullptr, nullptr, 0);
-  if (!m_sendCq || !m_recvCq) {
-    fmt::println(stderr, "[Verbs] {}: create_cq failed", m_ifname);
-    return false;
-  }
+    m_pd = ibv_alloc_pd(m_ctx);
+    if (!m_pd) {
+        fmt::println(stderr, "[Verbs] {}: alloc_pd failed", m_ifname);
+        return false;
+    }
 
-  const std::size_t bufSize = static_cast<std::size_t>(MaxFrame) * (1 + RqDepth);
-  if (posix_memalign(reinterpret_cast<void**>(&m_buf), 4096, bufSize) != 0) return false;
-  std::memset(m_buf, 0, bufSize);
-  m_mr = ibv_reg_mr(m_pd, m_buf, bufSize, IBV_ACCESS_LOCAL_WRITE);
-  if (!m_mr) {
-    fmt::println(stderr, "[Verbs] {}: reg_mr failed (RLIMIT_MEMLOCK?)", m_ifname);
-    return false;
-  }
+    m_sendCq = ibv_create_cq(m_ctx, SqDepth, nullptr, nullptr, 0);
+    m_recvCq = ibv_create_cq(m_ctx, RqDepth, nullptr, nullptr, 0);
+    if (!m_sendCq || !m_recvCq) {
+        fmt::println(stderr, "[Verbs] {}: create_cq failed", m_ifname);
+        return false;
+    }
 
-  ibv_qp_init_attr qa{};
-  qa.qp_type             = IBV_QPT_RAW_PACKET;
-  qa.send_cq             = m_sendCq;
-  qa.recv_cq             = m_recvCq;
-  qa.cap.max_send_wr     = HAS_TX ? SqDepth : 1;
-  qa.cap.max_recv_wr     = HAS_RX ? RqDepth : 1;
-  qa.cap.max_send_sge    = 1;
-  qa.cap.max_recv_sge    = 1;
-  qa.cap.max_inline_data = HAS_TX ? MaxInline : 0;
-  m_qp = ibv_create_qp(m_pd, &qa);
-  if (!m_qp) {
-    fmt::println(stderr, "[Verbs] {}: create_qp(RAW_PACKET) failed (root/CAP_NET_RAW?)", m_ifname);
-    return false;
-  }
-  m_maxInline = qa.cap.max_inline_data;
+    const std::size_t bufSize = static_cast<std::size_t>(MaxFrame) * (1 + RqDepth);
+    if (posix_memalign(reinterpret_cast<void**>(&m_buf), 4096, bufSize) != 0) {
+        return false;
+    }
+    std::memset(m_buf, 0, bufSize);
+    m_mr = ibv_reg_mr(m_pd, m_buf, bufSize, IBV_ACCESS_LOCAL_WRITE);
+    if (!m_mr) {
+        fmt::println(stderr, "[Verbs] {}: reg_mr failed (RLIMIT_MEMLOCK?)", m_ifname);
+        return false;
+    }
 
-  ibv_qp_attr at{};
-  at.qp_state = IBV_QPS_INIT;
-  at.port_num = PortNum;
-  if (ibv_modify_qp(m_qp, &at, IBV_QP_STATE | IBV_QP_PORT) != 0) {
-    qpErr("INIT");
-    return false;
-  }
-  at = {}; at.qp_state = IBV_QPS_RTR;
-  if (ibv_modify_qp(m_qp, &at, IBV_QP_STATE) != 0) {
-    qpErr("RTR");
-    return false;
-  }
-  if constexpr (HAS_TX) {
-    at = {}; at.qp_state = IBV_QPS_RTS;
+    ibv_qp_init_attr qa{};
+    qa.qp_type             = IBV_QPT_RAW_PACKET;
+    qa.send_cq             = m_sendCq;
+    qa.recv_cq             = m_recvCq;
+    qa.cap.max_send_wr     = HAS_TX ? SqDepth : 1;
+    qa.cap.max_recv_wr     = HAS_RX ? RqDepth : 1;
+    qa.cap.max_send_sge    = 1;
+    qa.cap.max_recv_sge    = 1;
+    qa.cap.max_inline_data = HAS_TX ? MaxInline : 0;
+    m_qp                   = ibv_create_qp(m_pd, &qa);
+    if (!m_qp) {
+        fmt::println(stderr, "[Verbs] {}: create_qp(RAW_PACKET) failed (root/CAP_NET_RAW?)", m_ifname);
+        return false;
+    }
+    m_maxInline = qa.cap.max_inline_data;
+
+    ibv_qp_attr at{};
+    at.qp_state = IBV_QPS_INIT;
+    at.port_num = PortNum;
+    if (ibv_modify_qp(m_qp, &at, IBV_QP_STATE | IBV_QP_PORT) != 0) {
+        qpErr("INIT");
+        return false;
+    }
+    at          = {};
+    at.qp_state = IBV_QPS_RTR;
     if (ibv_modify_qp(m_qp, &at, IBV_QP_STATE) != 0) {
-      qpErr("RTS");
-      return false;
+        qpErr("RTR");
+        return false;
     }
-  }
-
-  if constexpr (HAS_RX) {
-    mlx5dv_obj obj{};
-    mlx5dv_cq  dvcq{};
-    mlx5dv_qp  dvqp{};
-    obj.cq.in  = m_recvCq; obj.cq.out = &dvcq;
-    obj.qp.in  = m_qp;     obj.qp.out = &dvqp;
-    if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_CQ | MLX5DV_OBJ_QP) != 0) {
-      fmt::println(stderr, "[Verbs] {}: mlx5dv_init_obj failed (mlx5 provider required)", m_ifname);
-      return false;
-    }
-    m_cqBuf    = static_cast<std::uint8_t*>(dvcq.buf);
-    m_cqDbrec  = reinterpret_cast<volatile std::uint32_t*>(dvcq.dbrec);
-    m_cqeCnt   = dvcq.cqe_cnt;
-    m_cqeSz    = dvcq.cqe_size;
-    m_rqBuf    = static_cast<std::uint8_t*>(dvqp.rq.buf);
-    m_rqDbrec  = reinterpret_cast<volatile std::uint32_t*>(dvqp.dbrec);
-    m_rqWqeCnt = dvqp.rq.wqe_cnt;
-    m_rqStride = dvqp.rq.stride;
-    if (m_rqWqeCnt < RqDepth || (m_rqWqeCnt & (m_rqWqeCnt - 1)) != 0 ||
-        (m_cqeCnt & (m_cqeCnt - 1)) != 0 || m_rqStride < 16) {
-      fmt::println(stderr, "[Verbs] {}: unexpected ring geometry (rq {} stride {} cq {})",
-                   m_ifname, m_rqWqeCnt, m_rqStride, m_cqeCnt);
-      return false;
+    if constexpr (HAS_TX) {
+        at          = {};
+        at.qp_state = IBV_QPS_RTS;
+        if (ibv_modify_qp(m_qp, &at, IBV_QP_STATE) != 0) {
+            qpErr("RTS");
+            return false;
+        }
     }
 
-    prewriteRq();
-    m_rqHead = RqDepth;
-    std::atomic_thread_fence(std::memory_order_release);
-    m_rqDbrec[0] = htobe32(m_rqHead & 0xffff);
+    if constexpr (HAS_RX) {
+        mlx5dv_obj obj{};
+        mlx5dv_cq  dvcq{};
+        mlx5dv_qp  dvqp{};
+        obj.cq.in  = m_recvCq;
+        obj.cq.out = &dvcq;
+        obj.qp.in  = m_qp;
+        obj.qp.out = &dvqp;
+        if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_CQ | MLX5DV_OBJ_QP) != 0) {
+            fmt::println(stderr, "[Verbs] {}: mlx5dv_init_obj failed (mlx5 provider required)", m_ifname);
+            return false;
+        }
+        m_cqBuf    = static_cast<std::uint8_t*>(dvcq.buf);
+        m_cqDbrec  = reinterpret_cast<volatile std::uint32_t*>(dvcq.dbrec);
+        m_cqeCnt   = dvcq.cqe_cnt;
+        m_cqeSz    = dvcq.cqe_size;
+        m_rqBuf    = static_cast<std::uint8_t*>(dvqp.rq.buf);
+        m_rqDbrec  = reinterpret_cast<volatile std::uint32_t*>(dvqp.dbrec);
+        m_rqWqeCnt = dvqp.rq.wqe_cnt;
+        m_rqStride = dvqp.rq.stride;
+        if (m_rqWqeCnt < RqDepth || (m_rqWqeCnt & (m_rqWqeCnt - 1)) != 0 ||
+            (m_cqeCnt & (m_cqeCnt - 1)) != 0 || m_rqStride < 16) {
+            fmt::println(stderr, "[Verbs] {}: unexpected ring geometry (rq {} stride {} cq {})", m_ifname,
+                         m_rqWqeCnt, m_rqStride, m_cqeCnt);
+            return false;
+        }
 
-    struct { ibv_flow_attr attr; ibv_flow_spec_eth eth; } fr{};
-    fr.attr.type         = IBV_FLOW_ATTR_NORMAL;
-    fr.attr.size         = sizeof(fr);
-    fr.attr.priority     = 0;
-    fr.attr.num_of_specs = 1;
-    fr.attr.port         = PortNum;
-    fr.eth.type          = IBV_FLOW_SPEC_ETH;
-    fr.eth.size          = sizeof(ibv_flow_spec_eth);
-    std::memcpy(fr.eth.val.dst_mac, m_mac.data(), 6);
-    std::memset(fr.eth.mask.dst_mac, 0xFF, 6);
-    m_flow = ibv_create_flow(m_qp, &fr.attr);
-    if (!m_flow) {
-      fmt::println(stderr, "[Verbs] {}: create_flow failed", m_ifname);
-      return false;
+        prewriteRq();
+        m_rqHead = RqDepth;
+        std::atomic_thread_fence(std::memory_order_release);
+        m_rqDbrec[0] = htobe32(m_rqHead & 0xffff);
+
+        struct {
+            ibv_flow_attr     attr;
+            ibv_flow_spec_eth eth;
+        } fr{};
+
+        fr.attr.type         = IBV_FLOW_ATTR_NORMAL;
+        fr.attr.size         = sizeof(fr);
+        fr.attr.priority     = 0;
+        fr.attr.num_of_specs = 1;
+        fr.attr.port         = PortNum;
+        fr.eth.type          = IBV_FLOW_SPEC_ETH;
+        fr.eth.size          = sizeof(ibv_flow_spec_eth);
+        std::memcpy(fr.eth.val.dst_mac, m_mac.data(), 6);
+        std::memset(fr.eth.mask.dst_mac, 0xFF, 6);
+        m_flow = ibv_create_flow(m_qp, &fr.attr);
+        if (!m_flow) {
+            fmt::println(stderr, "[Verbs] {}: create_flow failed", m_ifname);
+            return false;
+        }
     }
-  }
 
-  fmt::println(stderr, "[Verbs] {} ({}) port {} ready — inline {}B, sq {} rq {} signal 1/{}",
-               m_ifname, ibdev, PortNum, m_maxInline, SqDepth, RqDepth, SignalEvery);
-  return true;
+    fmt::println(stderr, "[Verbs] {} ({}) port {} ready — inline {}B, sq {} rq {} signal 1/{}", m_ifname,
+                 ibdev, PortNum, m_maxInline, SqDepth, RqDepth, SignalEvery);
+    return true;
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::shutdown() noexcept {
-  if (m_flow)   {
-    ibv_destroy_flow(m_flow);
-    m_flow = nullptr;
-  }
-  if (m_qp)     {
-    ibv_destroy_qp(m_qp);
-    m_qp = nullptr;
-  }
-  if (m_sendCq) {
-    ibv_destroy_cq(m_sendCq);
-    m_sendCq = nullptr;
-  }
-  if (m_recvCq) {
-    ibv_destroy_cq(m_recvCq);
-    m_recvCq = nullptr;
-  }
-  if (m_mr)     {
-    ibv_dereg_mr(m_mr);
-    m_mr = nullptr;
-  }
-  if (m_buf)    {
-    std::free(m_buf);
-    m_buf = nullptr;
-  }
-  if (m_pd)     {
-    ibv_dealloc_pd(m_pd);
-    m_pd = nullptr;
-  }
-  if (m_ctx)    {
-    ibv_close_device(m_ctx);
-    m_ctx = nullptr;
-  }
+    if (m_flow) {
+        ibv_destroy_flow(m_flow);
+        m_flow = nullptr;
+    }
+    if (m_qp) {
+        ibv_destroy_qp(m_qp);
+        m_qp = nullptr;
+    }
+    if (m_sendCq) {
+        ibv_destroy_cq(m_sendCq);
+        m_sendCq = nullptr;
+    }
+    if (m_recvCq) {
+        ibv_destroy_cq(m_recvCq);
+        m_recvCq = nullptr;
+    }
+    if (m_mr) {
+        ibv_dereg_mr(m_mr);
+        m_mr = nullptr;
+    }
+    if (m_buf) {
+        std::free(m_buf);
+        m_buf = nullptr;
+    }
+    if (m_pd) {
+        ibv_dealloc_pd(m_pd);
+        m_pd = nullptr;
+    }
+    if (m_ctx) {
+        ibv_close_device(m_ctx);
+        m_ctx = nullptr;
+    }
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-std::array<std::uint8_t, 6> Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::macAddress() const noexcept {
-  return m_mac;
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+std::array<std::uint8_t, 6>
+Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::macAddress() const noexcept {
+    return m_mac;
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx) {
-  std::memcpy(m_buf, frameTemplate.data(),
-              std::min<std::size_t>(frameTemplate.size(), MaxFrame));
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::prefillRing(
+    std::span<const std::uint8_t> frameTemplate) noexcept
+    requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx)
+{
+    std::memcpy(m_buf, frameTemplate.data(), std::min<std::size_t>(frameTemplate.size(), MaxFrame));
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::acquire(std::uint32_t frameLen) noexcept requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx) {
-  m_txLen = frameLen;
-  return m_buf;
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::acquire(
+    std::uint32_t frameLen) noexcept
+    requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx)
+{
+    m_txLen = frameLen;
+    return m_buf;
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::commit() noexcept requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx) {
-  ibv_sge sge{ .addr = reinterpret_cast<std::uintptr_t>(m_buf),
-               .length = m_txLen, .lkey = m_mr->lkey };
-  ibv_send_wr wr{};
-  wr.sg_list    = &sge;
-  wr.num_sge    = 1;
-  wr.opcode     = IBV_WR_SEND;
-  wr.send_flags = IBV_SEND_INLINE;
-  if ((++m_txCount & (SignalEvery - 1)) == 0) [[unlikely]] {
-    wr.send_flags |= IBV_SEND_SIGNALED;
-    ++m_unreaped;
-  }
-  ibv_send_wr* bad = nullptr;
-  if (ibv_post_send(m_qp, &wr, &bad) != 0) [[unlikely]]
-    fmt::println(stderr, "[Verbs] {}: post_send failed", m_ifname);
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::commit() noexcept
+    requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx)
+{
+    ibv_sge     sge{.addr = reinterpret_cast<std::uintptr_t>(m_buf), .length = m_txLen, .lkey = m_mr->lkey};
+    ibv_send_wr wr;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot path: every field set below
+    wr.sg_list    = &sge;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_INLINE;
+    if ((++m_txCount & (SignalEvery - 1)) == 0) [[unlikely]] {
+        wr.send_flags |= IBV_SEND_SIGNALED;
+        ++m_unreaped;
+    }
+    ibv_send_wr* bad = nullptr;
+    if (ibv_post_send(m_qp, &wr, &bad) != 0) [[unlikely]] {
+        fmt::println(stderr, "[Verbs] {}: post_send failed", m_ifname);
+    }
 
-  if (m_unreaped >= 2) [[unlikely]] {
-    ibv_wc wc;
-    if (ibv_poll_cq(m_sendCq, 1, &wc) > 0) --m_unreaped;
-    while (m_unreaped >= SqDepth / SignalEvery - 1)
-      if (ibv_poll_cq(m_sendCq, 1, &wc) > 0) --m_unreaped;
-  }
+    if (m_unreaped >= 2) [[unlikely]] {
+        ibv_wc wc;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot path: out-param of ibv_poll_cq
+        if (ibv_poll_cq(m_sendCq, 1, &wc) > 0) {
+            --m_unreaped;
+        }
+        while (m_unreaped >= SqDepth / SignalEvery - 1) {
+            if (ibv_poll_cq(m_sendCq, 1, &wc) > 0) {
+                --m_unreaped;
+            }
+        }
+    }
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::send(std::span<const std::uint8_t> frame) noexcept requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx) {
-  if (frame.size() > m_maxInline || frame.size() > MaxFrame) [[unlikely]] {
-    return false;
-  }
-  auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
-  std::memcpy(dst, frame.data(), frame.size());
-  commit();
-  return true;
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::send(
+    std::span<const std::uint8_t> frame) noexcept
+    requires (M == VerbsMode::TxOnly || M == VerbsMode::RxTx)
+{
+    if (frame.size() > m_maxInline || frame.size() > MaxFrame) [[unlikely]] {
+        return false;
+    }
+    auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
+    std::memcpy(dst, frame.data(), frame.size());
+    commit();
+    return true;
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline RxFrame Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::tryReceive() noexcept requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx) {
-  std::uint8_t* entry = m_cqBuf
-      + static_cast<std::size_t>(m_cqCi & (m_cqeCnt - 1)) * m_cqeSz;
-  auto* cqe = reinterpret_cast<mlx5_cqe64*>(m_cqeSz == 64 ? entry : entry + 64);
-  const std::uint8_t opOwn  = *reinterpret_cast<volatile std::uint8_t*>(&cqe->op_own);
-  const std::uint8_t opcode = opOwn >> 4;
-  const std::uint8_t owner  = ((m_cqCi & m_cqeCnt) != 0) ? 1 : 0;
-  if (opcode == MLX5_CQE_INVALID ||
-      (opOwn & MLX5_CQE_OWNER_MASK) != owner) [[likely]] return {};
-  std::atomic_thread_fence(std::memory_order_acquire);
-  const std::uint16_t slot = be16toh(cqe->wqe_counter) & (RqDepth - 1);
-  if (opcode != MLX5_CQE_RESP_SEND) [[unlikely]] {
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline RxFrame Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::tryReceive() noexcept
+    requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx)
+{
+    std::uint8_t*      entry  = m_cqBuf + static_cast<std::size_t>(m_cqCi & (m_cqeCnt - 1)) * m_cqeSz;
+    auto*              cqe    = reinterpret_cast<mlx5_cqe64*>(m_cqeSz == 64 ? entry : entry + 64);
+    const std::uint8_t opOwn  = *reinterpret_cast<volatile std::uint8_t*>(&cqe->op_own);
+    const std::uint8_t opcode = opOwn >> 4;
+    const std::uint8_t owner  = ((m_cqCi & m_cqeCnt) != 0) ? 1 : 0;
+    if (opcode == MLX5_CQE_INVALID || (opOwn & MLX5_CQE_OWNER_MASK) != owner) [[likely]] {
+        return {};
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const std::uint16_t slot = be16toh(cqe->wqe_counter) & (RqDepth - 1);
+    if (opcode != MLX5_CQE_RESP_SEND) [[unlikely]] {
+        ++m_rqHead;
+        m_rqDbrec[0] = htobe32(m_rqHead & 0xffff);
+        ++m_cqCi;
+        m_cqDbrec[0] = htobe32(m_cqCi & 0xffffff);
+        return {};
+    }
+    m_lastSlot = slot;
+    return {.data = {rxSlot(m_lastSlot), be32toh(cqe->byte_cnt)}, .sec = 0, .nsec = 0, .status = 1};
+}
+
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::release() noexcept
+    requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx)
+{
     ++m_rqHead;
     m_rqDbrec[0] = htobe32(m_rqHead & 0xffff);
     ++m_cqCi;
     m_cqDbrec[0] = htobe32(m_cqCi & 0xffffff);
-    return {};
-  }
-  m_lastSlot = slot;
-  return { .data   = { rxSlot(m_lastSlot), be32toh(cqe->byte_cnt) },
-           .sec    = 0,
-           .nsec   = 0,
-           .status = 1 };
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::release() noexcept requires (M == VerbsMode::RxOnly || M == VerbsMode::RxTx) {
-  ++m_rqHead;
-  m_rqDbrec[0] = htobe32(m_rqHead & 0xffff);
-  ++m_cqCi;
-  m_cqDbrec[0] = htobe32(m_cqCi & 0xffffff);
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+inline std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::rxSlot(
+    std::uint16_t s) const noexcept {
+    return m_buf + static_cast<std::size_t>(MaxFrame) * (1 + s);
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-inline std::uint8_t* Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::rxSlot(std::uint16_t s) const noexcept {
-  return m_buf + static_cast<std::size_t>(MaxFrame) * (1 + s);
-}
-
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::prewriteRq() noexcept {
-  struct DataSeg { std::uint32_t byteCount; std::uint32_t lkey; std::uint64_t addr; };
-  for (std::uint32_t p = 0; p < m_rqWqeCnt; ++p) {
-    const std::uint16_t s = static_cast<std::uint16_t>(p & (RqDepth - 1));
-    auto* seg = reinterpret_cast<DataSeg*>(m_rqBuf + static_cast<std::size_t>(p) * m_rqStride);
-    seg->byteCount = htobe32(MaxFrame);
-    seg->lkey      = htobe32(m_mr->lkey);
-    seg->addr      = htobe64(reinterpret_cast<std::uintptr_t>(rxSlot(s)));
-  }
+    struct DataSeg {
+        std::uint32_t byteCount;
+        std::uint32_t lkey;
+        std::uint64_t addr;
+    };
+
+    for (std::uint32_t p = 0; p < m_rqWqeCnt; ++p) {
+        const std::uint16_t s = static_cast<std::uint16_t>(p & (RqDepth - 1));
+        auto* seg      = reinterpret_cast<DataSeg*>(m_rqBuf + static_cast<std::size_t>(p) * m_rqStride);
+        seg->byteCount = htobe32(MaxFrame);
+        seg->lkey      = htobe32(m_mr->lkey);
+        seg->addr      = htobe64(reinterpret_cast<std::uintptr_t>(rxSlot(s)));
+    }
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::qpErr(const char* st) const noexcept {
-  fmt::println(stderr, "[Verbs] {}: modify_qp -> {} failed", m_ifname, st);
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::qpErr(
+    const char* st) const noexcept {
+    fmt::println(stderr, "[Verbs] {}: modify_qp -> {} failed", m_ifname, st);
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
-std::string Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::ibdevFromNetdev(const std::string& ifname) noexcept {
-  const std::string dir = "/sys/class/net/" + ifname + "/device/infiniband";
-  std::string out;
-  if (DIR* d = opendir(dir.c_str())) {
-    while (dirent* e = readdir(d))
-      if (e->d_name[0] != '.') {
-        out = e->d_name;
-        break;
-      }
-    closedir(d);
-  }
-  return out;
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+std::string Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::ibdevFromNetdev(
+    const std::string& ifname) noexcept {
+    const std::string dir = "/sys/class/net/" + ifname + "/device/infiniband";
+    std::string       out;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) {
+            if (e->d_name[0] != '.') {
+                out = e->d_name;
+                break;
+            }
+        }
+        closedir(d);
+    }
+    return out;
 }
 
-template<VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth, std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
+template <VerbsMode M, std::uint8_t PortNum, std::uint16_t SqDepth, std::uint16_t RqDepth,
+          std::uint16_t SignalEvery, std::uint16_t MaxInline, std::uint16_t MaxFrame>
 bool Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame>::readMac() noexcept {
-  const std::string p = "/sys/class/net/" + m_ifname + "/address";
-  FILE* f = std::fopen(p.c_str(), "r");
-  if (!f) {
-    fmt::println(stderr, "[Verbs] {}: cannot read MAC", m_ifname);
-    return false;
-  }
-  unsigned b[6]{};
-  const int n = std::fscanf(f, "%x:%x:%x:%x:%x:%x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]);
-  std::fclose(f);
-  if (n != 6) return false;
-  for (int i = 0; i < 6; ++i) m_mac[i] = static_cast<std::uint8_t>(b[i]);
-  return true;
+    const std::string p = "/sys/class/net/" + m_ifname + "/address";
+    FILE*             f = std::fopen(p.c_str(), "r");
+    if (!f) {
+        fmt::println(stderr, "[Verbs] {}: cannot read MAC", m_ifname);
+        return false;
+    }
+    unsigned  b[6]{};
+    const int n = std::fscanf(f, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+    std::fclose(f);
+    if (n != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) {
+        m_mac[i] = static_cast<std::uint8_t>(b[i]);
+    }
+    return true;
 }
 
-#endif // ABTRDA3_VERBS_HPP
+#endif   // ABTRDA3_VERBS_HPP

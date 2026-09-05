@@ -3,26 +3,27 @@
 
 #pragma once
 
-#include "RingConcepts.hpp"
-#include "TestConfig.hpp"
-#include "HistThread.hpp"
-#include "SingleRecorder.hpp"
-#include "Profiling.hpp"
-
-#include <fmt/core.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <atomic>
 #include <optional>
 #include <stop_token>
 #include <thread>
 #include <vector>
 
+#include <fmt/core.h>
+
+#include "HistThread.hpp"
+#include "Profiling.hpp"
+#include "RingConcepts.hpp"
+#include "SingleRecorder.hpp"
+#include "TestConfig.hpp"
+
 inline constexpr bool kapplyCTPIOFence = true;
 
-template<TxRing Tx, RxRing Rx>
-inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop) {
-    std::uint64_t packet_count = 0;
+template <TxRing Tx, RxRing Rx>
+inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_token& stop) {
+    std::uint64_t                           packet_count = 0;
     [[maybe_unused]] prof::CycleStats reflectStats;   // debug-only; gated, elided in release
 
     std::vector<std::uint8_t> tmpl(cfg.frameSize, 0);
@@ -32,9 +33,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     tmpl[13] = static_cast<std::uint8_t>(cfg.etherType & 0xFF);
     tx.prefillRing(tmpl);
 
-    constexpr bool kHwTs = requires (Tx& t) {
-        t.hwTurnaround();
-    };
+    constexpr bool                    kHwTs = requires (Tx& t) { t.hwTurnaround(); };
     std::optional<Shared>       sh;
     std::optional<HistThread>   hist;
     std::optional<std::jthread> tHist;
@@ -58,8 +57,8 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     bool stopping = false;
     while (!stopping) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
-            RxFrame rxf = rx.tryReceive();
-            if (rxf.data.empty()){
+            const RxFrame rxf = rx.tryReceive();
+            if (rxf.data.empty()) {
                 continue;
             }
 
@@ -72,7 +71,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
             // Zero-copy: write directly into TX ring slot
             std::uint8_t* dst = tx.acquire(cfg.frameSize);
             while (!dst) {
-                if (stop.stop_requested())[[unlikely]]{
+                if (stop.stop_requested()) [[unlikely]] {
                     rx.release();
                     stopping = true;
                     break;
@@ -85,7 +84,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
 
             std::memcpy(dst + 14, &rxf.data[14], 12);
 
-            if constexpr(kapplyCTPIOFence) {
+            if constexpr (kapplyCTPIOFence) {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
             }
 
@@ -112,7 +111,8 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
     }
 
     if constexpr (kHwTs) {
-        while (!sh->toHist.try_push(kEndSentinel));
+        while (!sh->toHist.try_push(kEndSentinel))
+            ;
         tHist->join();
     }
 
@@ -121,7 +121,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         reflectStats.report("server reflect (rx->tx)", prof::tscHz());
     }
     if constexpr (kHwTs) {
-        fmt::print(stderr, "[Server] hw_ts warmup_discarded={} push_fail={}\n",
-                   hwWarmup, sh->pushFailures.load(std::memory_order_relaxed));
+        fmt::print(stderr, "[Server] hw_ts warmup_discarded={} push_fail={}\n", hwWarmup,
+                   sh->pushFailures.load(std::memory_order_relaxed));
     }
 }

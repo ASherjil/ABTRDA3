@@ -3,13 +3,13 @@
 
 #pragma once
 
-#include "RingConcepts.hpp"
-#include "TestConfig.hpp"
-
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <stop_token>
+
+#include "RingConcepts.hpp"
+#include "TestConfig.hpp"
 
 // =============================================================================
 // RX-only packet sink
@@ -19,20 +19,20 @@
 // Runs until watchdog timeout or SIGINT.
 // =============================================================================
 
-template<RxRing Rx>
-inline void run_rxsink(Rx& rx, const TestConfig& cfg, std::stop_token stop) {
+template <RxRing Rx>
+inline void run_rxsink(Rx& rx, const TestConfig& cfg, const std::stop_token& stop) {
     std::uint64_t accepted = 0;
     std::uint64_t rejected = 0;
 
     // Our MAC — check if incoming packets are addressed to us
-    const auto& ourMac = cfg.server.mac;  // RxSink runs as "server" role
+    const auto& ourMac = cfg.server.mac;   // RxSink runs as "server" role
 
     timespec t_start{};
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     while (true) {
         for (std::uint32_t i = 0; i < 65536; ++i) {
-            RxFrame rxf = rx.tryReceive();
+            const RxFrame rxf = rx.tryReceive();
             if (rxf.data.empty()) [[likely]] {
                 continue;
             }
@@ -46,14 +46,16 @@ inline void run_rxsink(Rx& rx, const TestConfig& cfg, std::stop_token stop) {
 
             rx.release();
         }
-        if (stop.stop_requested()) break;
+        if (stop.stop_requested()) {
+            break;
+        }
     }
 
     timespec t_end{};
     clock_gettime(CLOCK_MONOTONIC, &t_end);
-    double elapsed_s = static_cast<double>(t_end.tv_sec - t_start.tv_sec)
-                     + static_cast<double>(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
-    double pps = (elapsed_s > 0) ? static_cast<double>(accepted) / elapsed_s : 0;
+    const double elapsed_s = static_cast<double>(t_end.tv_sec - t_start.tv_sec) +
+                             static_cast<double>(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+    const double pps = (elapsed_s > 0) ? static_cast<double>(accepted) / elapsed_s : 0;
 
     std::printf("\n=== RX Sink Results ===\n");
     std::printf("Accepted: %lu packets (dst MAC match + size OK)\n", accepted);

@@ -15,43 +15,45 @@
 //
 #pragma once
 
-#include "BackendBase.hpp"   // ABTEdge — sysfs-resource0 MMIO (for the i40e ITR read)
-
-#include <fmt/core.h>
-
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <fmt/core.h>
+
+#include "BackendBase.hpp"   // ABTEdge — sysfs-resource0 MMIO (for the i40e ITR read)
+
 namespace pci {
 
 // basename of a sysfs symlink target (".../0000:01:00.1" -> "0000:01:00.1").
 // Empty if the path is not a symlink / does not exist.
 [[nodiscard]] inline std::string readlinkBasename(const std::string& path) noexcept {
-  char buf[256];
-  const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
-  if (n <= 0) return {};
-  buf[n] = '\0';
-  std::string s(buf);
-  const auto pos = s.find_last_of('/');
-  return pos == std::string::npos ? s : s.substr(pos + 1);
+    char          buf[256];
+    const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        return {};
+    }
+    buf[n] = '\0';
+    const std::string s(buf);
+    const auto        pos = s.find_last_of('/');
+    return pos == std::string::npos ? s : s.substr(pos + 1);
 }
 
 // Interface name -> PCI BDF, via /sys/class/net/<if>/device. Empty if the netdev
 // doesn't exist (e.g. already bound to vfio-pci) or isn't backed by a PCI device.
 [[nodiscard]] inline std::string resolveBdf(std::string_view ifname) noexcept {
-  return readlinkBasename("/sys/class/net/" + std::string(ifname) + "/device");
+    return readlinkBasename("/sys/class/net/" + std::string(ifname) + "/device");
 }
 
 // The driver currently bound to a PCI device (basename of its driver symlink),
 // or empty if the device is bound to no driver.
 [[nodiscard]] inline std::string currentDriver(std::string_view bdf) noexcept {
-  return readlinkBasename("/sys/bus/pci/devices/" + std::string(bdf) + "/driver");
+    return readlinkBasename("/sys/bus/pci/devices/" + std::string(bdf) + "/driver");
 }
 
 // Size of a PCI BAR (in bytes) for the given device, read from
@@ -59,18 +61,25 @@ namespace pci {
 //   0xSTART 0xEND 0xFLAGS
 // Size = END - START + 1, or 0 if the BAR is unused. Returns 0 on any error.
 [[nodiscard]] inline std::size_t barSize(std::string_view bdf, int barIndex) noexcept {
-  std::string path = "/sys/bus/pci/devices/" + std::string(bdf) + "/resource";
-  std::FILE* f = std::fopen(path.c_str(), "r");
-  if (!f) return 0;
-  char line[160]{};
-  for (int i = 0; i <= barIndex; ++i) {
-    if (!std::fgets(line, sizeof(line), f)) { std::fclose(f); return 0; }
-  }
-  std::fclose(f);
-  unsigned long long start = 0, end = 0;
-  if (std::sscanf(line, "%llx %llx", &start, &end) == 2 && end >= start && start != 0)
-    return static_cast<std::size_t>(end - start + 1ULL);
-  return 0;
+    const std::string path = "/sys/bus/pci/devices/" + std::string(bdf) + "/resource";
+    std::FILE*        f    = std::fopen(path.c_str(), "r");
+    if (!f) {
+        return 0;
+    }
+    char line[160]{};
+    for (int i = 0; i <= barIndex; ++i) {
+        if (!std::fgets(line, sizeof(line), f)) {
+            std::fclose(f);
+            return 0;
+        }
+    }
+    std::fclose(f);
+    unsigned long long start = 0;
+    unsigned long long end   = 0;
+    if (std::sscanf(line, "%llx %llx", &start, &end) == 2 && end >= start && start != 0) {
+        return static_cast<std::size_t>(end - start + 1ULL);
+    }
+    return 0;
 }
 
 // Derive a PCI BDF from a systemd "predictable" interface name
@@ -81,29 +90,44 @@ namespace pci {
 // matching PCI device exists. Empty if the name isn't the enp form or no device
 // matches.
 [[nodiscard]] inline std::string bdfFromName(std::string_view ifname) noexcept {
-  if (ifname.size() < 5 || ifname[0] != 'e' || ifname[1] != 'n' || ifname[2] != 'p')
-    return {};
-  std::size_t i = 3;
-  auto readDec = [&](unsigned& out) -> bool {
-    const std::size_t start = i;
-    out = 0;
-    while (i < ifname.size() && ifname[i] >= '0' && ifname[i] <= '9')
-      out = out * 10u + static_cast<unsigned>(ifname[i++] - '0');
-    return i > start;
-  };
-  unsigned bus = 0, dev = 0, func = 0;
-  if (!readDec(bus)) return {};
-  if (i >= ifname.size() || ifname[i] != 's') return {};
-  ++i;
-  if (!readDec(dev)) return {};
-  if (i < ifname.size() && ifname[i] == 'f') { ++i; if (!readDec(func)) return {}; }
+    if (ifname.size() < 5 || ifname[0] != 'e' || ifname[1] != 'n' || ifname[2] != 'p') {
+        return {};
+    }
+    std::size_t i       = 3;
+    auto        readDec = [&](unsigned& out) -> bool {
+        const std::size_t start = i;
+        out                     = 0;
+        while (i < ifname.size() && ifname[i] >= '0' && ifname[i] <= '9') {
+            out = out * 10u + static_cast<unsigned>(ifname[i++] - '0');
+        }
+        return i > start;
+    };
+    unsigned bus  = 0;
+    unsigned dev  = 0;
+    unsigned func = 0;
+    if (!readDec(bus)) {
+        return {};
+    }
+    if (i >= ifname.size() || ifname[i] != 's') {
+        return {};
+    }
+    ++i;
+    if (!readDec(dev)) {
+        return {};
+    }
+    if (i < ifname.size() && ifname[i] == 'f') {
+        ++i;
+        if (!readDec(func)) {
+            return {};
+        }
+    }
 
-  char bdf[16];
-  std::snprintf(bdf, sizeof(bdf), "0000:%02x:%02x.%x",
-                bus & 0xffu, dev & 0xffu, func & 0xfu);
-  if (::access((std::string("/sys/bus/pci/devices/") + bdf).c_str(), F_OK) != 0)
-    return {};
-  return bdf;
+    char bdf[16];
+    std::snprintf(bdf, sizeof(bdf), "0000:%02x:%02x.%x", bus & 0xffu, dev & 0xffu, func & 0xfu);
+    if (::access((std::string("/sys/bus/pci/devices/") + bdf).c_str(), F_OK) != 0) {
+        return {};
+    }
+    return bdf;
 }
 
 // ── i40e Interrupt Throttle Rate verification ────────────────────────────────
@@ -135,15 +159,15 @@ namespace pci {
 //     writes BOTH to be safe; the 30->9us win came from ITR0.)
 // So the verdict below keys on ITRN for the kernel path and reports ITR0 as
 // informational. A NONZERO ITRN is the real "RX throttle still active" signal.
-inline constexpr std::size_t   I40E_PFINT_ITR0_0     = 0x00038000;
-inline constexpr std::size_t   I40E_PFINT_ITRN_0_0   = 0x00030000;
+inline constexpr std::size_t   I40E_PFINT_ITR0_0      = 0x00038000;
+inline constexpr std::size_t   I40E_PFINT_ITRN_0_0    = 0x00030000;
 inline constexpr std::uint32_t I40E_ITR_INTERVAL_MASK = 0xFFF;
 
 // True if the device backing `ifname` is currently bound to the kernel i40e
 // driver (the AF_XDP / packet_mmap path). False for vfio-pci (DPDK) or non-i40e.
 [[nodiscard]] inline bool boundToI40e(std::string_view ifname) noexcept {
-  const std::string bdf = resolveBdf(ifname);
-  return !bdf.empty() && currentDriver(bdf) == "i40e";
+    const std::string bdf = resolveBdf(ifname);
+    return !bdf.empty() && currentDriver(bdf) == "i40e";
 }
 
 // Read and print the live ITR registers for the NIC backing `ifname`. `tag`
@@ -156,40 +180,41 @@ inline constexpr std::uint32_t I40E_ITR_INTERVAL_MASK = 0xFFF;
 // be re-derived from its name — only enp<bus>s<dev>f<func> can. Callers that already hold the
 // BDF (dispatch resolves it pre-unbind) must pass it, or this silently reports nothing.
 inline bool reportItr(const std::string& bdf, std::string_view ifname, const char* tag) {
-  if (bdf.empty()) {
-    fmt::print(stderr, "[{}] {}: cannot resolve PCI BDF\n", tag, ifname);
-    return false;
-  }
+    if (bdf.empty()) {
+        fmt::print(stderr, "[{}] {}: cannot resolve PCI BDF\n", tag, ifname);
+        return false;
+    }
 
-  const std::size_t bar0Size = barSize(bdf, 0);
-  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
-  BackendBase bar0;
-  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
-    fmt::print(stderr, "[{}] {} ({}): resource0 mmap failed (need root?)\n",
-               tag, ifname, bdf);
-    return false;
-  }
+    const std::size_t bar0Size = barSize(bdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+    BackendBase       bar0;
+    if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+        fmt::print(stderr, "[{}] {} ({}): resource0 mmap failed (need root?)\n", tag, ifname, bdf);
+        return false;
+    }
 
-  const std::uint32_t itr0 = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
-  const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
-  const std::uint32_t itr0Int = itr0 & I40E_ITR_INTERVAL_MASK;
-  const std::uint32_t itrnInt = itrn & I40E_ITR_INTERVAL_MASK;
-  const bool rxThrottleOff = (itrnInt == 0);   // ITRN = our data-queue RX ITR
+    const std::uint32_t itr0          = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
+    const std::uint32_t itrn          = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
+    const std::uint32_t itr0Int       = itr0 & I40E_ITR_INTERVAL_MASK;
+    const std::uint32_t itrnInt       = itrn & I40E_ITR_INTERVAL_MASK;
+    const bool          rxThrottleOff = (itrnInt == 0);   // ITRN = our data-queue RX ITR
 
-  fmt::print(stderr,
-    "[{}] {} ({}): PFINT_ITRN(data-RX)=0x{:08x} ({}us) PFINT_ITR0(misc)=0x{:08x} ({}us) "
-    "=> RX path {}\n",
-    tag, ifname, bdf, itrn, itrnInt * 2u, itr0, itr0Int * 2u,
-    rxThrottleOff ? "UNTHROTTLED (ITRN=0)" : "THROTTLED (ITRN nonzero!)");
-  return rxThrottleOff;
+    fmt::print(stderr,
+               "[{}] {} ({}): PFINT_ITRN(data-RX)=0x{:08x} ({}us) PFINT_ITR0(misc)=0x{:08x} ({}us) "
+               "=> RX path {}\n",
+               tag, ifname, bdf, itrn, itrnInt * 2u, itr0, itr0Int * 2u,
+               rxThrottleOff ? "UNTHROTTLED (ITRN=0)" : "THROTTLED (ITRN nonzero!)");
+    return rxThrottleOff;
 }
 
 // Name-only convenience for the KERNEL paths (AF_XDP / packet_mmap), where the netdev still
 // exists so the BDF is resolvable. Do NOT use it after a vfio unbind.
 inline bool reportItr(std::string_view ifname, const char* tag) {
-  std::string bdf = resolveBdf(ifname);       // kernel driver: netdev present
-  if (bdf.empty()) bdf = bdfFromName(ifname); // enp<bus>s<dev>f<func> only
-  return reportItr(bdf, ifname, tag);
+    std::string bdf = resolveBdf(ifname);   // kernel driver: netdev present
+    if (bdf.empty()) {
+        bdf = bdfFromName(ifname);   // enp<bus>s<dev>f<func> only
+    }
+    return reportItr(bdf, ifname, tag);
 }
 
 // ── Driver-specific BAR0 fixes (applied by the DISPATCH layer) ───────────────
@@ -212,28 +237,30 @@ inline bool reportItr(std::string_view ifname, const char* tag) {
 // adaptive ITR could re-arm). Without this the i40e RTT is ~5x slower
 // (ITR-gated ~50us vs ~10us).
 inline bool i40eClearItr(const std::string& bdf, std::string_view ifname) noexcept {
-  if (bdf.empty()) {
-    fmt::print(stderr, "[PCI] {}: no BDF — i40e ITR not cleared, expect ~30us+ median RTT\n",
-               ifname);
-    return false;
-  }
-  const std::size_t bar0Size = barSize(bdf, 0);
-  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
-  BackendBase bar0;
-  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
-    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — i40e ITR not cleared, "
-                       "expect ~30us+ median RTT\n", ifname, bdf);
-    return false;
-  }
-  *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0)   = 0;
-  *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0) = 0;
-  const std::uint32_t itr0 = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
-  const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
-  const bool off = ((itr0 | itrn) & I40E_ITR_INTERVAL_MASK) == 0;
-  fmt::print(stderr, "[PCI] {} ({}): i40e ITR cleared (ITR0=0x{:08x} ITRN=0x{:08x}) "
-                     "=> RX write-back {}\n",
-             ifname, bdf, itr0, itrn, off ? "UNTHROTTLED" : "STILL THROTTLED!");
-  return off;
+    if (bdf.empty()) {
+        fmt::print(stderr, "[PCI] {}: no BDF — i40e ITR not cleared, expect ~30us+ median RTT\n", ifname);
+        return false;
+    }
+    const std::size_t bar0Size = barSize(bdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+    BackendBase       bar0;
+    if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+        fmt::print(stderr,
+                   "[PCI] {} ({}): resource0 mmap failed — i40e ITR not cleared, "
+                   "expect ~30us+ median RTT\n",
+                   ifname, bdf);
+        return false;
+    }
+    *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0)   = 0;
+    *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0) = 0;
+    const std::uint32_t itr0 = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITR0_0);
+    const std::uint32_t itrn = *bar0.registerPtr<std::uint32_t>(I40E_PFINT_ITRN_0_0);
+    const bool          off  = ((itr0 | itrn) & I40E_ITR_INTERVAL_MASK) == 0;
+    fmt::print(stderr,
+               "[PCI] {} ({}): i40e ITR cleared (ITR0=0x{:08x} ITRN=0x{:08x}) "
+               "=> RX write-back {}\n",
+               ifname, bdf, itr0, itrn, off ? "UNTHROTTLED" : "STILL THROTTLED!");
+    return off;
 }
 
 // i40e: switch the bound RX queues to NoITR (QINT_RQCTL.ITR_INDX = 3).
@@ -281,105 +308,121 @@ inline bool i40eClearItr(const std::string& bdf, std::string_view ifname) noexce
 // found NOTHING on the kernel path (native AF_XDP / DPDK-over-AF_XDP). What actually rejects
 // 0xDEADBEEF is reserved bit 31 (set in it, clear in every real value); NEXTQ_TYPE=3
 // (UNKNOWN, also set in it) is a second, independent guard.
-inline constexpr std::size_t   I40E_QINT_RQCTL_BASE  = 0x0003A000;
-inline constexpr std::size_t   I40E_QINT_RQCTL_COUNT = 1536;        // _Q = 0..1535
-inline constexpr std::uint32_t I40E_ITR_INDX_SHIFT   = 11;
-inline constexpr std::uint32_t I40E_ITR_INDX_MASK    = 0x3u << I40E_ITR_INDX_SHIFT;
-inline constexpr std::uint32_t I40E_CAUSE_ENA_MASK   = 0x1u << 30;
-inline constexpr std::uint32_t I40E_NEXTQ_TYPE_SHIFT = 27;
-inline constexpr std::uint32_t I40E_NEXTQ_TYPE_MASK  = 0x3u << I40E_NEXTQ_TYPE_SHIFT;
-inline constexpr std::uint32_t I40E_QUEUE_TYPE_UNKNOWN = 3;         // i40e_type.h:229
-inline constexpr std::uint32_t I40E_RQCTL_RSVD_MASK  = 0x1u << 31;
-inline constexpr std::uint32_t I40E_ITR_INDEX_NONE   = 3;
-inline constexpr std::uint32_t I40E_REG_UNIMPL       = 0xDEADBEEFu;
+inline constexpr std::size_t   I40E_QINT_RQCTL_BASE    = 0x0003A000;
+inline constexpr std::size_t   I40E_QINT_RQCTL_COUNT   = 1536;   // _Q = 0..1535
+inline constexpr std::uint32_t I40E_ITR_INDX_SHIFT     = 11;
+inline constexpr std::uint32_t I40E_ITR_INDX_MASK      = 0x3u << I40E_ITR_INDX_SHIFT;
+inline constexpr std::uint32_t I40E_CAUSE_ENA_MASK     = 0x1u << 30;
+inline constexpr std::uint32_t I40E_NEXTQ_TYPE_SHIFT   = 27;
+inline constexpr std::uint32_t I40E_NEXTQ_TYPE_MASK    = 0x3u << I40E_NEXTQ_TYPE_SHIFT;
+inline constexpr std::uint32_t I40E_QUEUE_TYPE_UNKNOWN = 3;   // i40e_type.h:229
+inline constexpr std::uint32_t I40E_RQCTL_RSVD_MASK    = 0x1u << 31;
+inline constexpr std::uint32_t I40E_ITR_INDEX_NONE     = 3;
+inline constexpr std::uint32_t I40E_REG_UNIMPL         = 0xDEADBEEFu;
 
 // A real driver-written QINT_RQCTL, on EITHER stack: bound (CAUSE_ENA), reserved bit clear,
 // a valid NEXTQ_TYPE (RX/TX/PE_CEQ — not UNKNOWN), and not an unbacked-read signature.
 [[nodiscard]] inline bool i40eIsBoundRxQueue(std::uint32_t v) noexcept {
-  if (v == I40E_REG_UNIMPL || v == 0xFFFFFFFFu) return false;
-  if ((v & I40E_CAUSE_ENA_MASK) == 0)           return false;
-  if ((v & I40E_RQCTL_RSVD_MASK) != 0)          return false;
-  if (((v & I40E_NEXTQ_TYPE_MASK) >> I40E_NEXTQ_TYPE_SHIFT) == I40E_QUEUE_TYPE_UNKNOWN)
-    return false;
-  return true;
+    if (v == I40E_REG_UNIMPL || v == 0xFFFFFFFFu) {
+        return false;
+    }
+    if ((v & I40E_CAUSE_ENA_MASK) == 0) {
+        return false;
+    }
+    if ((v & I40E_RQCTL_RSVD_MASK) != 0) {
+        return false;
+    }
+    if (((v & I40E_NEXTQ_TYPE_MASK) >> I40E_NEXTQ_TYPE_SHIFT) == I40E_QUEUE_TYPE_UNKNOWN) {
+        return false;
+    }
+    return true;
 }
 
 inline bool i40eSetNoItr(const std::string& bdf, std::string_view ifname) noexcept {
-  if (bdf.empty()) {
-    fmt::print(stderr, "[PCI] {}: no BDF — i40e NoITR not applied\n", ifname);
-    return false;
-  }
-  const std::size_t bar0Size = barSize(bdf, 0);
-  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
-  BackendBase bar0;
-  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
-    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — i40e NoITR not applied\n",
-               ifname, bdf);
-    return false;
-  }
-
-  // Clamp the scan to what BAR0 actually maps.
-  std::size_t count = I40E_QINT_RQCTL_COUNT;
-  if (bar0Size < I40E_QINT_RQCTL_BASE + count * 4) {
-    if (bar0Size <= I40E_QINT_RQCTL_BASE) {
-      fmt::print(stderr, "[PCI] {} ({}): BAR0 too small for QINT_RQCTL — NoITR not applied\n",
-                 ifname, bdf);
-      return false;
+    if (bdf.empty()) {
+        fmt::print(stderr, "[PCI] {}: no BDF — i40e NoITR not applied\n", ifname);
+        return false;
     }
-    count = (bar0Size - I40E_QINT_RQCTL_BASE) / 4;
-  }
-
-  unsigned      patched = 0;
-  unsigned      failed  = 0;
-  std::size_t   firstQ  = 0;
-  std::uint32_t firstBefore = 0;
-  std::uint32_t firstAfter  = 0;
-  for (std::size_t q = 0; q < count; ++q) {
-    auto* reg = bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
-    const std::uint32_t before = *reg;
-    if (!i40eIsBoundRxQueue(before)) continue;           // unbacked offset, or queue not bound
-    const std::uint32_t want = (before & ~I40E_ITR_INDX_MASK)
-                             | (I40E_ITR_INDEX_NONE << I40E_ITR_INDX_SHIFT);
-    *reg = want;
-    const std::uint32_t after = *reg;                    // read back: did the write land?
-    if (patched + failed == 0) {
-      firstQ      = q;
-      firstBefore = before;
-      firstAfter  = after;
+    const std::size_t bar0Size = barSize(bdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+    BackendBase       bar0;
+    if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+        fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — i40e NoITR not applied\n", ifname, bdf);
+        return false;
     }
-    ((after & I40E_ITR_INDX_MASK) == I40E_ITR_INDX_MASK) ? ++patched : ++failed;
-  }
 
-  if (patched == 0 && failed == 0) {
-    // Self-diagnosing miss: dump what the scan actually saw, so a validator that is wrong for
-    // some future driver says WHY instead of just failing (this is how the kernel path's
-    // NEXTQ_TYPE=TX was found). Skip zeros (unbound) and the unbacked-read signatures.
-    fmt::print(stderr, "[PCI] {} ({}): i40e NoITR NOT applied — no bound RX queue in "
-                       "QINT_RQCTL. Non-empty entries seen:\n", ifname, bdf);
-    unsigned shown = 0;
-    for (std::size_t q = 0; q < count && shown < 6; ++q) {
-      const std::uint32_t v = *bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
-      if (v == 0 || v == I40E_REG_UNIMPL || v == 0xFFFFFFFFu) continue;
-      fmt::print(stderr, "[PCI]   q={} 0x{:08x} (cause_ena={} nextq_type={} itr_indx={} "
-                         "msix={} rsvd31={})\n",
-                 q, v, (v & I40E_CAUSE_ENA_MASK) ? 1 : 0,
-                 (v & I40E_NEXTQ_TYPE_MASK) >> I40E_NEXTQ_TYPE_SHIFT,
-                 (v & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT,
-                 v & 0xFFu, (v & I40E_RQCTL_RSVD_MASK) ? 1 : 0);
-      ++shown;
+    // Clamp the scan to what BAR0 actually maps.
+    std::size_t count = I40E_QINT_RQCTL_COUNT;
+    if (bar0Size < I40E_QINT_RQCTL_BASE + count * 4) {
+        if (bar0Size <= I40E_QINT_RQCTL_BASE) {
+            fmt::print(stderr, "[PCI] {} ({}): BAR0 too small for QINT_RQCTL — NoITR not applied\n", ifname,
+                       bdf);
+            return false;
+        }
+        count = (bar0Size - I40E_QINT_RQCTL_BASE) / 4;
     }
-    if (shown == 0) fmt::print(stderr, "[PCI]   (none — every entry was 0 or unbacked)\n");
-    return false;
-  }
-  if (failed != 0) {
-    fmt::print(stderr, "[PCI] {} ({}): i40e NoITR REFUSED on {} of {} RX queue(s) — RX "
-                       "write-back is STILL ITR-gated\n",
-               ifname, bdf, failed, patched + failed);
-    return false;
-  }
-  fmt::print(stderr, "[PCI] {} ({}): i40e NoITR on {} RX queue(s) (q{}: 0x{:08x} -> 0x{:08x})\n",
-             ifname, bdf, patched, firstQ, firstBefore, firstAfter);
-  return true;
+
+    unsigned      patched     = 0;
+    unsigned      failed      = 0;
+    std::size_t   firstQ      = 0;
+    std::uint32_t firstBefore = 0;
+    std::uint32_t firstAfter  = 0;
+    for (std::size_t q = 0; q < count; ++q) {
+        auto*               reg    = bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
+        const std::uint32_t before = *reg;
+        if (!i40eIsBoundRxQueue(before)) {
+            continue;   // unbacked offset, or queue not bound
+        }
+        const std::uint32_t want = (before & ~I40E_ITR_INDX_MASK) |
+                                   (I40E_ITR_INDEX_NONE << I40E_ITR_INDX_SHIFT);
+        *reg                      = want;
+        const std::uint32_t after = *reg;   // read back: did the write land?
+        if (patched + failed == 0) {
+            firstQ      = q;
+            firstBefore = before;
+            firstAfter  = after;
+        }
+        ((after & I40E_ITR_INDX_MASK) == I40E_ITR_INDX_MASK) ? ++patched : ++failed;
+    }
+
+    if (patched == 0 && failed == 0) {
+        // Self-diagnosing miss: dump what the scan actually saw, so a validator that is wrong for
+        // some future driver says WHY instead of just failing (this is how the kernel path's
+        // NEXTQ_TYPE=TX was found). Skip zeros (unbound) and the unbacked-read signatures.
+        fmt::print(stderr,
+                   "[PCI] {} ({}): i40e NoITR NOT applied — no bound RX queue in "
+                   "QINT_RQCTL. Non-empty entries seen:\n",
+                   ifname, bdf);
+        unsigned shown = 0;
+        for (std::size_t q = 0; q < count && shown < 6; ++q) {
+            const std::uint32_t v = *bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
+            if (v == 0 || v == I40E_REG_UNIMPL || v == 0xFFFFFFFFu) {
+                continue;
+            }
+            fmt::print(stderr,
+                       "[PCI]   q={} 0x{:08x} (cause_ena={} nextq_type={} itr_indx={} "
+                       "msix={} rsvd31={})\n",
+                       q, v, (v & I40E_CAUSE_ENA_MASK) ? 1 : 0,
+                       (v & I40E_NEXTQ_TYPE_MASK) >> I40E_NEXTQ_TYPE_SHIFT,
+                       (v & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT, v & 0xFFu,
+                       (v & I40E_RQCTL_RSVD_MASK) ? 1 : 0);
+            ++shown;
+        }
+        if (shown == 0) {
+            fmt::print(stderr, "[PCI]   (none — every entry was 0 or unbacked)\n");
+        }
+        return false;
+    }
+    if (failed != 0) {
+        fmt::print(stderr,
+                   "[PCI] {} ({}): i40e NoITR REFUSED on {} of {} RX queue(s) — RX "
+                   "write-back is STILL ITR-gated\n",
+                   ifname, bdf, failed, patched + failed);
+        return false;
+    }
+    fmt::print(stderr, "[PCI] {} ({}): i40e NoITR on {} RX queue(s) (q{}: 0x{:08x} -> 0x{:08x})\n", ifname,
+               bdf, patched, firstQ, firstBefore, firstAfter);
+    return true;
 }
 
 // ── i40e QINT_RQCTL POSITIVE CONTROL (a probe, NOT a tuning lever) ───────────────────────
@@ -404,66 +447,71 @@ inline bool i40eSetNoItr(const std::string& bdf, std::string_view ifname) noexce
 // PFINT_ITRN(_i,_INTPF) = 0x30000 + _i*2048 + _INTPF*4 (_i=0..2); PFINT_ITR0(_i) = 0x38000 +
 // _i*128. Vector 0 (the MISC vector) uses ITR0; vectors 1..N use ITRN(_i, msix_vect-1).
 // INTERVAL is bits [11:0] in 2us units, so interval2us=10 => 20us — a ~3x RTT blowup here.
-inline constexpr std::size_t   I40E_PFINT_ITRN_BASE   = 0x00030000;
-inline constexpr std::size_t   I40E_PFINT_ITRN_STRIDE = 2048;
-inline constexpr std::size_t   I40E_PFINT_ITR0_BASE   = 0x00038000;
-inline constexpr std::size_t   I40E_PFINT_ITR0_STRIDE = 128;
+inline constexpr std::size_t I40E_PFINT_ITRN_BASE   = 0x00030000;
+inline constexpr std::size_t I40E_PFINT_ITRN_STRIDE = 2048;
+inline constexpr std::size_t I40E_PFINT_ITR0_BASE   = 0x00038000;
+inline constexpr std::size_t I40E_PFINT_ITR0_STRIDE = 128;
 
-inline bool i40eItrProbe(const std::string& bdf, std::string_view ifname,
-                         std::uint32_t itrIdx, std::uint32_t interval2us) noexcept {
-  if (bdf.empty() || itrIdx > 2) {
-    fmt::print(stderr, "[PCI] {}: ITR probe skipped (bad BDF or itrIdx>2)\n", ifname);
-    return false;
-  }
-  const std::size_t bar0Size = barSize(bdf, 0);
-  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
-  BackendBase bar0;
-  if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
-    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — ITR probe skipped\n",
-               ifname, bdf);
-    return false;
-  }
-  std::size_t count = I40E_QINT_RQCTL_COUNT;
-  if (bar0Size < I40E_QINT_RQCTL_BASE + count * 4) {
-    if (bar0Size <= I40E_QINT_RQCTL_BASE) return false;
-    count = (bar0Size - I40E_QINT_RQCTL_BASE) / 4;
-  }
+inline bool i40eItrProbe(const std::string& bdf, std::string_view ifname, std::uint32_t itrIdx,
+                         std::uint32_t interval2us) noexcept {
+    if (bdf.empty() || itrIdx > 2) {
+        fmt::print(stderr, "[PCI] {}: ITR probe skipped (bad BDF or itrIdx>2)\n", ifname);
+        return false;
+    }
+    const std::size_t bar0Size = barSize(bdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+    BackendBase       bar0;
+    if (bar0Size == 0 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+        fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — ITR probe skipped\n", ifname, bdf);
+        return false;
+    }
+    std::size_t count = I40E_QINT_RQCTL_COUNT;
+    if (bar0Size < I40E_QINT_RQCTL_BASE + count * 4) {
+        if (bar0Size <= I40E_QINT_RQCTL_BASE) {
+            return false;
+        }
+        count = (bar0Size - I40E_QINT_RQCTL_BASE) / 4;
+    }
 
-  unsigned n = 0;
-  for (std::size_t q = 0; q < count; ++q) {
-    auto* rqctl = bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
-    const std::uint32_t before = *rqctl;
-    if (!i40eIsBoundRxQueue(before)) continue;
+    unsigned n = 0;
+    for (std::size_t q = 0; q < count; ++q) {
+        auto*               rqctl  = bar0.registerPtr<std::uint32_t>(I40E_QINT_RQCTL_BASE + q * 4);
+        const std::uint32_t before = *rqctl;
+        if (!i40eIsBoundRxQueue(before)) {
+            continue;
+        }
 
-    // Load the chosen ITR index with a big interval, on the vector this queue rides.
-    const std::uint32_t msix = before & 0xFFu;
-    const std::size_t   itrOff =
-        (msix == 0) ? I40E_PFINT_ITR0_BASE + itrIdx * I40E_PFINT_ITR0_STRIDE
-                    : I40E_PFINT_ITRN_BASE + itrIdx * I40E_PFINT_ITRN_STRIDE + (msix - 1) * 4;
-    if (itrOff + 4 > bar0Size) continue;
-    auto* itr = bar0.registerPtr<std::uint32_t>(itrOff);
-    *itr = interval2us & I40E_ITR_INTERVAL_MASK;
-    const std::uint32_t itrBack = *itr;
+        // Load the chosen ITR index with a big interval, on the vector this queue rides.
+        const std::uint32_t msix   = before & 0xFFu;
+        const std::size_t   itrOff = (msix == 0) ? I40E_PFINT_ITR0_BASE + itrIdx * I40E_PFINT_ITR0_STRIDE
+                                                 : I40E_PFINT_ITRN_BASE + itrIdx * I40E_PFINT_ITRN_STRIDE +
+                                                     static_cast<std::size_t>((msix - 1) * 4);
+        if (itrOff + 4 > bar0Size) {
+            continue;
+        }
+        auto* itr                   = bar0.registerPtr<std::uint32_t>(itrOff);
+        *itr                        = interval2us & I40E_ITR_INTERVAL_MASK;
+        const std::uint32_t itrBack = *itr;
 
-    // Point the queue at that index.
-    const std::uint32_t want = (before & ~I40E_ITR_INDX_MASK)
-                             | ((itrIdx << I40E_ITR_INDX_SHIFT) & I40E_ITR_INDX_MASK);
-    *rqctl = want;
-    const std::uint32_t after = *rqctl;
-    ++n;
+        // Point the queue at that index.
+        const std::uint32_t want = (before & ~I40E_ITR_INDX_MASK) |
+                                   ((itrIdx << I40E_ITR_INDX_SHIFT) & I40E_ITR_INDX_MASK);
+        *rqctl                    = want;
+        const std::uint32_t after = *rqctl;
+        ++n;
+        fmt::print(stderr,
+                   "[PCI] {} ({}): ITR PROBE q={} msix={} ITR[{}]@0x{:05x}={} ({}us)  QINT_RQCTL "
+                   "0x{:08x} -> 0x{:08x} (ITR_INDX {} -> {})\n",
+                   ifname, bdf, q, msix, itrIdx, itrOff, itrBack, itrBack * 2, before, after,
+                   (before & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT,
+                   (after & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT);
+    }
     fmt::print(stderr,
-        "[PCI] {} ({}): ITR PROBE q={} msix={} ITR[{}]@0x{:05x}={} ({}us)  QINT_RQCTL "
-        "0x{:08x} -> 0x{:08x} (ITR_INDX {} -> {})\n",
-        ifname, bdf, q, msix, itrIdx, itrOff, itrBack, itrBack * 2,
-        before, after,
-        (before & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT,
-        (after  & I40E_ITR_INDX_MASK) >> I40E_ITR_INDX_SHIFT);
-  }
-  fmt::print(stderr, "[PCI] {} ({}): ITR PROBE armed on {} queue(s). RTT MUST now blow up. "
-                     "If it does NOT, the silicon is IGNORING post-start QINT_RQCTL writes "
-                     "=> NoITR was never applied and needs the bind-time DPDK patch.\n",
-             ifname, bdf, n);
-  return n > 0;
+               "[PCI] {} ({}): ITR PROBE armed on {} queue(s). RTT MUST now blow up. "
+               "If it does NOT, the silicon is IGNORING post-start QINT_RQCTL writes "
+               "=> NoITR was never applied and needs the bind-time DPDK patch.\n",
+               ifname, bdf, n);
+    return n > 0;
 }
 
 // igc (i225): clear the EEE/LPI enable bits in EEER (0x0E30). VERIFIED REDUNDANT
@@ -472,26 +520,25 @@ inline bool i40eItrProbe(const std::string& bdf, std::string_view ifname,
 // belt-and-braces for parity with the published soak binaries; see
 // docs/Known_driver_issues.md §2.4.
 inline bool igcDisableEee(const std::string& bdf, std::string_view ifname) noexcept {
-  constexpr std::size_t   kEeer      = 0x00000E30;
-  constexpr std::uint32_t kLpiEnable = 0x00030000;   // TX_LPI_EN | RX_LPI_EN
-  if (bdf.empty()) {
-    fmt::print(stderr, "[PCI] {}: no BDF — igc EEE left as-is\n", ifname);
-    return false;
-  }
-  const std::size_t bar0Size = barSize(bdf, 0);
-  const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
-  BackendBase bar0;
-  if (bar0Size < kEeer + 4 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
-    fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — igc EEE left as-is\n",
-               ifname, bdf);
-    return false;
-  }
-  auto* eeer = bar0.registerPtr<std::uint32_t>(kEeer);
-  const std::uint32_t before = *eeer;
-  *eeer = before & ~kLpiEnable;
-  fmt::print(stderr, "[PCI] {} ({}): igc EEE/LPI disabled (EEER 0x{:08x} -> 0x{:08x})\n",
-             ifname, bdf, before, *eeer);
-  return true;
+    constexpr std::size_t   kEeer      = 0x00000E30;
+    constexpr std::uint32_t kLpiEnable = 0x00030000;   // TX_LPI_EN | RX_LPI_EN
+    if (bdf.empty()) {
+        fmt::print(stderr, "[PCI] {}: no BDF — igc EEE left as-is\n", ifname);
+        return false;
+    }
+    const std::size_t bar0Size = barSize(bdf, 0);
+    const std::string resPath  = "/sys/bus/pci/devices/" + bdf + "/resource0";
+    BackendBase       bar0;
+    if (bar0Size < kEeer + 4 || !bar0.open(resPath.c_str(), 0, bar0Size)) {
+        fmt::print(stderr, "[PCI] {} ({}): resource0 mmap failed — igc EEE left as-is\n", ifname, bdf);
+        return false;
+    }
+    auto*               eeer   = bar0.registerPtr<std::uint32_t>(kEeer);
+    const std::uint32_t before = *eeer;
+    *eeer                      = before & ~kLpiEnable;
+    fmt::print(stderr, "[PCI] {} ({}): igc EEE/LPI disabled (EEER 0x{:08x} -> 0x{:08x})\n", ifname, bdf,
+               before, *eeer);
+    return true;
 }
 
-}  // namespace pci
+}   // namespace pci

@@ -18,42 +18,56 @@
 //   sudo ./abtrda3_test --txgen  [--count N] [--config <file>]
 //   sudo ./abtrda3_test --rxsink [--config <file>]
 
-#include "NicTuner.hpp"
-#include "TestConfig.hpp"
-#include "RuntimeSetup.hpp"
-#include "TransportDispatch.hpp"
-
-#include <fmt/core.h>
-
 #include <cstdint>
 #include <cstring>
 #include <optional>
 
+#include <fmt/core.h>
+
+#include "NicTuner.hpp"
+#include "RuntimeSetup.hpp"
+#include "TestConfig.hpp"
+#include "TransportDispatch.hpp"
+
 namespace {
 
 struct CliArgs {
-    const char*   configPath = "abtrda3_test.toml";
-    RunMode       runMode{};
-    bool          useServerRole{};
-    std::int64_t  countOverride = -1;
-    bool          valid         = false;
+    const char*  configPath = "abtrda3_test.toml";
+    RunMode      runMode{};
+    bool         useServerRole{};
+    std::int64_t countOverride = -1;
+    bool         valid         = false;
 };
 
 [[nodiscard]] CliArgs parseCli(int argc, char* argv[]) {
     CliArgs a{};
-    bool haveMode = false;
+    bool    haveMode = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             a.configPath = argv[++i];
-        }
-        else if (arg == "--server")  { a.runMode = RunMode::Server; a.useServerRole = true;  haveMode = true; }
-        else if (arg == "--client")  { a.runMode = RunMode::Client; a.useServerRole = false; haveMode = true; }
-        else if (arg == "--txgen")   { a.runMode = RunMode::TxGen;  a.useServerRole = false; haveMode = true; }
-        else if (arg == "--rxsink")  { a.runMode = RunMode::RxSink; a.useServerRole = true;  haveMode = true; }
-        else if (arg == "--single")  { a.runMode = RunMode::SingleRecorder; a.useServerRole = false; haveMode = true; }
-        else if (arg == "--count" && i + 1 < argc) {
+        } else if (arg == "--server") {
+            a.runMode       = RunMode::Server;
+            a.useServerRole = true;
+            haveMode        = true;
+        } else if (arg == "--client") {
+            a.runMode       = RunMode::Client;
+            a.useServerRole = false;
+            haveMode        = true;
+        } else if (arg == "--txgen") {
+            a.runMode       = RunMode::TxGen;
+            a.useServerRole = false;
+            haveMode        = true;
+        } else if (arg == "--rxsink") {
+            a.runMode       = RunMode::RxSink;
+            a.useServerRole = true;
+            haveMode        = true;
+        } else if (arg == "--single") {
+            a.runMode       = RunMode::SingleRecorder;
+            a.useServerRole = false;
+            haveMode        = true;
+        } else if (arg == "--count" && i + 1 < argc) {
             a.countOverride = std::atoll(argv[++i]);
         }
     }
@@ -72,7 +86,7 @@ void printUsage(const char* argv0) {
                  argv0);
 }
 
-} // anonymous namespace
+}   // anonymous namespace
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -99,9 +113,10 @@ int main(int argc, char* argv[]) {
     // + SCHED_OTHER here), the recorder self-pins to recRecorderCore inside the
     // dispatch. NicTuner is applied to both ports inside runSingleRecorder.
     if (args.runMode == RunMode::SingleRecorder) {
-        fmt::println("[Config] Loaded from {} — mode=SingleRecorder tx={} rx={}",
-                     args.configPath, cfg.client.interface, cfg.server.interface);
-        std::optional<NicTuner> txTuner, rxTuner;
+        fmt::println("[Config] Loaded from {} — mode=SingleRecorder tx={} rx={}", args.configPath,
+                     cfg.client.interface, cfg.server.interface);
+        std::optional<NicTuner> txTuner;
+        std::optional<NicTuner> rxTuner;
         if (cfg.nicTunerMode != NicTunerMode::Off) {
             txTuner.emplace(cfg.client.interface.c_str(), cfg.recHotPathCore, cfg.nicTunerMode);
             rxTuner.emplace(cfg.server.interface.c_str(), cfg.recRecorderCore, cfg.nicTunerMode);
@@ -109,19 +124,19 @@ int main(int argc, char* argv[]) {
             fmt::println(stderr, "[NicTuner] Off");
         }
         // Watchdog disabled (0): the hot loop self-terminates on duration_sec.
-        RuntimeSetup rt(cfg.recHotPathCore, 0, "SingleRecorder");
+        const RuntimeSetup rt(cfg.recHotPathCore, 0, "SingleRecorder");
         return runSingleRecorder(cfg, rt.stopToken());
     }
 
     const RoleConfig& role = args.useServerRole ? cfg.server : cfg.client;
 
     std::uint32_t count = cfg.clientCount;
-    if (args.countOverride >= 0)
+    if (args.countOverride >= 0) {
         count = static_cast<std::uint32_t>(args.countOverride);
+    }
 
-    fmt::println("[Config] Loaded from {} — role={} transport={} iface={}",
-                 args.configPath, runModeName(args.runMode),
-                 role.transport, role.interface);
+    fmt::println("[Config] Loaded from {} — role={} transport={} iface={}", args.configPath,
+                 runModeName(args.runMode), role.transport, role.interface);
 
     // System tuning (optional per config)
     std::optional<NicTuner> tuner;
@@ -132,7 +147,7 @@ int main(int argc, char* argv[]) {
     }
 
     // RT setup (watchdog, CPU pin, SCHED_OTHER, mlockall, signal handler)
-    RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(args.runMode));
+    const RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(args.runMode));
 
     return runTransport(cfg, role, args.runMode, count, rt.stopToken());
 }

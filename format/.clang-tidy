@@ -1,0 +1,57 @@
+# abtrda3 static-analysis profile — imported from abt-t2t/format. Run over a configured build:
+#   format/apply.sh build/x86_64-release-full
+# (run-clang-tidy needs the build's compile_commands.json; the full preset covers every transport)
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cppcoreguidelines-special-member-functions,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-pro-type-member-init,
+  cppcoreguidelines-virtual-class-destructor,
+  misc-const-correctness,
+  misc-unused-parameters,
+  misc-redundant-expression,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-use-nodiscard,
+  modernize-use-bool-literals,
+  modernize-use-designated-initializers,
+  modernize-loop-convert,
+  performance-*,
+  -performance-enum-size,
+  readability-make-member-function-const,
+  readability-const-return-type,
+  readability-redundant-smartptr-get,
+  readability-static-accessed-through-instance,
+  readability-container-size-empty,
+  readability-redundant-member-init,
+  readability-redundant-string-init,
+  readability-use-std-min-max,
+  readability-convert-member-functions-to-static,
+  readability-isolate-declaration,
+  readability-inconsistent-declaration-parameter-name,
+  readability-use-concise-preprocessor-directives,
+  google-explicit-constructor,
+  cppcoreguidelines-missing-std-forward,
+  cppcoreguidelines-avoid-const-or-ref-data-members,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-prefer-member-initializer,
+  cert-err34-c
+WarningsAsErrors: ''
+# Only this repository's own headers (src/, test/) — never build/_deps or system headers.
+# Matches both the workstation checkout (abtrda3) and rtserver's (ABTRDA3).
+HeaderFilterRegex: '.*/[Aa][Bb][Tt][Rr][Dd][Aa]3/(src|test)/.*'
+FormatStyle: file
+CheckOptions:
+  cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor: true
+  cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted: true
+  # AnalyzeValues is OFF here (abt-t2t has it on): the check sees one template
+  # instantiation at a time, so a local mutated only inside an `if constexpr`
+  # branch gets const-ified in the instantiation that never takes the branch and
+  # the other instantiation stops compiling (Client/Server/AFXDP, 2026-09-05).
+  misc-const-correctness.AnalyzeValues: false
+  misc-const-correctness.AnalyzeReferences: true
+  misc-const-correctness.WarnPointersAsValues: false

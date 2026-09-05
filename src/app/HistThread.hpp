@@ -19,14 +19,6 @@
 // `Shared` (below) is the ONLY cross-thread surface: the queue, the txDone flag,
 // the overflow tally, and the once-calibrated TSC rate.
 
-#include "TestConfig.hpp"
-#include "TscClock.hpp"
-
-#include <rigtorp/SPSCQueue.h>
-#include <hdr/hdr_histogram.h>
-
-#include <fmt/core.h>
-
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -36,19 +28,29 @@
 #include <string>
 #include <utility>
 
+#include <fmt/core.h>
+#include <hdr/hdr_histogram.h>
+#include <rigtorp/SPSCQueue.h>
+
+#include "TestConfig.hpp"
+#include "TscClock.hpp"
+
 // RX -> Hist end marker. A real cycle-delta of ~2^64 cycles is physically
 // impossible (~years), so this can never collide with a sample.
 inline constexpr std::uint64_t kEndSentinel = ~0ULL;
 
 // ── Shared cross-core surface — the ONLY state touched by more than one thread ──
 struct Shared {
-    rigtorp::SPSCQueue<std::uint64_t> toHist;          // producer writes, Hist reads (cycle deltas)
-    std::atomic<bool>                 txDone{false};   // TX writes, RX reads (unused by the RTT client)
-    std::atomic<std::uint64_t>        pushFailures{0}; // producer -> SPSC overflow tally
-    const TestConfig&                 cfg;             // read-only after construction
-    double                            tscHz{0.0};      // calibrated ONCE before threads start
+    rigtorp::SPSCQueue<std::uint64_t> toHist;            // producer writes, Hist reads (cycle deltas)
+    std::atomic<bool>                 txDone{false};     // TX writes, RX reads (unused by the RTT client)
+    std::atomic<std::uint64_t>        pushFailures{0};   // producer -> SPSC overflow tally
+    const TestConfig&                 cfg;               // read-only after construction
+    double                            tscHz{0.0};        // calibrated ONCE before threads start
 
-    explicit Shared(const TestConfig& c) : toHist(c.recQueueCapacity), cfg(c) {}
+    explicit Shared(const TestConfig& c)
+        : toHist(c.recQueueCapacity),
+          cfg(c) {
+    }
 };
 
 // ── Hist: drain the SPSC into an HdrHistogram, then report ───────────────────
@@ -56,10 +58,10 @@ class HistThread {
 public:
     // `title` labels the report ("One-Way", "Round-Trip"). When `reportOneWayHalf`
     // is set (RTT mode) the report also prints the RTT/2 one-way estimate.
-    HistThread(Shared& sh, std::string outputPath, std::uint64_t durationSec,
-               std::string title = "One-Way", bool reportOneWayHalf = false);
+    HistThread(Shared& sh, std::string outputPath, std::uint64_t durationSec, std::string title = "One-Way",
+               bool reportOneWayHalf = false);
 
-    void run(std::stop_token stop);
+    void run(const std::stop_token& stop);
 
 private:
     void report(hdr_histogram* h, std::uint64_t recorded, double tscHz);
@@ -75,15 +77,19 @@ private:
 
 inline HistThread::HistThread(Shared& sh, std::string outputPath, std::uint64_t durationSec,
                               std::string title, bool reportOneWayHalf)
-    : m_sh(sh), m_outputPath(std::move(outputPath)), m_durationSec(durationSec),
-      m_title(std::move(title)), m_reportOneWayHalf(reportOneWayHalf) {}
+    : m_sh(sh),
+      m_outputPath(std::move(outputPath)),
+      m_durationSec(durationSec),
+      m_title(std::move(title)),
+      m_reportOneWayHalf(reportOneWayHalf) {
+}
 
-inline void HistThread::run(std::stop_token stop) {
+inline void HistThread::run(const std::stop_token& stop) {
     const double tscHz = m_sh.tscHz;   // calibrated once by the coordinator, read-only here
 
     // Range = 1 cycle .. 60 s of cycles, 5 significant figures (HdrHistogram's max:
     // 0.001% relative error).
-    hdr_histogram* h = nullptr;
+    hdr_histogram*     h      = nullptr;
     const std::int64_t maxCyc = static_cast<std::int64_t>(tscHz * 60.0);
     if (hdr_init(1, maxCyc, 5, &h) != 0 || !h) {
         fmt::print(stderr, "[SingleRec/Hist] hdr_init failed\n");
@@ -101,23 +107,23 @@ inline void HistThread::run(std::stop_token stop) {
         if (el >= nextHb) [[unlikely]] {
             const double elapsedMin = static_cast<double>(el) / tscHz / 60.0;
             const double remainMin  = static_cast<double>(m_durationSec) / 60.0 - elapsedMin;
-            fmt::println(stderr,
-                "[SingleRec/Hist] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={}",
+            fmt::println(
+                stderr, "[SingleRec/Hist] heartbeat: ~{:.0f} min elapsed, ~{:.0f} min remaining, recorded={}",
                 elapsedMin, remainMin < 0.0 ? 0.0 : remainMin, recorded);
             nextHb += hbCyc;
         }
 
-        std::uint64_t* cyclePtr = m_sh.toHist.front();
+        const std::uint64_t* cyclePtr = m_sh.toHist.front();
         if (!cyclePtr) {
             if (stop.stop_requested()) {
-                break;                                  // SIGINT backstop
+                break;   // SIGINT backstop
             }
             continue;
         }
         const std::uint64_t cyc = *cyclePtr;
         m_sh.toHist.pop();
         if (cyc == kEndSentinel) {
-            break;                                      // producer signalled end-of-stream
+            break;   // producer signalled end-of-stream
         }
 
         // Warmup discard happens at the PRODUCER (it never pushes cold-start frames),
@@ -155,15 +161,15 @@ inline void HistThread::report(hdr_histogram* h, std::uint64_t recorded, double 
     }
     fmt::print("-----------------------------\n");
 
-    if (m_outputPath.empty())
+    if (m_outputPath.empty()) {
         return;
+    }
 
     // Percentile-distribution CSV (hdrhistogram.github.io plotFiles / gnuplot) — dense
     // in the TAIL. Values are cycles; scale by cycles-per-us so Value comes out in us.
     std::FILE* f = std::fopen(m_outputPath.c_str(), "w");
     if (!f) {
-        fmt::print(stderr, "[SingleRec/Hist] cannot open {}: {}\n",
-                   m_outputPath, std::strerror(errno));
+        fmt::print(stderr, "[SingleRec/Hist] cannot open {}: {}\n", m_outputPath, std::strerror(errno));
         return;
     }
     const double cyclesPerUs = tscHz / 1e6;
@@ -176,12 +182,13 @@ inline void HistThread::report(hdr_histogram* h, std::uint64_t recorded, double 
     // sample soaks the percentile CSV's count column wraps; THIS file is the truth.
     // Strip one trailing ".csv" so "foo.csv" -> "foo.hist.csv", not "foo.csv.hist.csv".
     std::string histPath = m_outputPath;
-    if (histPath.size() >= 4 && histPath.compare(histPath.size() - 4, 4, ".csv") == 0)
+    if (histPath.size() >= 4 && histPath.compare(histPath.size() - 4, 4, ".csv") == 0) {
         histPath.resize(histPath.size() - 4);
+    }
     histPath += ".hist.csv";
     if (std::FILE* hf = std::fopen(histPath.c_str(), "w")) {
         std::fprintf(hf, "value_us,count\n");
-        hdr_iter it;
+        hdr_iter it{};
         hdr_iter_recorded_init(&it, h);
         while (hdr_iter_next(&it)) {
             std::fprintf(hf, "%.4f,%lld\n",

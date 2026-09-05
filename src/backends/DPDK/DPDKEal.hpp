@@ -21,28 +21,28 @@
 
 class DPDKEal {
 protected:
-  DPDKEal() noexcept = default;
+    DPDKEal() noexcept = default;
 
-  // i40e RX/TX path select: AVX-512 and scalar measured IDENTICAL (~9.15us) — the
-  // floor is the i40e hardware, not the vector path. 256 = AVX2 (KDI §3).
-  static constexpr unsigned kMaxSimdBitwidth = 256;
+    // i40e RX/TX path select: AVX-512 and scalar measured IDENTICAL (~9.15us) — the
+    // floor is the i40e hardware, not the vector path. 256 = AVX2 (KDI §3).
+    static constexpr unsigned kMaxSimdBitwidth = 256;
 
-  // Park EAL's control thread ("dpdk-intr") here, off the poll core — otherwise it
-  // lands ON it and ping-pongs with our busy-poll ~80x/s -> tail spikes (KDI §3).
-  // Core 0 = kernel housekeeping/IRQ core (irqaffinity=0,1).
-  static constexpr int kControlThreadCore = 0;
+    // Park EAL's control thread ("dpdk-intr") here, off the poll core — otherwise it
+    // lands ON it and ping-pongs with our busy-poll ~80x/s -> tail spikes (KDI §3).
+    // Core 0 = kernel housekeeping/IRQ core (irqaffinity=0,1).
+    static constexpr int kControlThreadCore = 0;
 
-  // Both lists are filled by prepare() BEFORE the single EAL init (the single-recorder
-  // owns both loopback ports in one process). Dedup keys on the BDF/vdev name and the
-  // FIRST registration wins, so a devargs-bearing entry survives (KDI §3).
-  static void addAllowedBdf(const std::string& bdf);   // "<bdf>[,key=val...]"    -> -a
-  static void addVdev(const std::string& arg);         // "net_af_xdpN,iface=..." -> --vdev
+    // Both lists are filled by prepare() BEFORE the single EAL init (the single-recorder
+    // owns both loopback ports in one process). Dedup keys on the BDF/vdev name and the
+    // FIRST registration wins, so a devargs-bearing entry survives (KDI §3).
+    static void addAllowedBdf(const std::string& bdf);   // "<bdf>[,key=val...]"    -> -a
+    static void addVdev(const std::string& arg);         // "net_af_xdpN,iface=..." -> --vdev
 
-  [[nodiscard]] static std::size_t vdevCount() noexcept;   // names the next vdev
+    [[nodiscard]] static std::size_t vdevCount() noexcept;   // names the next vdev
 
-  // Runs rte_eal_init ONCE; later calls are no-ops returning true.
-  [[nodiscard]] static bool ealInit(const std::string& bdf, int lcore) noexcept;
+    // Runs rte_eal_init ONCE; later calls are no-ops returning true.
+    [[nodiscard]] static bool ealInit(const std::string& bdf, int lcore) noexcept;
 
-  static bool writeSysfs(const std::string& path, std::string_view val) noexcept;
-  [[nodiscard]] static bool bindToVfio(const std::string& bdf) noexcept;
+    static bool               writeSysfs(const std::string& path, std::string_view val) noexcept;
+    [[nodiscard]] static bool bindToVfio(const std::string& bdf) noexcept;
 };

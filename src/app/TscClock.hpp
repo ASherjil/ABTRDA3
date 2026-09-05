@@ -22,22 +22,22 @@
 
 #include <cstdint>
 #include <ctime>
+
 #include <x86intrin.h>
 
 namespace tsc {
 
 [[gnu::always_inline, gnu::hot]]
 inline std::uint64_t now() noexcept {
-    unsigned aux;
+    unsigned aux = 0;
     return __rdtscp(&aux);   // serializing read of the invariant TSC
 }
 
 [[gnu::always_inline]]
 inline std::uint64_t mono_ns() noexcept {
-    timespec ts;
+    timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL
-         + static_cast<std::uint64_t>(ts.tv_nsec);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
 // Measure the TSC tick rate (Hz) over a fixed wall-clock window. Called once at
@@ -47,7 +47,7 @@ inline std::uint64_t mono_ns() noexcept {
     const std::uint64_t ns0 = mono_ns();
     const std::uint64_t c0  = now();
 
-    const timespec sleep{0, static_cast<long>(windowMs) * 1'000'000L};
+    const timespec sleep{.tv_sec = 0, .tv_nsec = static_cast<long>(windowMs) * 1'000'000L};
     ::nanosleep(&sleep, nullptr);
 
     const std::uint64_t c1  = now();
@@ -64,4 +64,4 @@ inline double cyclesToNs(std::uint64_t cycles, double tscHz) noexcept {
     return static_cast<double>(cycles) * 1e9 / tscHz;
 }
 
-}  // namespace tsc
+}   // namespace tsc

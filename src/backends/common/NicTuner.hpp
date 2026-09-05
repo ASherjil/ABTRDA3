@@ -3,7 +3,11 @@
 
 #pragma once
 
-enum class NicTunerMode { Off, NfsSafe, Full };
+enum class NicTunerMode {
+    Off,
+    NfsSafe,
+    Full
+};
 
 /// Applies low-latency NIC and kernel tuning on construction.
 /// Settings are non-persistent (revert on reboot). Requires root.

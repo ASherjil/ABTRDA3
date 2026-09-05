@@ -20,25 +20,25 @@
 
 // packet_mmap + af_xdp always compile; the other four exist only when their
 // ABTRDA3_WITH_* CMake option is ON (which defines the matching ABTRDA3_HAVE_*).
-#include "TestConfig.hpp"
-#include "RingConcepts.hpp"
-#include "SocketOps.hpp"
+#include "AFXDP.hpp"
+#include "NicTuner.hpp"
 #include "PacketMmapRx.hpp"
 #include "PacketMmapTx.hpp"
-#include "AFXDP.hpp"
 #include "PciHelpers.hpp"
-#include "NicTuner.hpp"
+#include "RingConcepts.hpp"
+#include "SocketOps.hpp"
+#include "TestConfig.hpp"
 
-#if defined(ABTRDA3_HAVE_DPDK)
+#ifdef ABTRDA3_HAVE_DPDK
 #include "DPDK.hpp"
 #endif
-#if defined(ABTRDA3_HAVE_VERBS)
+#ifdef ABTRDA3_HAVE_VERBS
 #include "Verbs.hpp"
 #endif
-#if defined(ABTRDA3_HAVE_EFVI)
+#ifdef ABTRDA3_HAVE_EFVI
 #include "EtherFabricVirtualInterface.hpp"
 #endif
-#if defined(ABTRDA3_HAVE_I210)
+#ifdef ABTRDA3_HAVE_I210
 #include "Intel_I210.hpp"
 #include "common/HugePageHelpers.hpp"
 #endif
@@ -47,28 +47,35 @@
 #include <string_view>
 
 // ── CRTP base: the defaults every traits struct inherits ────────────────────
-template<class Self>
+template <class Self>
 struct TransportBase {
+private:
+    TransportBase() = default;
+
+public:
     static constexpr bool kPairedRxTx    = false;
     static constexpr bool kSingleCapable = true;
 
-    static bool preflight(const TestConfig&, const RoleConfig&) noexcept { return true; }
+    static bool preflight(const TestConfig&, const RoleConfig&) noexcept {
+        return true;
+    }
 
     // Deduced return type + prvalue return keeps the elision chain (no move ctor needed).
     static auto makeSingleTx(const TestConfig& cfg, const RoleConfig& role) {
         return Self::makeTx(cfg, role);
     }
+
     static auto makeSingleRx(const TestConfig& cfg, const RoleConfig& role) {
         return Self::makeRx(cfg, role);
     }
 
-    template<class Nic, class Fn>
+    template <class Nic, class Fn>
     static void withAux(Nic&, const TestConfig&, const RoleConfig&, Fn&& fn) {
         fn();
     }
 
     // --single: Tx on the client port, Rx on the server port, both in THIS process.
-    template<class Fn>
+    template <class Fn>
     static int withSinglePair(const TestConfig& cfg, Fn&& fn) {
         auto tx = Self::makeSingleTx(cfg, cfg.client);
         auto rx = Self::makeSingleRx(cfg, cfg.server);
@@ -83,18 +90,20 @@ struct TransportBase {
         fn(tx, rx);
         return 0;
     }
+
+    friend Self;
 };
 
 // ── packet_mmap ─────────────────────────────────────────────────────────────
 // The only PAIRED transport: no duplex form, so Server/Client runs two objects on the
 // same interface. The ctor opens the ring — there is no init().
 struct PacketMmapTraits : TransportBase<PacketMmapTraits> {
-    static constexpr std::string_view kName        = "packet_mmap";
-    static constexpr bool             kPairedRxTx  = true;
+    static constexpr std::string_view kName       = "packet_mmap";
+    static constexpr bool             kPairedRxTx = true;
 
     using TxOnly = PacketMmapTx;
     using RxOnly = PacketMmapRx;
-    using RxTx   = void;                       // unused: kPairedRxTx
+    using RxTx   = void;   // unused: kPairedRxTx
 
     static PacketMmapTx makeTx(const TestConfig& cfg, const RoleConfig& role) {
         RingConfig rc{};
@@ -119,7 +128,7 @@ struct PacketMmapTraits : TransportBase<PacketMmapTraits> {
         return PacketMmapRx(rc);
     }
 
-    template<class Nic>
+    template <class Nic>
     static bool init(Nic&, const TestConfig&, const RoleConfig&) noexcept {
         return true;
     }
@@ -154,11 +163,16 @@ static_assert(kI40eNoItr || kI40eAlsoClearItr || kI40eItrProbe,
               "i40e with neither NoITR nor the ITR clear sits at the PMD's 32us default (~30us RTT)");
 
 // Apply + verify on any stack. `bdf` must be pre-resolved (netdev gone after vfio unbind).
-inline void i40eApplyWritebackPolicy(const std::string& bdf, std::string_view ifname,
-                                     const char* tag) {
-    if (kI40eAlsoClearItr) pci::i40eClearItr(bdf, ifname);
-    if (kI40eNoItr)        pci::i40eSetNoItr(bdf, ifname);
-    if (kI40eItrProbe)     pci::i40eItrProbe(bdf, ifname, kI40eItrProbeIdx, kI40eItrProbeInterval);
+inline void i40eApplyWritebackPolicy(const std::string& bdf, std::string_view ifname, const char* tag) {
+    if (kI40eAlsoClearItr) {
+        pci::i40eClearItr(bdf, ifname);
+    }
+    if (kI40eNoItr) {
+        pci::i40eSetNoItr(bdf, ifname);
+    }
+    if (kI40eItrProbe) {
+        pci::i40eItrProbe(bdf, ifname, kI40eItrProbeIdx, kI40eItrProbeInterval);
+    }
     pci::reportItr(bdf, ifname, tag);   // under NoITR a NONZERO ITRN is fine — it is ignored
 }
 
@@ -177,42 +191,50 @@ struct AfxdpTraits : TransportBase<AfxdpTraits> {
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) {
         return TxOnly(role.interface.c_str(), role.xdpQueueId);
     }
+
     static RxOnly makeRx(const TestConfig&, const RoleConfig& role) {
         return RxOnly(role.interface.c_str(), role.xdpQueueId);
     }
+
     static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
         return RxTx(role.interface.c_str(), role.xdpQueueId);
     }
+
     static SingleTx makeSingleTx(const TestConfig&, const RoleConfig& role) {
         return SingleTx(role.interface.c_str(), role.xdpQueueId);
     }
 
-    template<class Nic>
+    template <class Nic>
     static bool init(Nic& xsk, const TestConfig& cfg, const RoleConfig& role) {
         // Kernel-bound throughout, so the netdev exists and the BDF resolves by name.
-        const bool  isI40e = pci::boundToI40e(role.interface);
-        const std::string bdf = isI40e ? pci::resolveBdf(role.interface) : std::string{};
+        const bool        isI40e = pci::boundToI40e(role.interface);
+        const std::string bdf    = isI40e ? pci::resolveBdf(role.interface) : std::string{};
 
         // Pre-bind ITR read: pins down that the XSK bind itself zeroes PFINT_ITRN.
-        if (isI40e) pci::reportItr(bdf, role.interface, "AFXDP-ITR pre-bind");
+        if (isI40e) {
+            pci::reportItr(bdf, role.interface, "AFXDP-ITR pre-bind");
+        }
 
-        if (!xsk.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend))
+        if (!xsk.init(cfg.afxdpEnableDeferral, cfg.afxdpEnableIrqSuspend)) {
             return false;
+        }
         // AFTER the bind — xsk_socket__create() resets coalescing.
-        if (cfg.nicTunerMode != NicTunerMode::Off)
+        if (cfg.nicTunerMode != NicTunerMode::Off) {
             NicTuner::setCoalescingZero(role.interface.c_str());
+        }
         // AFTER xsk.init() — the bind reconfigures the queue pair and rewrites QINT_RQCTL.
-        if (isI40e) i40eApplyWritebackPolicy(bdf, role.interface, "AFXDP-ITR post-bind");
+        if (isI40e) {
+            i40eApplyWritebackPolicy(bdf, role.interface, "AFXDP-ITR post-bind");
+        }
         return true;
     }
 
     static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
-        fmt::println("[{}] Transport: af_xdp on {} (queue {})",
-                     roleName, role.interface, role.xdpQueueId);
+        fmt::println("[{}] Transport: af_xdp on {} (queue {})", roleName, role.interface, role.xdpQueueId);
     }
 };
 
-#if defined(ABTRDA3_HAVE_DPDK)
+#ifdef ABTRDA3_HAVE_DPDK
 // ── dpdk ────────────────────────────────────────────────────────────────────
 // The DPDK class is PMD-agnostic; ALL driver-specific policy lives here.
 
@@ -225,8 +247,7 @@ inline constexpr bool kIgcAdvertise1GOnly = true;
 // rides in the WQE, no payload DMA read (-520ns; prerequisite for setTxInlineReuse);
 // plain 64B CQEs. sq_db_nc=0 was a null (1ns): the cost is the WQE DMA read-back
 // (BlueFlame), not the doorbell write.
-inline constexpr const char* kMlx5LatencyDevargs =
-    "txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0";
+inline constexpr const char* kMlx5LatencyDevargs = "txq_mem_algn=0,txqs_min_inline=0,rxq_cqe_comp_en=0";
 
 // 64, not the 256 default: mlx5 bulk-refills min(64, NbRxDesc>>2) mbufs at the top of
 // rx_burst — 256 pays a 64-mbuf refill mid-poll, 64 pays 16. Measured (30s, CX4):
@@ -253,21 +274,23 @@ inline constexpr std::uint16_t kSfcNbRxDesc = 64;
 
 // BEFORE prepare(): set knobs + resolve the BDF while the netdev still exists (vfio
 // unbind removes it). setDevargs must land before prepare() registers the BDF.
-template<class Nic>
+template <class Nic>
 [[nodiscard]] inline std::string dpdkPreInit(Nic& nic, const RoleConfig& role) {
     const std::string bdf = pci::resolveBdf(role.interface);
     if (role.driver == "igc" && !role.dpdkAfxdpPmd) {
-        if (kIgcAdvertise1GOnly) nic.setLinkSpeeds(RTE_ETH_LINK_SPEED_1G);
-        nic.setSymmetricQueues(true);        // nb_txq=0 silently breaks igc RX (KDI §2.2)
+        if (kIgcAdvertise1GOnly) {
+            nic.setLinkSpeeds(RTE_ETH_LINK_SPEED_1G);
+        }
+        nic.setSymmetricQueues(true);   // nb_txq=0 silently breaks igc RX (KDI §2.2)
     }
     if (role.driver.find("mlx5") != std::string::npos && !role.dpdkAfxdpPmd) {
         nic.setDevargs(kMlx5LatencyDevargs);
         nic.setTxInlineReuse(true);
-        nic.setNbRxDesc(kMlx5NbRxDesc);      // shrinks the in-poll refill burst 64 -> 16
+        nic.setNbRxDesc(kMlx5NbRxDesc);   // shrinks the in-poll refill burst 64 -> 16
     }
     if (role.driver == "sfc" && !role.dpdkAfxdpPmd) {
-        nic.setDevargs(kSfcLatencyDevargs);  // no inline reuse — see kSfcLatencyDevargs
-        nic.setNbRxDesc(kSfcNbRxDesc);       // shrinks the in-poll refill burst 32 -> 8
+        nic.setDevargs(kSfcLatencyDevargs);   // no inline reuse — see kSfcLatencyDevargs
+        nic.setNbRxDesc(kSfcNbRxDesc);        // shrinks the in-poll refill burst 32 -> 8
     }
     return bdf;
 }
@@ -275,10 +298,12 @@ template<class Nic>
 // AFTER dev_start (a reset during start wipes these). "i40e" covers both the vfio PMD
 // and DPDK-over-AF_XDP — same silicon, same policy. BDF passed explicitly (see above).
 inline void dpdkPostInitFixes(const std::string& bdf, const RoleConfig& role) {
-    if (role.driver == "i40e")
+    if (role.driver == "i40e") {
         i40eApplyWritebackPolicy(bdf, role.interface, "DPDK-ITR");
-    if (role.driver == "igc" && !role.dpdkAfxdpPmd)
+    }
+    if (role.driver == "igc" && !role.dpdkAfxdpPmd) {
         pci::igcDisableEee(bdf, role.interface);
+    }
 }
 
 struct DpdkTraits : TransportBase<DpdkTraits> {
@@ -291,31 +316,34 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) {
         return TxOnly(role.interface, role.cpuCore, role.driver);
     }
+
     static RxOnly makeRx(const TestConfig&, const RoleConfig& role) {
         return RxOnly(role.interface, role.cpuCore, role.driver);
     }
+
     static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
         return RxTx(role.interface, role.cpuCore, role.driver);
     }
 
-    template<class Nic>
+    template <class Nic>
     static bool init(Nic& nic, const TestConfig& cfg, const RoleConfig& role) {
         const std::string bdf = dpdkPreInit(nic, role);
-        if (!nic.init(true, role.dpdkBifurcated, role.dpdkAfxdpPmd, cfg.afxdpEnableDeferral))
+        if (!nic.init(true, role.dpdkBifurcated, role.dpdkAfxdpPmd, cfg.afxdpEnableDeferral)) {
             return false;
+        }
         dpdkPostInitFixes(bdf, role);
         return true;
     }
 
     static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
-        fmt::println("[{}] Transport: dpdk on {} (driver={}, lcore {})",
-                     roleName, role.interface, role.driver, role.cpuCore);
+        fmt::println("[{}] Transport: dpdk on {} (driver={}, lcore {})", roleName, role.interface,
+                     role.driver, role.cpuCore);
     }
 
     // DPDK's own --single lifecycle: EAL is process-global — register BOTH ports before
     // the first init() triggers rte_eal_init; a loopback link needs both PHYs up, so
     // start both (init(false) = no link wait), then wait both. One core drives both. KDI §3.
-    template<class Fn>
+    template <class Fn>
     static int withSinglePair(const TestConfig& cfg, Fn&& fn) {
         TxOnly tx(cfg.client.interface, cfg.recHotPathCore, cfg.client.driver);
         RxOnly rx(cfg.server.interface, cfg.recHotPathCore, cfg.server.driver);
@@ -328,13 +356,11 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
             fmt::println(stderr, "Error: DPDK prepare (vfio bind) failed");
             return 1;
         }
-        if (!tx.init(false, cfg.client.dpdkBifurcated, cfg.client.dpdkAfxdpPmd,
-                     cfg.afxdpEnableDeferral)) {
+        if (!tx.init(false, cfg.client.dpdkBifurcated, cfg.client.dpdkAfxdpPmd, cfg.afxdpEnableDeferral)) {
             fmt::println(stderr, "Error: Tx DPDK init failed on {}", cfg.client.interface);
             return 1;
         }
-        if (!rx.init(false, cfg.server.dpdkBifurcated, cfg.server.dpdkAfxdpPmd,
-                     cfg.afxdpEnableDeferral)) {
+        if (!rx.init(false, cfg.server.dpdkBifurcated, cfg.server.dpdkAfxdpPmd, cfg.afxdpEnableDeferral)) {
             fmt::println(stderr, "Error: Rx DPDK init failed on {}", cfg.server.interface);
             return 1;
         }
@@ -353,9 +379,9 @@ struct DpdkTraits : TransportBase<DpdkTraits> {
         return 0;
     }
 };
-#endif  // ABTRDA3_HAVE_DPDK
+#endif   // ABTRDA3_HAVE_DPDK
 
-#if defined(ABTRDA3_HAVE_VERBS)
+#ifdef ABTRDA3_HAVE_VERBS
 // ── verbs ───────────────────────────────────────────────────────────────────
 // RAW_PACKET QP on mlx5 — the sub-2us path: DPDK's dispatch minus ethdev/mbuf, same
 // silicon. mlx5-only; port stays on the kernel driver, admin-UP; driver/lcore ignored.
@@ -366,11 +392,19 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
     using RxOnly = Verbs<VerbsMode::RxOnly>;
     using RxTx   = Verbs<VerbsMode::RxTx>;
 
-    static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
-    static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }
-    static RxTx   makeRxTx(const TestConfig&, const RoleConfig& role) { return RxTx(role.interface); }
+    static TxOnly makeTx(const TestConfig&, const RoleConfig& role) {
+        return TxOnly(role.interface);
+    }
 
-    template<class Nic>
+    static RxOnly makeRx(const TestConfig&, const RoleConfig& role) {
+        return RxOnly(role.interface);
+    }
+
+    static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
+        return RxTx(role.interface);
+    }
+
+    template <class Nic>
     static bool init(Nic& nic, const TestConfig&, const RoleConfig&) {
         return nic.init();
     }
@@ -379,9 +413,9 @@ struct VerbsTraits : TransportBase<VerbsTraits> {
         fmt::println("[{}] Transport: verbs on {} (RAW_PACKET QP)", roleName, role.interface);
     }
 };
-#endif  // ABTRDA3_HAVE_VERBS
+#endif   // ABTRDA3_HAVE_VERBS
 
-#if defined(ABTRDA3_HAVE_EFVI)
+#ifdef ABTRDA3_HAVE_EFVI
 // ── ef_vi ────────────────────────────────────────────────────────────────────
 // Solarflare/AMD kernel bypass on the X2522 (EF10): CTPIO TX writes the frame through
 // a write-combined MMIO aperture straight into the NIC TX FIFO. Bifurcated like verbs
@@ -404,15 +438,26 @@ inline constexpr bool kEfViHwTimestamps = true;
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
 
-    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
-    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
-    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx,   256, 8, 2048, kEfViCtThreshold, kEfViUseCtpio, kEfViHwTimestamps>;
+    using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold,
+                                               kEfViUseCtpio, kEfViHwTimestamps>;
+    using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold,
+                                               kEfViUseCtpio, kEfViHwTimestamps>;
+    using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx, 256, 8, 2048, kEfViCtThreshold,
+                                               kEfViUseCtpio, kEfViHwTimestamps>;
 
-    static TxOnly makeTx(const TestConfig&, const RoleConfig& role) { return TxOnly(role.interface); }
-    static RxOnly makeRx(const TestConfig&, const RoleConfig& role) { return RxOnly(role.interface); }
-    static RxTx   makeRxTx(const TestConfig&, const RoleConfig& role) { return RxTx(role.interface); }
+    static TxOnly makeTx(const TestConfig&, const RoleConfig& role) {
+        return TxOnly(role.interface);
+    }
 
-    template<class Nic>
+    static RxOnly makeRx(const TestConfig&, const RoleConfig& role) {
+        return RxOnly(role.interface);
+    }
+
+    static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
+        return RxTx(role.interface);
+    }
+
+    template <class Nic>
     static bool init(Nic& nic, const TestConfig&, const RoleConfig&) {
         return nic.init();
     }
@@ -421,9 +466,9 @@ struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
         fmt::println("[{}] Transport: ef_vi on {} (CTPIO)", roleName, role.interface);
     }
 };
-#endif  // ABTRDA3_HAVE_EFVI
+#endif   // ABTRDA3_HAVE_EFVI
 
-#if defined(ABTRDA3_HAVE_I210)
+#ifdef ABTRDA3_HAVE_I210
 // ── intel_i210 (custom PMD) ─────────────────────────────────────────────────
 // One duplex object serves every mode. No --single (that needs two ports in one process).
 struct I210Traits : TransportBase<I210Traits> {
@@ -439,7 +484,9 @@ struct I210Traits : TransportBase<I210Traits> {
     }
 
     static bool preflight(const TestConfig&, const RoleConfig&) {
-        if (ensureHugepages(16)) return true;
+        if (ensureHugepages(16)) {
+            return true;
+        }
         fmt::println(stderr, "Error: hugepage allocation failed");
         return false;
     }
@@ -447,17 +494,23 @@ struct I210Traits : TransportBase<I210Traits> {
     static RxTx makeRxTx(const TestConfig&, const RoleConfig& role) {
         return RxTx(role.interface, 0, driverOf(role));
     }
-    static RxTx makeTx(const TestConfig& cfg, const RoleConfig& role) { return makeRxTx(cfg, role); }
-    static RxTx makeRx(const TestConfig& cfg, const RoleConfig& role) { return makeRxTx(cfg, role); }
 
-    template<class Nic>
+    static RxTx makeTx(const TestConfig& cfg, const RoleConfig& role) {
+        return makeRxTx(cfg, role);
+    }
+
+    static RxTx makeRx(const TestConfig& cfg, const RoleConfig& role) {
+        return makeRxTx(cfg, role);
+    }
+
+    template <class Nic>
     static bool init(Nic& nic, const TestConfig&, const RoleConfig&) {
         return nic.init();
     }
 
     static void banner(const TestConfig&, const RoleConfig& role, const char* roleName) {
-        fmt::println("[{}] Transport: intel_i210 (PMD) on {} (driver={})",
-                     roleName, role.interface, driverOf(role));
+        fmt::println("[{}] Transport: intel_i210 (PMD) on {} (driver={})", roleName, role.interface,
+                     driverOf(role));
     }
 };
-#endif  // ABTRDA3_HAVE_I210
+#endif   // ABTRDA3_HAVE_I210
