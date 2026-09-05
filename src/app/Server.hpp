@@ -80,8 +80,7 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
                 continue;
             }
             if constexpr (kHwTs) {
-                rxInFlight    = rx.hwRxTimestamp();
-                txSeqInFlight = static_cast<std::uint32_t>(packet_count);
+                rxInFlight = rx.hwRxTimestamp();
             }
 
             // CPU-cost bracket: packet in hand -> reply posted (excludes the poll wait).
@@ -111,6 +110,9 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
             }
 
             rx.release();
+            if constexpr (kHwTs) {
+                txSeqInFlight = tx.txSequence();
+            }
             tx.commit();
 
             if constexpr (prof::kDebugProfiling) {

@@ -141,6 +141,10 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
         if constexpr (!kHwTs) {
             t1 = tsc::now();   // send stamp (same core as t2)
         }
+        [[maybe_unused]] std::uint32_t txSeq = 0;
+        if constexpr (kHwTs) {
+            txSeq = tx.txSequence();
+        }
         tx.commit();
         if constexpr (prof::kDebugProfiling) {
             txStats.record(prof::cycles() - txStart);
@@ -167,9 +171,8 @@ inline void run_client(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token st
                     if (rxSeq == seqNet) [[likely]] {   // our echo
                         rx.release();
                         if constexpr (kHwTs) {
-                            const std::uint32_t sendIdx = static_cast<std::uint32_t>(sent - 1);
-                            auto                txTs    = tx.pollTxTimestamp();
-                            while (txTs && txTs->seq != sendIdx) {
+                            auto txTs = tx.pollTxTimestamp();
+                            while (txTs && txTs->seq != txSeq) {
                                 txTs = tx.pollTxTimestamp();
                             }
                             if (warmup < kWarmupDiscard) {

@@ -171,6 +171,7 @@ class EtherFabricVirtualInterface {
     static constexpr std::uint32_t kRxPrefixTsOffset = 10;
     static constexpr std::uint32_t kOneSecQns        = 4000000000u;
     static constexpr std::uint32_t kQnsOverrun       = 20;
+    static constexpr std::uint32_t kTxStampNone      = 0xFFFFFFFFu;
     static_assert(kEvPollBatch >= EF_VI_EVENT_POLL_MIN_EVS);
 
     // One unused guard slot on EACH side of the TX region. Measured (2x 5-min
@@ -248,6 +249,13 @@ public:
         return TxStamp{seq, static_cast<std::uint32_t>(entry)};
     }
 
+    [[nodiscard, gnu::always_inline]]
+    std::uint32_t txSequence() const noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
+    {
+        return m_txHead;
+    }
+
     [[nodiscard]] std::uint32_t hwRxTimestampCorrection() const noexcept
         requires (HwTimestamps)
     {
@@ -260,10 +268,11 @@ public:
     {
         const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32),
                                                          rxCorrection);
-        if (!rx) {
+        const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
+        if (!rx || tx == 0 || tx == kTxStampNone) {
             return std::nullopt;
         }
-        return hwDelta(*rx, static_cast<std::uint32_t>(packed));
+        return hwDelta(*rx, tx);
     }
 
     [[nodiscard]] static std::optional<std::uint64_t> hwTurnaround(std::uint64_t packed,
@@ -272,10 +281,11 @@ public:
     {
         const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32),
                                                          rxCorrection);
-        if (!rx) {
+        const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
+        if (!rx || tx == 0 || tx == kTxStampNone) {
             return std::nullopt;
         }
-        return hwDelta(static_cast<std::uint32_t>(packed), *rx);
+        return hwDelta(tx, *rx);
     }
 
 private:
@@ -916,7 +926,15 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
                 case EF_EVENT_TYPE_TX: {
                     ef_request_id ids[EF_VI_TRANSMIT_BATCH];
                     const int     n = ef_vi_transmit_unbundle(&m_vi, &ev, ids);
-                    m_txTail += static_cast<std::uint32_t>(n);
+                    if constexpr (HwTimestamps && HAS_TX) {
+                        for (int k = 0; k < n; ++k) {
+                            m_txStamp[m_txTail & (NbTxBufs - 1)] =
+                                (static_cast<std::uint64_t>(m_txTail) << 32) | kTxStampNone;
+                            ++m_txTail;
+                        }
+                    } else {
+                        m_txTail += static_cast<std::uint32_t>(n);
+                    }
                     if constexpr (UseCtpio) {
                         if (EF_EVENT_TX_CTPIO(ev)) {
                             m_ctpioWins += static_cast<std::uint64_t>(n);
@@ -1006,6 +1024,10 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
                 }
                 case EF_EVENT_TYPE_TX_ERROR: {
                     ++m_txErrors;
+                    if constexpr (HwTimestamps && HAS_TX) {
+                        m_txStamp[m_txTail & (NbTxBufs - 1)] = (static_cast<std::uint64_t>(m_txTail) << 32) |
+                                                               kTxStampNone;
+                    }
                     ++m_txTail;
                     ++m_evIdx;
                     break;
