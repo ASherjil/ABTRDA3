@@ -448,6 +448,8 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
     ibv_sge     sge{.addr = reinterpret_cast<std::uintptr_t>(m_buf), .length = m_txLen, .lkey = m_mr->lkey};
     ibv_send_wr wr;   // NOLINT(cppcoreguidelines-pro-type-member-init,cppcoreguidelines-init-variables) hot
                       // path: every field set below
+    wr.next       = nullptr;
+    wr.wr_id      = 0;
     wr.sg_list    = &sge;
     wr.num_sge    = 1;
     wr.opcode     = IBV_WR_SEND;
