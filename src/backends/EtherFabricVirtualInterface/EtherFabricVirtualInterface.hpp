@@ -250,6 +250,18 @@ public:
     }
 
     [[nodiscard, gnu::always_inline]]
+    bool rxFrameComplete() noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
+    {
+        if constexpr (!kEfViRxPayloadPoll) {
+            return true;
+        }
+        RxEv scratch;
+        (void)pollEvent(scratch, false);
+        return m_rxEvReconciled >= m_rxPollHits;
+    }
+
+    [[nodiscard, gnu::always_inline]]
     std::uint32_t txSequence() const noexcept
         requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
     {
