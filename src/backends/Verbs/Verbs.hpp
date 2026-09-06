@@ -458,7 +458,7 @@ inline void Verbs<M, PortNum, SqDepth, RqDepth, SignalEvery, MaxInline, MaxFrame
         wr.send_flags |= IBV_SEND_SIGNALED;
         ++m_unreaped;
     }
-    ibv_send_wr* bad = nullptr;
+    ibv_send_wr* bad = nullptr;   // NOLINT(misc-const-correctness) ibv_post_send takes ibv_send_wr**
     if (ibv_post_send(m_qp, &wr, &bad) != 0) [[unlikely]] {
         fmt::println(stderr, "[Verbs] {}: post_send failed", m_ifname);
     }

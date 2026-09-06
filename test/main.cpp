@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
         }
         // Watchdog disabled (0): the hot loop self-terminates on duration_sec.
         const RuntimeSetup rt(cfg.recHotPathCore, 0, "SingleRecorder");
-        return runSingleRecorder(cfg, rt.stopToken());
+        return runSingleRecorder(cfg, RuntimeSetup::stopToken());
     }
 
     const RoleConfig& role = args.useServerRole ? cfg.server : cfg.client;
@@ -149,5 +149,5 @@ int main(int argc, char* argv[]) {
     // RT setup (watchdog, CPU pin, SCHED_OTHER, mlockall, signal handler)
     const RuntimeSetup rt(role.cpuCore, cfg.watchdogSec, runModeName(args.runMode));
 
-    return runTransport(cfg, role, args.runMode, count, rt.stopToken());
+    return runTransport(cfg, role, args.runMode, count, RuntimeSetup::stopToken());
 }

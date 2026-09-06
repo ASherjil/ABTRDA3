@@ -206,7 +206,7 @@ inline int runTransport(const TestConfig& cfg, const RoleConfig& role, RunMode m
 // to its own isolated core. run() blocks until the soak completes (Tx duration -> Rx
 // drains + sentinel -> Hist reports). Design: SingleRecorder.hpp.
 template <TxRing Tx, RxRing Rx>
-inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg, std::stop_token stop) {
+inline void driveSingleRecorder(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_token& stop) {
     Bench<Tx, Rx> bench(cfg, tx, rx);
     bench.run(cfg.recDurationSec, std::move(stop));
 }
