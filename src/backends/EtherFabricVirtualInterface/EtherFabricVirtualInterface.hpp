@@ -1,5 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Areeb Sherjil
+//
+// EtherFabricVirtualInterface — ef_vi (Solarflare/AMD Onload) raw-L2 transport for EF10-class
+// adapters (X2522). The port stays on the kernel sfc driver and admin-UP; needs root, the
+// sfc_char/sfc_resource modules, a 2 MiB hugepage pool and, for HwTimestamps, an AppFlex-licensed
+// adapter. X3/EFCT is refused at init.
+//
+// TX: CTPIO write into the write-combined aperture followed by the mandatory fallback descriptor;
+//     the completion reports which path won (ctpio_wins / ctpio_fallbacks). TX buffers rotate
+//     through NbTxBufs slots because the fallback DMA may read a slot until its completion arrives.
+// RX: dst-MAC steering filter, NbRxBufs posted slots. With kEfViRxPayloadPoll tryReceive() spins on
+//     the next slot's ethertype instead of the event queue (the frame lands before its event); the
+//     event queue is drained on poll misses. release() clears the marker and flushes the lines.
+// HW timestamps (HwTimestamps): the RX stamp is the raw quarter-nanosecond minor word from the
+//     14-byte prefix (hwRxTimestamp); TX stamps arrive per slot via EF_EVENT_TYPE_TX_WITH_TIMESTAMP
+//     (pollTxTimestamp, joined on txSequence()). hwRoundTrip/hwTurnaround decode on the recorder
+//     thread. Callers must consume TX stamps every round and at least once per NbTxBufs sends.
+// Tuning: Generic = libciul send/receive path (EF_VI_CTPIO_MODE selects its writer). X2522Plus
+//     (requires HwTimestamps, CTPIO and payload-poll) = hand-rolled EF10 commit: header word plus
+//     16-byte stores per 64-byte line, sfence between lines, precomputed descriptor, descriptor-push
+//     doorbell; no ring-full checks; RX re-post deferred to the miss spin; RX stamp read on demand
+//     after the send; marker polled 8x per event-queue check. The descriptor encoding is verified
+//     against libciul at init. Measured 2026-09-08 (64B frames): tick-to-trade median 0.977 vs
+//     0.983 us for Generic; without the inter-line sfence 57-62% of sends fall back.
+// The ef10 constants mirror onload's host_ef10_common.h (not part of the installed headers) and
+//     are static_asserted against it whenever the onload source tree is on the include path.
+// Env: ABTRDA3_TX_PAD[_<ifname>] slides the TX region by N slots inside the hugepage.
 
 #ifndef ABTRDA3_ETHERFABRICVIRTUALINTERFACE_HPP
 #define ABTRDA3_ETHERFABRICVIRTUALINTERFACE_HPP
@@ -14,17 +40,11 @@
 #include <etherfabric/pd.h>
 #include <etherfabric/vi.h>
 
-// EF10 register / descriptor / CTPIO-header field layout for the X2522 hand-rolled
-// TX path lives in onload's src/include/ci/driver/efab/hardware/host_ef10_common.h,
-// which the installed etherfabric/ headers do not ship. The values are inlined in
-// namespace ef10 below and cross-checked against the real header wherever a build
-// sees the onload source tree.
 #if __has_include(<ci/driver/efab/hardware/host_ef10_common.h>)
 #include <ci/driver/efab/hardware/host_ef10_common.h>
 #define ABTRDA3_EF10_DEFS_AVAILABLE 1
 #endif
 
-// Older glibc <sys/mman.h> lacks the explicit-size hugetlb flags (21 = log2(2MiB))
 #ifndef MAP_HUGE_SHIFT
 #define MAP_HUGE_SHIFT 26
 #endif
@@ -48,148 +68,25 @@
 
 #include "../common/Profiling.hpp"
 
-// =============================================================================
-// EtherFabricVirtualInterface — ef_vi (Solarflare/AMD kernel bypass) transport.
-//
-// WHY: the X2522-25G-PLUS is the third 25G silicon in the campaign (mlx5 verbs
-// 1.266us, tuned DPDK/mlx5 3.379us median RTT). ef_vi is Solarflare's native
-// datapath — the layer Onload itself is built on — and its CTPIO TX writes the
-// frame THROUGH a write-combined MMIO aperture straight into the NIC's TX FIFO:
-// no descriptor, no doorbell, no NIC DMA read in the send path. The vendor's
-// own eflatency measures ~1.86us RTT on this card; this transport must match
-// that number through the same API, then race DPDK's sfc PMD (vfio, full
-// userspace) on identical silicon.
-//
-// SCOPE: EF10-class Solarflare NICs (X2522 = SFC9250/Medford2) via Onload 9.0.2
-// (/dev/sfc_char + libciul1). The port STAYS on the kernel sfc driver and must
-// be admin-UP (like verbs/mlx5 — no vfio, no unbind). X3/EFCT's rx_ref datapath
-// is deliberately NOT implemented; init() refuses an EFCT adapter. Requires
-// root (VI allocation) and the onload/sfc_char/sfc_resource modules loaded.
-//
-// DESIGN:
-//   * One ef_pd + ef_vi per port object (pd_flags = 0: EF_PD_EXPRESS is an X4
-//     concept). One event queue carries BOTH RX events and TX completions.
-//   * RX = CLASSIC descriptor model: NbRxBufs slots posted via
-//     ef_vi_receive_post(dma_id = slot index); EF_EVENT_TYPE_RX returns the id,
-//     release() re-posts that one slot — same shape as every other transport.
-//     EF10 pushes RX descriptors to hardware in MULTIPLES OF 8, so single
-//     re-posts coalesce silently until 8 accumulate; with NbRxBufs posted the
-//     ring never starves (it just trails by <8 slots).
-//   * TX = CTPIO with the MANDATORY paired fallback: every
-//     ef_vi_transmit_ctpio() MUST be followed by ef_vi_transmit_ctpio_fallback()
-//     — on EF10 the fallback IS the plain DMA descriptor that commits the send
-//     and generates the TX completion; skipping it breaks the send entirely.
-//     If the NIC times out mid-CTPIO (slow writer, oversize frame) it falls
-//     back to DMA-reading that descriptor's buffer, so the frame goes out
-//     either way. EF_EVENT_TX_CTPIO on the completion says which path won —
-//     counted and reported at shutdown (wins vs fallbacks).
-//   * TX buffers ROTATE through NbTxBufs slots, reclaimed by TX completions —
-//     a single reused slot (the Verbs trick) is UNSAFE here: verbs
-//     IBV_SEND_INLINE copies the frame into the WQE so the buffer is free on
-//     return, but the CTPIO fallback descriptor points AT our buffer and the
-//     NIC may DMA-read it any time until its completion arrives. Serial
-//     ping-pong never notices; pipelined --single/--txgen would overwrite a
-//     buffer mid-DMA and put corrupt frames on the wire.
-//   * The evq cursor {m_evs, m_nEv, m_evIdx} PERSISTS across calls —
-//     ef_eventq_poll returns several events and tryReceive() must hand back ONE
-//     frame, so unprocessed events (including the TX completions that free TX
-//     slots) stay in the cursor for the next call. Draining is reachable from
-//     BOTH sides: tryReceive() walks it, and acquire()/commit() walk it too
-//     (TX-only walk that stops at an RX event and leaves it for tryReceive) —
-//     required in TxOnly mode where nobody calls tryReceive(), and when the
-//     fallback ring is momentarily full (-EAGAIN).
-//   * FILTER = dst-MAC (ef_filter_spec_set_eth_local, VLAN_ANY) — the exact
-//     counterpart of the Verbs flow rule. NOT an ethertype filter: firmware
-//     silently accepts-and-ignores eth_type filters for IPv4/IPv6 (vi.h:
-//     "will return no error"), so MAC steering is the one option that can never
-//     silently no-op. SFC filters STEER (not tee): the kernel stops seeing
-//     matching frames while the VI exists; they revert on ef_vi_free.
-//
-// CTPIO THRESHOLD (CtThreshold): bytes the NIC buffers before starting to emit.
-//   >= frame_len => store-and-forward for that frame (no underrun possible);
-//   EF_VI_CTPIO_CT_THRESHOLD_SNF (0xffff) => S&F at every size. The libciul
-//   writer paces itself for a 10G link (ctpio.c "Supporting 10Gbit link only
-//   for now"), SLOWER than a 25G MAC drains, so true cut-through on 25G can
-//   underrun => the NIC poisons the frame (bad FCS) and re-sends the good copy
-//   from the fallback — the peer sees the poison as EF_EVENT_TYPE_RX_DISCARD /
-//   CRC_BAD (counted, re-posted, reported at shutdown). At frame_size 64 the
-//   default threshold 64 is already >= frame_len, so poison is impossible;
-//   at 128B frames this becomes a live A/B (64 vs SNF vs NO_POISON).
-//
-// TUNABLES (compile-time template params; only the interface name is runtime
-// config): NbRxBufs, NbTxBufs (power of two), BufSize (slot stride),
-// CtThreshold, UseCtpio (false = plain DMA descriptor sends, the doorbell
-// baseline for the CTPIO-vs-DMA A/B on identical silicon). Satisfies the
-// TxRing/RxRing concepts (tryReceive/release + acquire/commit/send/prefillRing)
-// like every other transport.
-//
-// GOTCHAS:
-//   * The CTPIO frame buffer is reusable the moment ef_vi_transmit_ctpio
-//     returns — but the FALLBACK buffer is not (see slot rotation above).
-//   * EF_EVENT_RX_BYTES includes the RX prefix; the frame starts at
-//     slot + ef_vi_receive_prefix_len() (0 with default flags, nonzero if
-//     timestamps/event-merge engage).
-//   * HW timestamps are deliberately OFF: the campaign times every transport
-//     with rdtscp so instrument != transport (HwTimestamps=false).
-//   * -EPERM from ef_vi_alloc_from_pd = firmware forcing event merging; retried
-//     with EF_VI_RX_EVENT_MERGE (logged loudly — merge is a throughput feature
-//     and RX then arrives as EF_EVENT_TYPE_RX_MULTI).
-//   * A discard consumes the RX descriptor — every discard path re-posts.
-//   * shutdown() order: vi (removes filters) -> memreg -> pd -> driver handle.
-// =============================================================================
-
 enum class EtherFabricMode : std::uint8_t {
     RxOnly,
     TxOnly,
     RxTx
 };
 
-// RX payload polling (event-queue bypass). On EF10 the NIC DMAs the FRAME into
-// the posted buffer first and composes the EVQ event as a SEPARATE later write —
-// everyone who waits on the EVQ pays for that second DMA plus event decode.
-// RX buffers complete in strict FIFO ring order, so tryReceive() instead spins
-// on the next buffer's ETHERTYPE (offset 12 — the only field our raw-L2 protocol
-// guarantees nonzero; MAC bytes and seq can legitimately be 0). release() clears
-// the marker before re-posting. The EVQ still gets drained on every poll miss —
-// TX completions and counters ride there — but RX events become bookkeeping
-// no-ops. Trade-offs, deliberate for this point-to-point CRC-clean rig:
-//   * discard filtering is bypassed — a bad frame would be delivered before its
-//     discard event is seen (rig history: 0 discards in 437M+ samples; the
-//     discard counter still runs and flags any occurrence at shutdown);
-//   * frame length is not known at delivery (span covers the whole slot);
-//   * only bytes 0..63 (the marker's cacheline/TLP) are guaranteed present at
-//     detection — fine for this protocol, which never reads past byte 25;
-//   * the EVQ drain rides the poll MISS path — a saturating RX stream with no
-//     misses (RxOnly at line rate) would starve it until the EVQ overflows
-//     (visible as unexpected_events). RxTx ping-pong misses every round.
 inline constexpr bool kEfViRxPayloadPoll = true;
 
-// Per-adapter tuning of the hot path.
-//   Generic   — every send/receive goes through libciul (portable across EF10 parts).
-//   X2522Ull  — Solarflare X2522-Plus, hardware-timestamp builds only. The TX path is
-//               hand-rolled against the EF10 register layout: the CTPIO header word
-//               lives in the slot 4 bytes ahead of the frame so the aperture write is
-//               whole 64-byte lines streamed from L1 with 16-byte stores, one sfence,
-//               a precomputed descriptor word and the 16-byte descriptor-push
-//               doorbell. No ring-full checks (the miss spin drains the EVQ every
-//               round), RX descriptor re-post deferred to the miss spin, RX stamp read
-//               on demand after the send, marker polled 8x per EVQ check. One sfence
-//               between 64-byte write buffers (see commit()). The descriptor encoding
-//               is verified against libciul at init and the VI refuses to start on any
-//               mismatch. Measured 2026-09-08 vs the libciul path, 64B frames:
-//               tick-to-trade median 0.977 vs 0.983 us — the software share of the
-//               path was already ~35 ns; the rest is NIC + PCIe.
 namespace ef10 {
-inline constexpr std::uint32_t kTxDescUpdReg           = 0x00000a10;   // ER_DZ_TX_DESC_UPD_REG
-inline constexpr std::uint32_t kCtpioUserThresholdLbn  = 16;           // ESF_FZ_USER_THRESHOLD
+inline constexpr std::uint32_t kTxDescUpdReg           = 0x00000a10;
+inline constexpr std::uint32_t kCtpioUserThresholdLbn  = 16;
 inline constexpr std::uint32_t kCtpioUserThresholdBits = 12;
-inline constexpr std::uint32_t kCtpioTimeStampReqLbn   = 12;   // ESF_FZ_TIME_STAMP_REQ
-inline constexpr std::uint32_t kCtpioFrameLengthBits   = 12;   // ESF_FZ_FRAME_LENGTH (lbn 0)
-inline constexpr std::uint32_t kTxUsrByteCntLbn        = 48;   // ESF_DZ_TX_USR_BYTE_CNT
+inline constexpr std::uint32_t kCtpioTimeStampReqLbn   = 12;
+inline constexpr std::uint32_t kCtpioFrameLengthBits   = 12;
+inline constexpr std::uint32_t kTxUsrByteCntLbn        = 48;
 inline constexpr std::uint32_t kTxUsrByteCntBits       = 14;
-inline constexpr std::uint32_t kTxUsrBufPageSizeLbn    = 44;   // ESF_DZ_TX_USR_BUF_PAGE_SIZE
+inline constexpr std::uint32_t kTxUsrBufPageSizeLbn    = 44;
 inline constexpr std::uint32_t kTxUsrBufPageSizeBits   = 4;
-inline constexpr std::uint32_t kTxUsrBufIdOffsetBits   = 44;   // ESF_DZ_TX_USR_BUF_ID_OFFSET (lbn 0)
+inline constexpr std::uint32_t kTxUsrBufIdOffsetBits   = 44;
 #ifdef ABTRDA3_EF10_DEFS_AVAILABLE
 static_assert(kTxDescUpdReg == ER_DZ_TX_DESC_UPD_REG);
 static_assert(kCtpioUserThresholdLbn == ESF_FZ_USER_THRESHOLD_LBN);
@@ -207,7 +104,7 @@ static_assert(ESF_DZ_TX_USR_BUF_ID_OFFSET_LBN == 0 &&
 
 enum class EfViTuning : std::uint8_t {
     Generic,
-    X2522Ull
+    X2522Plus
 };
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8,
@@ -218,39 +115,35 @@ class EtherFabricVirtualInterface {
     static constexpr bool HAS_TX = (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
 
     static_assert((NbTxBufs & (NbTxBufs - 1)) == 0, "NbTxBufs must be a power of two");
-    static_assert((NbRxBufs & (NbRxBufs - 1)) == 0,
-                  "NbRxBufs must be a power of two (payload-poll FIFO cursor wraps with & mask)");
+    static_assert((NbRxBufs & (NbRxBufs - 1)) == 0, "NbRxBufs must be a power of two");
     static_assert(NbRxBufs % 8 == 0, "EF10 pushes RX descriptors in multiples of 8");
     static_assert(BufSize >= 64, "slot must hold a minimum ethernet frame");
 
     static constexpr int kEvPollBatch = 8;
+    static_assert(kEvPollBatch >= EF_VI_EVENT_POLL_MIN_EVS);
 
-    static constexpr bool ULL = (Tuning == EfViTuning::X2522Ull);
-    static_assert(!ULL || (HwTimestamps && UseCtpio && kEfViRxPayloadPoll),
-                  "X2522Ull tuning requires HwTimestamps, CTPIO and payload-poll RX");
-    static_assert(!ULL || CtThreshold < (1u << ef10::kCtpioUserThresholdBits),
+    static constexpr bool kX2522Plus = (Tuning == EfViTuning::X2522Plus);
+    static_assert(!kX2522Plus || (HwTimestamps && UseCtpio && kEfViRxPayloadPoll),
+                  "X2522Plus tuning requires HwTimestamps, CTPIO and payload-poll RX");
+    static_assert(!kX2522Plus || CtThreshold < (1u << ef10::kCtpioUserThresholdBits),
                   "CTPIO threshold does not fit the header field");
-    // Bytes reserved ahead of every TX frame for the CTPIO header word.
-    static constexpr std::uint32_t kTxHdrBytes   = ULL ? 4u : 0u;
+
+    static constexpr std::uint32_t kTxHdrBytes   = kX2522Plus ? 4u : 0u;
     static constexpr std::uint32_t kCtpioHdrBase = (CtThreshold << ef10::kCtpioUserThresholdLbn) |
                                                    (1u << ef10::kCtpioTimeStampReqLbn);
-    static constexpr std::uint32_t kMarkerSpins = ULL ? 8u : 1u;
-
+    static constexpr std::uint32_t kMarkerSpins      = kX2522Plus ? 8u : 1u;
     static constexpr std::uint32_t kRxPrefixTsOffset = 10;
     static constexpr std::uint32_t kOneSecQns        = 4000000000u;
     static constexpr std::uint32_t kQnsOverrun       = 20;
     static constexpr std::uint32_t kTxStampNone      = 0xFFFFFFFFu;
-    static_assert(kEvPollBatch >= EF_VI_EVENT_POLL_MIN_EVS);
-
-    // One unused guard slot on EACH side of the TX region. Measured (2x 5-min
-    // histogram runs, 144M sends each): CTPIO noncontig fallbacks concentrate
-    // 94-98% on the EDGE TX slots — client slot 0 (its cacheline neighborhood
-    // abuts the DDIO-hot RX region) and server slot NbTxBufs-1 (abuts foreign
-    // heap) — deterministically across runs, with per-run severity from ~150ppm
-    // to ~100% of that slot's sends. The guards make every live TX slot interior.
-    static constexpr std::uint32_t kTxGuardSlots = 1;
+    static constexpr std::uint32_t kTxGuardSlots     = 1;
 
 public:
+    struct TxStamp {
+        std::uint32_t seq;
+        std::uint32_t minor;
+    };
+
     explicit EtherFabricVirtualInterface(std::string_view ifname) noexcept;
     ~EtherFabricVirtualInterface();
 
@@ -261,8 +154,6 @@ public:
 
     [[nodiscard]] bool init() noexcept;
     void               shutdown() noexcept;
-
-    [[nodiscard]] std::array<std::uint8_t, 6> macAddress() const noexcept;
 
     void prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
         requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
@@ -288,93 +179,31 @@ public:
         requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
 
     [[nodiscard, gnu::always_inline]]
-    std::uint32_t hwRxTimestamp() const noexcept
-        requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
-    {
-        if constexpr (ULL) {
-            // Read on demand from the held slot's prefix: keeps the (possibly second)
-            // line out of the reply path; valid until the slot is re-posted.
-            std::uint32_t raw = 0;
-            std::memcpy(&raw, rxSlot(m_heldId) + kRxPrefixTsOffset, sizeof raw);
-            return raw;
-        } else {
-            return m_rxTsRaw;
-        }
-    }
-
-    struct TxStamp {
-        std::uint32_t seq;
-        std::uint32_t minor;
-    };
+    inline std::uint32_t hwRxTimestamp() const noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx));
 
     [[nodiscard, gnu::always_inline]]
-    std::optional<TxStamp> pollTxTimestamp() noexcept
-        requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
-    {
-        if (m_txTsCursor == m_txTail) {
-            return std::nullopt;
-        }
-        const std::uint64_t entry = m_txStamp[m_txTsCursor & (NbTxBufs - 1)];
-        const std::uint32_t seq   = static_cast<std::uint32_t>(entry >> 32);
-        if (seq != m_txTsCursor) [[unlikely]] {
-            ++m_txTsOverflow;
-            m_txTsCursor = m_txTail;
-            return std::nullopt;
-        }
-        ++m_txTsCursor;
-        return TxStamp{seq, static_cast<std::uint32_t>(entry)};
-    }
+    inline std::optional<TxStamp> pollTxTimestamp() noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx));
 
     [[nodiscard, gnu::always_inline]]
-    bool rxFrameComplete() noexcept
-        requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
-    {
-        if constexpr (!kEfViRxPayloadPoll) {
-            return true;
-        }
-        RxEv scratch;
-        (void)pollEvent(scratch, false);
-        return m_rxEvReconciled >= m_rxPollHits;
-    }
+    inline bool rxFrameComplete() noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx));
 
     [[nodiscard, gnu::always_inline]]
-    std::uint32_t txSequence() const noexcept
-        requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
-    {
-        return m_txHead;
-    }
+    inline std::uint32_t txSequence() const noexcept
+        requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx));
 
     [[nodiscard]] std::uint32_t hwRxTimestampCorrection() const noexcept
-        requires (HwTimestamps)
-    {
-        return m_rxTsCorrection;
-    }
+        requires (HwTimestamps);
 
     [[nodiscard]] static std::optional<std::uint64_t> hwRoundTrip(std::uint64_t packed,
                                                                   std::uint32_t rxCorrection) noexcept
-        requires (HwTimestamps)
-    {
-        const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32),
-                                                         rxCorrection);
-        const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
-        if (!rx || tx == 0 || tx == kTxStampNone) {
-            return std::nullopt;
-        }
-        return hwDelta(*rx, tx);
-    }
+        requires (HwTimestamps);
 
     [[nodiscard]] static std::optional<std::uint64_t> hwTurnaround(std::uint64_t packed,
                                                                    std::uint32_t rxCorrection) noexcept
-        requires (HwTimestamps)
-    {
-        const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32),
-                                                         rxCorrection);
-        const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
-        if (!rx || tx == 0 || tx == kTxStampNone) {
-            return std::nullopt;
-        }
-        return hwDelta(tx, *rx);
-    }
+        requires (HwTimestamps);
 
 private:
     struct RxEv {
@@ -382,53 +211,20 @@ private:
         std::uint32_t len;
     };
 
-    [[nodiscard]] [[gnu::always_inline]] std::uint8_t* rxSlot(std::uint32_t i) const noexcept;
-    [[nodiscard]] [[gnu::always_inline]] std::uint8_t* txSlot(std::uint32_t s) const noexcept;
-
-    [[nodiscard]] [[gnu::always_inline]] std::uint8_t* txFrame(std::uint32_t s) const noexcept {
-        return txSlot(s) + kTxHdrBytes;
-    }
-
-    [[gnu::always_inline]] inline void repostReleased() noexcept;
-    [[nodiscard]] bool                 initUllTx() noexcept;
-    [[gnu::hot]] inline bool           pollEvent(RxEv& out, bool wantRx) noexcept;
-    [[gnu::hot]] inline void           readRxTimestamp(const std::uint8_t* prefixBase) noexcept;
+    [[nodiscard]] [[gnu::always_inline]] inline std::uint8_t* rxSlot(std::uint32_t i) const noexcept;
+    [[nodiscard]] [[gnu::always_inline]] inline std::uint8_t* txSlot(std::uint32_t s) const noexcept;
+    [[nodiscard]] [[gnu::always_inline]] inline std::uint8_t* txFrame(std::uint32_t s) const noexcept;
+    [[nodiscard]] [[gnu::always_inline]] inline bool          evqHasEvent() const noexcept;
+    [[gnu::always_inline]] inline void                        repostReleased() noexcept;
+    [[gnu::hot]] inline bool                                  pollEvent(RxEv& out, bool wantRx) noexcept;
+    [[gnu::hot]] inline void readRxTimestamp(const std::uint8_t* prefixBase) noexcept;
+    inline void              handleDiscard(std::uint32_t id, unsigned subtype) noexcept;
+    [[nodiscard]] bool       initX2522PlusTx() noexcept;
+    [[nodiscard]] bool       readMac() noexcept;
 
     [[nodiscard]] static std::optional<std::uint32_t> hwFoldRx(std::uint32_t raw,
-                                                               std::uint32_t correction) noexcept {
-        if (raw == 0xFFFFFFFFu) {
-            return std::nullopt;
-        }
-        std::uint32_t minor = raw + correction;
-        if (minor >= kOneSecQns) {
-            if (minor < kOneSecQns + kQnsOverrun + 2) {
-                minor -= kOneSecQns;
-            } else {
-                minor += kOneSecQns;
-            }
-        }
-        return minor;
-    }
-
-    [[nodiscard]] static std::uint64_t hwDelta(std::uint32_t end, std::uint32_t begin) noexcept {
-        std::int64_t d = static_cast<std::int64_t>(end) - static_cast<std::int64_t>(begin);
-        if (d < 0) {
-            d += kOneSecQns;
-        }
-        return static_cast<std::uint64_t>(d);
-    }
-
-    inline void        handleDiscard(std::uint32_t id, unsigned subtype) noexcept;
-    [[nodiscard]] bool readMac() noexcept;
-
-    [[nodiscard]] [[gnu::always_inline]] bool evqHasEvent() const noexcept {
-        const std::uint32_t           off  = m_vi.ep_state->evq.evq_ptr & m_vi.evq_mask;
-        const volatile std::uint64_t* slot = reinterpret_cast<const volatile std::uint64_t*>(m_vi.evq_base +
-                                                                                             off);
-        const std::uint64_t           v    = *slot;
-        return (static_cast<std::uint32_t>(v) != 0xFFFFFFFFu) &&
-               (static_cast<std::uint32_t>(v >> 32) != 0xFFFFFFFFu);
-    }
+                                                               std::uint32_t correction) noexcept;
+    [[nodiscard]] static std::uint64_t hwDelta(std::uint32_t end, std::uint32_t begin) noexcept;
 
     std::string                 m_ifname;
     std::array<std::uint8_t, 6> m_mac{};
@@ -456,25 +252,26 @@ private:
     int      m_evIdx{0};
 
     std::uint32_t m_heldId{0};
-    std::uint32_t m_rxNextIdx{0};   // payload-poll FIFO cursor: next buffer to complete
+    std::uint32_t m_rxNextIdx{0};
     std::uint32_t m_rxPendingPush{0};
+    std::uint32_t m_rxReleased{0};
+    std::uint32_t m_rxReposted{0};
     std::uint32_t m_txHead{0};
     std::uint32_t m_txTail{0};
     std::uint32_t m_txSlot{0};
     std::uint32_t m_txPad{0};
     std::uint32_t m_txBase{NbRxBufs + kTxGuardSlots};
     std::uint32_t m_txLen{0};
-    std::uint8_t* m_txPtr{nullptr};        // acquire() computes txSlot() once; commit() reuses it
-    std::uint8_t* m_txSlotBase{nullptr};   // ULL: slot start = CTPIO header word, frame follows
-    std::array<std::uint64_t, NbTxBufs> m_txDescBase{};    // ULL: descriptor minus the byte count
-    std::uint32_t                       m_rxReleased{0};   // ULL: slots released by the app
-    std::uint32_t                       m_rxReposted{0};   // ULL: slots re-posted to the NIC
+    std::uint8_t* m_txPtr{nullptr};
+    std::uint8_t* m_txSlotBase{nullptr};
+
+    std::array<std::uint64_t, NbTxBufs> m_txDescBase{};
 
     std::uint64_t                       m_ctpioWins{0};
     std::uint64_t                       m_ctpioFallbacks{0};
     std::array<std::uint64_t, NbTxBufs> m_fallbackPerSlot{};
-    std::uint64_t                       m_rxPollHits{0};       // payload-poll deliveries
-    std::uint64_t                       m_rxEvReconciled{0};   // RX events consumed as bookkeeping no-ops
+    std::uint64_t                       m_rxPollHits{0};
+    std::uint64_t                       m_rxEvReconciled{0};
     std::uint64_t                       m_rxDiscards{0};
     std::uint64_t                       m_rxCrcBad{0};
     std::uint64_t                       m_rxDropped{0};
@@ -491,8 +288,6 @@ private:
     std::uint64_t                       m_tsMismatch{0};
     std::uint64_t                       m_tsLibFail{0};
 };
-
-// =============================================================================
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
@@ -605,25 +400,8 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
         return false;
     }
 
-    // All buffer slots live in explicit 2MiB hugetlb pages (one page fits the
-    // default 265-slot config). With 4K heap pages, every process start drew fresh
-    // page placement per slot, and that draw set the CTPIO tear severity of the
-    // phase-chosen slot (150ppm..100% — the per-run lottery). A 2M-aligned page
-    // fixes every address bit below 2M across runs. The 2M size MUST be explicit:
-    // rtserver's default hugepagesz is 1G (the DPDK pool). The 2M pool needs
-    // creating once per boot:
-    //   echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
     constexpr std::size_t kHugePage = static_cast<std::size_t>(2u * 1024u * 1024u);
 
-    // TX region pad. The rotation-origin sweep proved the CTPIO tear is bound to
-    // an ADDRESS (a fragile cell at a fixed offset within the 2M page — slot 5's
-    // 0x83000 in the default layout), NOT to the doorbell phase: the victim slot
-    // never moved with the rotation origin. This knob slides the whole TX region
-    // by N slots (N x BufSize bytes) inside the page so no TX slot occupies a
-    // fragile cell. Init-time only. ABTRDA3_TX_PAD=<slots>, per-port override
-    // ABTRDA3_TX_PAD_<ifname>. Prediction of the cell model: victim index
-    // decrements as pad grows (pad=1 -> slot 4 ...), histogram flat once the
-    // region clears the cell (pad >= 6 for the default layout).
     if constexpr (HAS_TX) {
         const std::string padPerPort = fmt::format("ABTRDA3_TX_PAD_{}", m_ifname);
         const char*       pad        = std::getenv(padPerPort.c_str());
@@ -666,8 +444,8 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
         m_txDma[s] = ef_memreg_dma_addr(&m_memreg,
                                         static_cast<std::size_t>(m_txBase + s) * BufSize + kTxHdrBytes);
     }
-    if constexpr (ULL) {
-        if (!initUllTx()) {
+    if constexpr (kX2522Plus) {
+        if (!initX2522PlusTx()) {
             return false;
         }
     }
@@ -704,9 +482,6 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
         }
     }
 
-    // The mode libciul's CTPIO writer will use — read from OUR environment, the
-    // same place ef_vi_transmit_ctpio reads it. Prints the truth even when a
-    // launcher script (sudo env_reset!) silently strips the variable.
     const char* ctpioModeEnv = std::getenv("EF_VI_CTPIO_MODE");
     fmt::println(stderr,
                  "[ef_vi] {} ready — {} arch={} rxq {} txq {} tx={} ct_thresh={} prefix {}B bufs=2M-huge "
@@ -714,7 +489,7 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                  m_ifname, ef_vi_version_str(), m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                  NbRxBufs, NbTxBufs, UseCtpio ? "CTPIO" : "DMA", UseCtpio ? CtThreshold : 0U, m_rxPrefix,
                  m_txPad, HwTimestamps ? (HAS_RX && HAS_TX ? "rx+tx" : (HAS_RX ? "rx" : "tx")) : "off",
-                 ULL ? "x2522-ull" : (ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)"),
+                 kX2522Plus ? "x2522-plus" : (ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)"),
                  kEfViRxPayloadPoll ? "payload-poll" : "evq", m_evMerge ? " [EVENT-MERGE FORCED]" : "");
     return true;
 }
@@ -744,13 +519,11 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
             fmt::println(stderr, "[ef_vi] {}: rx discards={} (crc_bad={}) dropped={} unexpected_events={}",
                          m_ifname, m_rxDiscards, m_rxCrcBad, m_rxDropped, m_evUnexpected);
             if constexpr (kEfViRxPayloadPoll) {
-                // Sanity pair: every poll delivery should eventually produce one RX
-                // event; a persistent gap means ring/cursor desync.
                 fmt::println(stderr, "[ef_vi] {}: rx poll_hits={} events_reconciled={}", m_ifname,
                              m_rxPollHits, m_rxEvReconciled);
-                if constexpr (ULL) {
-                    fmt::println(stderr, "[ef_vi] {}: ull rx released={} reposted={}", m_ifname, m_rxReleased,
-                                 m_rxReposted);
+                if constexpr (kX2522Plus) {
+                    fmt::println(stderr, "[ef_vi] {}: x2522-plus rx released={} reposted={}", m_ifname,
+                                 m_rxReleased, m_rxReposted);
                 }
             }
         }
@@ -795,13 +568,6 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
-std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                                        HwTimestamps, Tuning>::macAddress() const noexcept {
-    return m_mac;
-}
-
-template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
                                  Tuning>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
@@ -819,7 +585,7 @@ EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpi
                             Tuning>::acquire(std::uint32_t frameLen) noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
-    if constexpr (ULL) {
+    if constexpr (kX2522Plus) {
         m_txSlot     = m_txHead & (NbTxBufs - 1);
         m_txLen      = frameLen;
         m_txSlotBase = txSlot(m_txSlot);
@@ -849,12 +615,7 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
                                         Tuning>::commit() noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
-    if constexpr (ULL) {
-        // CTPIO: header word + frame, whole 64-byte lines from L1 into the WC aperture.
-        // The header word is inserted into the first 16-byte register rather than
-        // stored to the slot and reloaded (a 4-byte store under a 16-byte load cannot
-        // forward). The fallback DMA buffer starts at the frame, so the slot's first
-        // four bytes never matter to the NIC.
+    if constexpr (kX2522Plus) {
         const std::uint32_t hdr    = kCtpioHdrBase | m_txLen;
         auto*               dst    = reinterpret_cast<__m128i*>(m_vi.vi_ctpio_mmap_ptr);
         const auto*         src    = reinterpret_cast<const __m128i*>(m_txSlotBase);
@@ -866,23 +627,14 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         for (std::uint32_t l = 1; l < nLines; ++l) {
             dst += 4;
             src += 4;
-            // sfence between lines. Measured 2026-09-08 (64B frames, 30 s runs): without
-            // it this core evicts the two write buffers out of order 57-62% of the time
-            // (CTPIO fallback, +0.8us); a timed gap instead of the fence needs 200 TSC
-            // ticks to get the fallback rate down and is then no faster; and the sends
-            // that DO win without the fence have the same median as with it. The fence
-            // is free at the median on this platform.
             _mm_sfence();
             _mm_store_si128(dst + 0, _mm_load_si128(src + 0));
             _mm_store_si128(dst + 1, _mm_load_si128(src + 1));
             _mm_store_si128(dst + 2, _mm_load_si128(src + 2));
             _mm_store_si128(dst + 3, _mm_load_si128(src + 3));
         }
-        _mm_sfence();   // WC data must reach the NIC before the descriptor push below
+        _mm_sfence();
 
-        // Fallback descriptor + descriptor-push doorbell (what libciul's
-        // ef_vi_transmit_ctpio_fallback does, minus the generic machinery). The host
-        // ring write is ordered ahead of the UC doorbell store by x86 TSO.
         ef_vi_txq_state&    qs   = m_vi.ep_state->txq;
         const std::uint32_t di   = qs.added & m_vi.vi_txq.mask;
         const std::uint64_t desc = m_txDescBase[m_txSlot] |
@@ -957,14 +709,14 @@ inline std::span<const std::uint8_t> EtherFabricVirtualInterface<
                 m_heldId    = m_rxNextIdx;
                 m_rxNextIdx = (m_rxNextIdx + 1) & (NbRxBufs - 1);
                 ++m_rxPollHits;
-                if constexpr (HwTimestamps && !ULL) {
+                if constexpr (HwTimestamps && !kX2522Plus) {
                     readRxTimestamp(buf);
                 }
                 return {buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix)};
             }
         }
 
-        if constexpr (ULL) {
+        if constexpr (kX2522Plus) {
             repostReleased();
         }
         RxEv ev{};
@@ -995,8 +747,8 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot)));
         asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot + 64)));
     }
-    if constexpr (ULL) {
-        ++m_rxReleased;   // descriptor re-post happens in the miss spin (repostReleased)
+    if constexpr (kX2522Plus) {
+        ++m_rxReleased;
         return;
     }
     ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
@@ -1009,98 +761,99 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
-                                        Tuning>::repostReleased() noexcept {
-    // Slots complete and are released in FIFO order, so the re-post counter modulo
-    // the ring size IS the slot index. Runs from the miss spin only.
-    while (m_rxReposted != m_rxReleased) {
-        const std::uint32_t id = m_rxReposted & (NbRxBufs - 1);
-        ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
-        ++m_rxReposted;
-        ++m_rxPendingPush;
+inline std::uint32_t EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
+                                                 HwTimestamps, Tuning>::hwRxTimestamp() const noexcept
+    requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
+{
+    if constexpr (kX2522Plus) {
+        std::uint32_t raw = 0;
+        std::memcpy(&raw, rxSlot(m_heldId) + kRxPrefixTsOffset, sizeof raw);
+        return raw;
+    } else {
+        return m_rxTsRaw;
     }
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
-                                 Tuning>::initUllTx() noexcept {
-    if (m_vi.nic_type.arch != EF_VI_ARCH_EF10 || m_vi.vi_ctpio_mmap_ptr == nullptr ||
-        (m_vi.vi_flags & EF_VI_TX_PHYS_ADDR) != 0) {
-        fmt::println(stderr, "[ef_vi] {}: X2522Ull needs an EF10 VI with CTPIO in buffer-table mode",
-                     m_ifname);
-        return false;
+inline auto EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::pollTxTimestamp() noexcept -> std::optional<TxStamp>
+    requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
+{
+    if (m_txTsCursor == m_txTail) {
+        return std::nullopt;
     }
-    // Buffer-table TX descriptor: [63] IS_OPT=0 [62] CONT [61:48] BYTE_CNT
-    // [47:44] BUF_PAGE_SIZE(order) [43:0] BUF_ID_OFFSET — ef10_dma_tx_calc_ip_buf().
-    // The libciul encoding is read back through ef_vi_transmitv_init() for every
-    // slot and must match bit for bit.
-    ef_vi_txq_state& qs   = m_vi.ep_state->txq;
-    const auto       mask = m_vi.vi_txq.mask;
-    for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
-        const std::uint64_t vaddr = static_cast<std::uint64_t>(m_txDma[s]);
-        const std::uint64_t idOff = vaddr & 0xffffffffffffULL;
-        const std::uint64_t order = vaddr >> 48;
-        if ((idOff >> ef10::kTxUsrBufIdOffsetBits) != 0 || (order >> ef10::kTxUsrBufPageSizeBits) != 0) {
-            fmt::println(stderr, "[ef_vi] {}: X2522Ull: TX buffer address {:#x} does not fit the descriptor",
-                         m_ifname, vaddr);
-            return false;
-        }
-        m_txDescBase[s] = (order << ef10::kTxUsrBufPageSizeLbn) | idOff;
-
-        constexpr std::uint32_t kProbeLen = 64;
-        const std::uint32_t     added     = qs.added;
-        const std::uint32_t     di        = added & mask;
-        const ef_iovec          iov{m_txDma[s], kProbeLen};
-        if (ef_vi_transmitv_init(&m_vi, &iov, 1, static_cast<ef_request_id>(s)) != 0) {
-            fmt::println(stderr, "[ef_vi] {}: X2522Ull: probe transmitv_init failed", m_ifname);
-            return false;
-        }
-        const std::uint64_t lib  = static_cast<const std::uint64_t*>(m_vi.vi_txq.descriptors)[di];
-        qs.added                 = added;   // roll the probe back: nothing was pushed
-        m_vi.vi_txq.ids[di]      = EF_REQUEST_ID_MASK;
-        const std::uint64_t ours = m_txDescBase[s] |
-                                   (static_cast<std::uint64_t>(kProbeLen) << ef10::kTxUsrByteCntLbn);
-        if (lib != ours) {
-            fmt::println(
-                stderr,
-                "[ef_vi] {}: X2522Ull: descriptor encoding mismatch slot {} lib={:#018x} ours={:#018x}",
-                m_ifname, s, lib, ours);
-            return false;
-        }
+    const std::uint64_t entry = m_txStamp[m_txTsCursor & (NbTxBufs - 1)];
+    const std::uint32_t seq   = static_cast<std::uint32_t>(entry >> 32);
+    if (seq != m_txTsCursor) [[unlikely]] {
+        ++m_txTsOverflow;
+        m_txTsCursor = m_txTail;
+        return std::nullopt;
     }
-    if (m_vi.tx_push_thresh == 0) {
-        fmt::println(stderr,
-                     "[ef_vi] {}: X2522Ull: descriptor push disabled (EF_VI_TX_PUSH_DISABLE) — refusing",
-                     m_ifname);
-        return false;
-    }
-    return true;
+    ++m_txTsCursor;
+    return TxStamp{seq, static_cast<std::uint32_t>(entry)};
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
-                                        Tuning>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
-    std::memcpy(&m_rxTsRaw, prefixBase + kRxPrefixTsOffset, sizeof m_rxTsRaw);
-    if constexpr (prof::kDebugProfiling) {
-        ef_precisetime ts{};
-        if (ef_vi_receive_get_precise_timestamp(&m_vi, prefixBase, &ts) != 0) {
-            ++m_tsLibFail;
-        } else {
-            ++m_tsVerified;
-            const std::uint32_t lib = static_cast<std::uint32_t>(ts.tv_nsec) * 4u +
-                                      (static_cast<std::uint32_t>(ts.tv_nsec_frac) >> 14);
-            const std::optional<std::uint32_t> ours = hwFoldRx(m_rxTsRaw, m_rxTsCorrection);
-            if (!ours || lib != *ours) {
-                if (m_tsMismatch < 8) {
-                    fmt::println(stderr, "[ef_vi] {}: hw_ts MISMATCH lib={} raw={}", m_ifname, lib,
-                                 m_rxTsRaw);
-                }
-                ++m_tsMismatch;
-            }
-        }
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::rxFrameComplete() noexcept
+    requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
+{
+    if constexpr (!kEfViRxPayloadPoll) {
+        return true;
     }
+    RxEv scratch;
+    (void)pollEvent(scratch, false);
+    return m_rxEvReconciled >= m_rxPollHits;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline std::uint32_t EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
+                                                 HwTimestamps, Tuning>::txSequence() const noexcept
+    requires (HwTimestamps && (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx))
+{
+    return m_txHead;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+std::uint32_t EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                          Tuning>::hwRxTimestampCorrection() const noexcept
+    requires (HwTimestamps)
+{
+    return m_rxTsCorrection;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+std::optional<std::uint64_t>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::hwRoundTrip(std::uint64_t packed, std::uint32_t rxCorrection) noexcept
+    requires (HwTimestamps)
+{
+    const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32), rxCorrection);
+    const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
+    if (!rx || tx == 0 || tx == kTxStampNone) {
+        return std::nullopt;
+    }
+    return hwDelta(*rx, tx);
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+std::optional<std::uint64_t>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::hwTurnaround(std::uint64_t packed, std::uint32_t rxCorrection) noexcept
+    requires (HwTimestamps)
+{
+    const std::optional<std::uint32_t> rx = hwFoldRx(static_cast<std::uint32_t>(packed >> 32), rxCorrection);
+    const std::uint32_t                tx = static_cast<std::uint32_t>(packed);
+    if (!rx || tx == 0 || tx == kTxStampNone) {
+        return std::nullopt;
+    }
+    return hwDelta(tx, *rx);
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
@@ -1121,28 +874,35 @@ inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize,
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
-                                        Tuning>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
-    ++m_rxDiscards;
-    if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) {
-        ++m_rxCrcBad;
-    }
-    if constexpr (kEfViRxPayloadPoll) {
-        // Payload mode: the bad frame's marker already fired (or will) and the app
-        // delivers + releases this buffer like any other — re-initing it here would
-        // double-post. The nonzero discard counter at shutdown is the alarm; this
-        // rig has never produced one (0 in 437M+ samples, FEC off, DAC, CRC clean).
-        return;
-    }
-    ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
-    ++m_rxPendingPush;
+inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
+                                                 HwTimestamps, Tuning>::txFrame(std::uint32_t s)
+    const noexcept {
+    return txSlot(s) + kTxHdrBytes;
 }
 
-// Walks the shared event queue. TX completions and discards are consumed in
-// place; the walk STOPS at an RX event — consumed and returned when wantRx,
-// left at the cursor head for tryReceive() when !wantRx (the TX-side drain
-// must never eat a frame). One eventq_poll refill per call keeps the empty
-// path (the hottest code here — the app spins on it) at a handful of insns.
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::evqHasEvent() const noexcept {
+    const std::uint32_t           off  = m_vi.ep_state->evq.evq_ptr & m_vi.evq_mask;
+    const volatile std::uint64_t* slot = reinterpret_cast<const volatile std::uint64_t*>(m_vi.evq_base + off);
+    const std::uint64_t           v    = *slot;
+    return (static_cast<std::uint32_t>(v) != 0xFFFFFFFFu) &&
+           (static_cast<std::uint32_t>(v >> 32) != 0xFFFFFFFFu);
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::repostReleased() noexcept {
+    while (m_rxReposted != m_rxReleased) {
+        const std::uint32_t id = m_rxReposted & (NbRxBufs - 1);
+        ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
+        ++m_rxReposted;
+        ++m_rxPendingPush;
+    }
+}
+
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
           unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
@@ -1153,8 +913,6 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
             switch (EF_EVENT_TYPE(ev)) {
                 case EF_EVENT_TYPE_RX: {
                     if constexpr (kEfViRxPayloadPoll) {
-                        // Delivery already happened (or is about to) via the payload marker —
-                        // the event is pure bookkeeping.
                         ++m_rxEvReconciled;
                         ++m_evIdx;
                         break;
@@ -1184,9 +942,6 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
                             m_ctpioWins += static_cast<std::uint64_t>(n);
                         } else {
                             m_ctpioFallbacks += static_cast<std::uint64_t>(n);
-                            // Per-slot histogram: a measured 5-min run failed at EXACTLY 1/8 =
-                            // one cursed slot of the NbTxBufs rotation (per-run: the buffer +
-                            // aperture are allocated fresh each start). dma_id = slot index.
                             for (int k = 0; k < n; ++k) {
                                 ++m_fallbackPerSlot[static_cast<std::uint32_t>(ids[k]) & (NbTxBufs - 1)];
                             }
@@ -1286,17 +1041,8 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         if (pass > 0) {
             return false;
         }
-        // Fast empty path: skip the out-of-line ef_eventq_poll call entirely when
-        // the EVQ head slot says no event exists (see evqHasEvent()). The refill
-        // below runs only when there is real work.
         if (!evqHasEvent()) [[likely]] {
             if constexpr (HAS_RX) {
-                // Idle RX push: the doorbell fires from the quiet spin, keeping its
-                // MMIO write (and the NIC's delayed descriptor fetch it triggers) away
-                // from release()'s position nanoseconds behind a CTPIO burst. Under
-                // the in_order CTPIO writer (config of record) doorbell phase cannot
-                // tear a burst at all — this placement is now about PCIe tidiness,
-                // not correctness. wantRx excludes the TX-side drain.
                 if (wantRx && m_rxPendingPush >= 8) {
                     ef_vi_receive_push(&m_vi);
                     m_rxPendingPush &= 7;
@@ -1307,11 +1053,102 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         m_nEv   = ef_eventq_poll(&m_vi, m_evs, kEvPollBatch);
         m_evIdx = 0;
         if (m_nEv == 0) [[unlikely]] {
-            // evqHasEvent raced a half-written event — absent by the full test;
-            // the next spin iteration picks it up.
             return false;
         }
     }
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
+    std::memcpy(&m_rxTsRaw, prefixBase + kRxPrefixTsOffset, sizeof m_rxTsRaw);
+    if constexpr (prof::kDebugProfiling) {
+        ef_precisetime ts{};
+        if (ef_vi_receive_get_precise_timestamp(&m_vi, prefixBase, &ts) != 0) {
+            ++m_tsLibFail;
+        } else {
+            ++m_tsVerified;
+            const std::uint32_t lib = static_cast<std::uint32_t>(ts.tv_nsec) * 4u +
+                                      (static_cast<std::uint32_t>(ts.tv_nsec_frac) >> 14);
+            const std::optional<std::uint32_t> ours = hwFoldRx(m_rxTsRaw, m_rxTsCorrection);
+            if (!ours || lib != *ours) {
+                if (m_tsMismatch < 8) {
+                    fmt::println(stderr, "[ef_vi] {}: hw_ts MISMATCH lib={} raw={}", m_ifname, lib,
+                                 m_rxTsRaw);
+                }
+                ++m_tsMismatch;
+            }
+        }
+    }
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
+    ++m_rxDiscards;
+    if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) {
+        ++m_rxCrcBad;
+    }
+    if constexpr (kEfViRxPayloadPoll) {
+        return;
+    }
+    ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
+    ++m_rxPendingPush;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::initX2522PlusTx() noexcept {
+    if (m_vi.nic_type.arch != EF_VI_ARCH_EF10 || m_vi.vi_ctpio_mmap_ptr == nullptr ||
+        (m_vi.vi_flags & EF_VI_TX_PHYS_ADDR) != 0) {
+        fmt::println(stderr, "[ef_vi] {}: X2522Plus needs an EF10 VI with CTPIO in buffer-table mode",
+                     m_ifname);
+        return false;
+    }
+    ef_vi_txq_state& qs   = m_vi.ep_state->txq;
+    const auto       mask = m_vi.vi_txq.mask;
+    for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
+        const std::uint64_t vaddr = static_cast<std::uint64_t>(m_txDma[s]);
+        const std::uint64_t idOff = vaddr & 0xffffffffffffULL;
+        const std::uint64_t order = vaddr >> 48;
+        if ((idOff >> ef10::kTxUsrBufIdOffsetBits) != 0 || (order >> ef10::kTxUsrBufPageSizeBits) != 0) {
+            fmt::println(stderr, "[ef_vi] {}: X2522Plus: TX buffer address {:#x} does not fit the descriptor",
+                         m_ifname, vaddr);
+            return false;
+        }
+        m_txDescBase[s] = (order << ef10::kTxUsrBufPageSizeLbn) | idOff;
+
+        constexpr std::uint32_t kProbeLen = 64;
+        const std::uint32_t     added     = qs.added;
+        const std::uint32_t     di        = added & mask;
+        const ef_iovec          iov{m_txDma[s], kProbeLen};
+        if (ef_vi_transmitv_init(&m_vi, &iov, 1, static_cast<ef_request_id>(s)) != 0) {
+            fmt::println(stderr, "[ef_vi] {}: X2522Plus: probe transmitv_init failed", m_ifname);
+            return false;
+        }
+        const std::uint64_t lib  = static_cast<const std::uint64_t*>(m_vi.vi_txq.descriptors)[di];
+        qs.added                 = added;
+        m_vi.vi_txq.ids[di]      = EF_REQUEST_ID_MASK;
+        const std::uint64_t ours = m_txDescBase[s] |
+                                   (static_cast<std::uint64_t>(kProbeLen) << ef10::kTxUsrByteCntLbn);
+        if (lib != ours) {
+            fmt::println(
+                stderr,
+                "[ef_vi] {}: X2522Plus: descriptor encoding mismatch slot {} lib={:#018x} ours={:#018x}",
+                m_ifname, s, lib, ours);
+            return false;
+        }
+    }
+    if (m_vi.tx_push_thresh == 0) {
+        fmt::println(stderr,
+                     "[ef_vi] {}: X2522Plus: descriptor push disabled (EF_VI_TX_PUSH_DISABLE) — refusing",
+                     m_ifname);
+        return false;
+    }
+    return true;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
@@ -1336,4 +1173,34 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
     return true;
 }
 
-#endif   // ABTRDA3_ETHERFABRICVIRTUALINTERFACE_HPP
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+std::optional<std::uint32_t>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::hwFoldRx(std::uint32_t raw, std::uint32_t correction) noexcept {
+    if (raw == 0xFFFFFFFFu) {
+        return std::nullopt;
+    }
+    std::uint32_t minor = raw + correction;
+    if (minor >= kOneSecQns) {
+        if (minor < kOneSecQns + kQnsOverrun + 2) {
+            minor -= kOneSecQns;
+        } else {
+            minor += kOneSecQns;
+        }
+    }
+    return minor;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+std::uint64_t EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                          Tuning>::hwDelta(std::uint32_t end, std::uint32_t begin) noexcept {
+    std::int64_t d = static_cast<std::int64_t>(end) - static_cast<std::int64_t>(begin);
+    if (d < 0) {
+        d += kOneSecQns;
+    }
+    return static_cast<std::uint64_t>(d);
+}
+
+#endif

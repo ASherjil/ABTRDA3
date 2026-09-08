@@ -436,7 +436,7 @@ inline constexpr bool kEfViUseCtpio = true;
 inline constexpr bool kEfViHwTimestamps = true;
 // X2522-Plus hand-rolled hot path — only ever compiled in with hardware timestamps;
 // the rdtscp instrument keeps the generic libciul path.
-inline constexpr EfViTuning kEfViTuning = kEfViHwTimestamps ? EfViTuning::X2522Ull : EfViTuning::Generic;
+inline constexpr EfViTuning kEfViTuning = kEfViHwTimestamps ? EfViTuning::X2522Plus : EfViTuning::Generic;
 
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
