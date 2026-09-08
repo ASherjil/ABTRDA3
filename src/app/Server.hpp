@@ -79,9 +79,6 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
                 }
                 continue;
             }
-            if constexpr (kHwTs) {
-                rxInFlight = rx.hwRxTimestamp();
-            }
 
             // CPU-cost bracket: packet in hand -> reply posted (excludes the poll wait).
             [[maybe_unused]] std::uint64_t reflectStart = 0;
@@ -114,6 +111,9 @@ inline void run_server(Tx& tx, Rx& rx, const TestConfig& cfg, const std::stop_to
                 txSeqInFlight = tx.txSequence();
             }
             tx.commit();
+            if constexpr (kHwTs) {
+                rxInFlight = rx.hwRxTimestamp();   // after the send: off the reply path
+            }
 
             if constexpr (prof::kDebugProfiling) {
                 reflectStats.record(prof::cycles() - reflectStart);

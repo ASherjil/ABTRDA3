@@ -4,6 +4,7 @@
 #ifndef ABTRDA3_ETHERFABRICVIRTUALINTERFACE_HPP
 #define ABTRDA3_ETHERFABRICVIRTUALINTERFACE_HPP
 
+#include <immintrin.h>
 #include <net/if.h>
 #include <sys/mman.h>
 
@@ -12,6 +13,16 @@
 #include <etherfabric/memreg.h>
 #include <etherfabric/pd.h>
 #include <etherfabric/vi.h>
+
+// EF10 register / descriptor / CTPIO-header field layout for the X2522 hand-rolled
+// TX path lives in onload's src/include/ci/driver/efab/hardware/host_ef10_common.h,
+// which the installed etherfabric/ headers do not ship. The values are inlined in
+// namespace ef10 below and cross-checked against the real header wherever a build
+// sees the onload source tree.
+#if __has_include(<ci/driver/efab/hardware/host_ef10_common.h>)
+#include <ci/driver/efab/hardware/host_ef10_common.h>
+#define ABTRDA3_EF10_DEFS_AVAILABLE 1
+#endif
 
 // Older glibc <sys/mman.h> lacks the explicit-size hugetlb flags (21 = log2(2MiB))
 #ifndef MAP_HUGE_SHIFT
@@ -153,9 +164,55 @@ enum class EtherFabricMode : std::uint8_t {
 //     (visible as unexpected_events). RxTx ping-pong misses every round.
 inline constexpr bool kEfViRxPayloadPoll = true;
 
+// Per-adapter tuning of the hot path.
+//   Generic   — every send/receive goes through libciul (portable across EF10 parts).
+//   X2522Ull  — Solarflare X2522-Plus, hardware-timestamp builds only. The TX path is
+//               hand-rolled against the EF10 register layout: the CTPIO header word
+//               lives in the slot 4 bytes ahead of the frame so the aperture write is
+//               whole 64-byte lines streamed from L1 with 16-byte stores, one sfence,
+//               a precomputed descriptor word and the 16-byte descriptor-push
+//               doorbell. No ring-full checks (the miss spin drains the EVQ every
+//               round), RX descriptor re-post deferred to the miss spin, RX stamp read
+//               on demand after the send, marker polled 8x per EVQ check. One sfence
+//               between 64-byte write buffers (see commit()). The descriptor encoding
+//               is verified against libciul at init and the VI refuses to start on any
+//               mismatch. Measured 2026-09-08 vs the libciul path, 64B frames:
+//               tick-to-trade median 0.977 vs 0.983 us — the software share of the
+//               path was already ~35 ns; the rest is NIC + PCIe.
+namespace ef10 {
+inline constexpr std::uint32_t kTxDescUpdReg           = 0x00000a10;   // ER_DZ_TX_DESC_UPD_REG
+inline constexpr std::uint32_t kCtpioUserThresholdLbn  = 16;           // ESF_FZ_USER_THRESHOLD
+inline constexpr std::uint32_t kCtpioUserThresholdBits = 12;
+inline constexpr std::uint32_t kCtpioTimeStampReqLbn   = 12;   // ESF_FZ_TIME_STAMP_REQ
+inline constexpr std::uint32_t kCtpioFrameLengthBits   = 12;   // ESF_FZ_FRAME_LENGTH (lbn 0)
+inline constexpr std::uint32_t kTxUsrByteCntLbn        = 48;   // ESF_DZ_TX_USR_BYTE_CNT
+inline constexpr std::uint32_t kTxUsrByteCntBits       = 14;
+inline constexpr std::uint32_t kTxUsrBufPageSizeLbn    = 44;   // ESF_DZ_TX_USR_BUF_PAGE_SIZE
+inline constexpr std::uint32_t kTxUsrBufPageSizeBits   = 4;
+inline constexpr std::uint32_t kTxUsrBufIdOffsetBits   = 44;   // ESF_DZ_TX_USR_BUF_ID_OFFSET (lbn 0)
+#ifdef ABTRDA3_EF10_DEFS_AVAILABLE
+static_assert(kTxDescUpdReg == ER_DZ_TX_DESC_UPD_REG);
+static_assert(kCtpioUserThresholdLbn == ESF_FZ_USER_THRESHOLD_LBN);
+static_assert(kCtpioUserThresholdBits == ESF_FZ_USER_THRESHOLD_WIDTH);
+static_assert(kCtpioTimeStampReqLbn == ESF_FZ_TIME_STAMP_REQ_LBN);
+static_assert(ESF_FZ_FRAME_LENGTH_LBN == 0 && kCtpioFrameLengthBits == ESF_FZ_FRAME_LENGTH_WIDTH);
+static_assert(kTxUsrByteCntLbn == ESF_DZ_TX_USR_BYTE_CNT_LBN);
+static_assert(kTxUsrByteCntBits == ESF_DZ_TX_USR_BYTE_CNT_WIDTH);
+static_assert(kTxUsrBufPageSizeLbn == ESF_DZ_TX_USR_BUF_PAGE_SIZE_LBN);
+static_assert(kTxUsrBufPageSizeBits == ESF_DZ_TX_USR_BUF_PAGE_SIZE_WIDTH);
+static_assert(ESF_DZ_TX_USR_BUF_ID_OFFSET_LBN == 0 &&
+              kTxUsrBufIdOffsetBits == ESF_DZ_TX_USR_BUF_ID_OFFSET_WIDTH);
+#endif
+}   // namespace ef10
+
+enum class EfViTuning : std::uint8_t {
+    Generic,
+    X2522Ull
+};
+
 template <EtherFabricMode M, std::uint16_t NbRxBufs = 256, std::uint16_t NbTxBufs = 8,
           std::uint32_t BufSize = 2048, unsigned CtThreshold = 64, bool UseCtpio = true,
-          bool HwTimestamps = false>
+          bool HwTimestamps = false, EfViTuning Tuning = EfViTuning::Generic>
 class EtherFabricVirtualInterface {
     static constexpr bool HAS_RX = (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx);
     static constexpr bool HAS_TX = (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx);
@@ -167,6 +224,17 @@ class EtherFabricVirtualInterface {
     static_assert(BufSize >= 64, "slot must hold a minimum ethernet frame");
 
     static constexpr int kEvPollBatch = 8;
+
+    static constexpr bool ULL = (Tuning == EfViTuning::X2522Ull);
+    static_assert(!ULL || (HwTimestamps && UseCtpio && kEfViRxPayloadPoll),
+                  "X2522Ull tuning requires HwTimestamps, CTPIO and payload-poll RX");
+    static_assert(!ULL || CtThreshold < (1u << ef10::kCtpioUserThresholdBits),
+                  "CTPIO threshold does not fit the header field");
+    // Bytes reserved ahead of every TX frame for the CTPIO header word.
+    static constexpr std::uint32_t kTxHdrBytes   = ULL ? 4u : 0u;
+    static constexpr std::uint32_t kCtpioHdrBase = (CtThreshold << ef10::kCtpioUserThresholdLbn) |
+                                                   (1u << ef10::kCtpioTimeStampReqLbn);
+    static constexpr std::uint32_t kMarkerSpins = ULL ? 8u : 1u;
 
     static constexpr std::uint32_t kRxPrefixTsOffset = 10;
     static constexpr std::uint32_t kOneSecQns        = 4000000000u;
@@ -223,7 +291,15 @@ public:
     std::uint32_t hwRxTimestamp() const noexcept
         requires (HwTimestamps && (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx))
     {
-        return m_rxTsRaw;
+        if constexpr (ULL) {
+            // Read on demand from the held slot's prefix: keeps the (possibly second)
+            // line out of the reply path; valid until the slot is re-posted.
+            std::uint32_t raw = 0;
+            std::memcpy(&raw, rxSlot(m_heldId) + kRxPrefixTsOffset, sizeof raw);
+            return raw;
+        } else {
+            return m_rxTsRaw;
+        }
     }
 
     struct TxStamp {
@@ -308,8 +384,15 @@ private:
 
     [[nodiscard]] [[gnu::always_inline]] std::uint8_t* rxSlot(std::uint32_t i) const noexcept;
     [[nodiscard]] [[gnu::always_inline]] std::uint8_t* txSlot(std::uint32_t s) const noexcept;
-    [[gnu::hot]] inline bool                           pollEvent(RxEv& out, bool wantRx) noexcept;
-    [[gnu::hot]] inline void readRxTimestamp(const std::uint8_t* prefixBase) noexcept;
+
+    [[nodiscard]] [[gnu::always_inline]] std::uint8_t* txFrame(std::uint32_t s) const noexcept {
+        return txSlot(s) + kTxHdrBytes;
+    }
+
+    [[gnu::always_inline]] inline void repostReleased() noexcept;
+    [[nodiscard]] bool                 initUllTx() noexcept;
+    [[gnu::hot]] inline bool           pollEvent(RxEv& out, bool wantRx) noexcept;
+    [[gnu::hot]] inline void           readRxTimestamp(const std::uint8_t* prefixBase) noexcept;
 
     [[nodiscard]] static std::optional<std::uint32_t> hwFoldRx(std::uint32_t raw,
                                                                std::uint32_t correction) noexcept {
@@ -381,7 +464,11 @@ private:
     std::uint32_t m_txPad{0};
     std::uint32_t m_txBase{NbRxBufs + kTxGuardSlots};
     std::uint32_t m_txLen{0};
-    std::uint8_t* m_txPtr{nullptr};   // acquire() computes txSlot() once; commit() reuses it
+    std::uint8_t* m_txPtr{nullptr};        // acquire() computes txSlot() once; commit() reuses it
+    std::uint8_t* m_txSlotBase{nullptr};   // ULL: slot start = CTPIO header word, frame follows
+    std::array<std::uint64_t, NbTxBufs> m_txDescBase{};    // ULL: descriptor minus the byte count
+    std::uint32_t                       m_rxReleased{0};   // ULL: slots released by the app
+    std::uint32_t                       m_rxReposted{0};   // ULL: slots re-posted to the NIC
 
     std::uint64_t                       m_ctpioWins{0};
     std::uint64_t                       m_ctpioFallbacks{0};
@@ -408,23 +495,23 @@ private:
 // =============================================================================
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                            HwTimestamps>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::EtherFabricVirtualInterface(std::string_view ifname) noexcept
     : m_ifname{ifname} {
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                            HwTimestamps>::~EtherFabricVirtualInterface() {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::~EtherFabricVirtualInterface() {
     shutdown();
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                 HwTimestamps>::init() noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::init() noexcept {
     if (!readMac()) {
         return false;
     }
@@ -576,7 +663,13 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
         m_rxDma[i] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(i) * BufSize);
     }
     for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
-        m_txDma[s] = ef_memreg_dma_addr(&m_memreg, static_cast<std::size_t>(m_txBase + s) * BufSize);
+        m_txDma[s] = ef_memreg_dma_addr(&m_memreg,
+                                        static_cast<std::size_t>(m_txBase + s) * BufSize + kTxHdrBytes);
+    }
+    if constexpr (ULL) {
+        if (!initUllTx()) {
+            return false;
+        }
     }
 
     if constexpr (HAS_RX) {
@@ -621,15 +714,15 @@ bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                  m_ifname, ef_vi_version_str(), m_vi.nic_type.arch == EF_VI_ARCH_EF10 ? "EF10" : "other",
                  NbRxBufs, NbTxBufs, UseCtpio ? "CTPIO" : "DMA", UseCtpio ? CtThreshold : 0U, m_rxPrefix,
                  m_txPad, HwTimestamps ? (HAS_RX && HAS_TX ? "rx+tx" : (HAS_RX ? "rx" : "tx")) : "off",
-                 ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)",
+                 ULL ? "x2522-ull" : (ctpioModeEnv != nullptr ? ctpioModeEnv : "default(paced)"),
                  kEfViRxPayloadPoll ? "payload-poll" : "evq", m_evMerge ? " [EVENT-MERGE FORCED]" : "");
     return true;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                 HwTimestamps>::shutdown() noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::shutdown() noexcept {
     if (m_haveVi) {
         if constexpr (HAS_TX) {
             if constexpr (UseCtpio) {
@@ -655,6 +748,10 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
                 // event; a persistent gap means ring/cursor desync.
                 fmt::println(stderr, "[ef_vi] {}: rx poll_hits={} events_reconciled={}", m_ifname,
                              m_rxPollHits, m_rxEvReconciled);
+                if constexpr (ULL) {
+                    fmt::println(stderr, "[ef_vi] {}: ull rx released={} reposted={}", m_ifname, m_rxReleased,
+                                 m_rxReposted);
+                }
             }
         }
         if constexpr (HwTimestamps) {
@@ -697,52 +794,107 @@ void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, Us
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 std::array<std::uint8_t, 6> EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                                        HwTimestamps>::macAddress() const noexcept {
+                                                        HwTimestamps, Tuning>::macAddress() const noexcept {
     return m_mac;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::
-    prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::prefillRing(std::span<const std::uint8_t> frameTemplate) noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
     for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
-        std::memcpy(txSlot(s), frameTemplate.data(), std::min<std::size_t>(frameTemplate.size(), BufSize));
+        std::memcpy(txFrame(s), frameTemplate.data(),
+                    std::min<std::size_t>(frameTemplate.size(), BufSize - kTxHdrBytes));
     }
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                                 HwTimestamps>::acquire(std::uint32_t frameLen) noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline std::uint8_t*
+EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                            Tuning>::acquire(std::uint32_t frameLen) noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
-    if (frameLen > BufSize) [[unlikely]] {
-        return nullptr;
-    }
-    if (m_txHead - m_txTail >= NbTxBufs) [[unlikely]] {
-        RxEv scratch{};
-        pollEvent(scratch, false);
-        if (m_txHead - m_txTail >= NbTxBufs) {
+    if constexpr (ULL) {
+        m_txSlot     = m_txHead & (NbTxBufs - 1);
+        m_txLen      = frameLen;
+        m_txSlotBase = txSlot(m_txSlot);
+        m_txPtr      = m_txSlotBase + kTxHdrBytes;
+        return m_txPtr;
+    } else {
+        if (frameLen > BufSize) [[unlikely]] {
             return nullptr;
         }
+        if (m_txHead - m_txTail >= NbTxBufs) [[unlikely]] {
+            RxEv scratch{};
+            pollEvent(scratch, false);
+            if (m_txHead - m_txTail >= NbTxBufs) {
+                return nullptr;
+            }
+        }
+        m_txSlot = m_txHead & (NbTxBufs - 1);
+        m_txLen  = frameLen;
+        m_txPtr  = txSlot(m_txSlot);
+        return m_txPtr;
     }
-    m_txSlot = m_txHead & (NbTxBufs - 1);
-    m_txLen  = frameLen;
-    m_txPtr  = txSlot(m_txSlot);
-    return m_txPtr;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                        HwTimestamps>::commit() noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::commit() noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
-    if constexpr (UseCtpio) {
+    if constexpr (ULL) {
+        // CTPIO: header word + frame, whole 64-byte lines from L1 into the WC aperture.
+        // The header word is inserted into the first 16-byte register rather than
+        // stored to the slot and reloaded (a 4-byte store under a 16-byte load cannot
+        // forward). The fallback DMA buffer starts at the frame, so the slot's first
+        // four bytes never matter to the NIC.
+        const std::uint32_t hdr    = kCtpioHdrBase | m_txLen;
+        auto*               dst    = reinterpret_cast<__m128i*>(m_vi.vi_ctpio_mmap_ptr);
+        const auto*         src    = reinterpret_cast<const __m128i*>(m_txSlotBase);
+        const std::uint32_t nLines = (m_txLen + kTxHdrBytes + 63u) >> 6;
+        _mm_store_si128(dst + 0, _mm_insert_epi32(_mm_load_si128(src + 0), static_cast<int>(hdr), 0));
+        _mm_store_si128(dst + 1, _mm_load_si128(src + 1));
+        _mm_store_si128(dst + 2, _mm_load_si128(src + 2));
+        _mm_store_si128(dst + 3, _mm_load_si128(src + 3));
+        for (std::uint32_t l = 1; l < nLines; ++l) {
+            dst += 4;
+            src += 4;
+            // sfence between lines. Measured 2026-09-08 (64B frames, 30 s runs): without
+            // it this core evicts the two write buffers out of order 57-62% of the time
+            // (CTPIO fallback, +0.8us); a timed gap instead of the fence needs 200 TSC
+            // ticks to get the fallback rate down and is then no faster; and the sends
+            // that DO win without the fence have the same median as with it. The fence
+            // is free at the median on this platform.
+            _mm_sfence();
+            _mm_store_si128(dst + 0, _mm_load_si128(src + 0));
+            _mm_store_si128(dst + 1, _mm_load_si128(src + 1));
+            _mm_store_si128(dst + 2, _mm_load_si128(src + 2));
+            _mm_store_si128(dst + 3, _mm_load_si128(src + 3));
+        }
+        _mm_sfence();   // WC data must reach the NIC before the descriptor push below
+
+        // Fallback descriptor + descriptor-push doorbell (what libciul's
+        // ef_vi_transmit_ctpio_fallback does, minus the generic machinery). The host
+        // ring write is ordered ahead of the UC doorbell store by x86 TSO.
+        ef_vi_txq_state&    qs   = m_vi.ep_state->txq;
+        const std::uint32_t di   = qs.added & m_vi.vi_txq.mask;
+        const std::uint64_t desc = m_txDescBase[m_txSlot] |
+                                   (static_cast<std::uint64_t>(m_txLen) << ef10::kTxUsrByteCntLbn);
+        static_cast<std::uint64_t*>(m_vi.vi_txq.descriptors)[di] = desc;
+        m_vi.vi_txq.ids[di]                                      = m_txSlot;
+        ++qs.added;
+        qs.previous = qs.added;
+        auto* dbell = reinterpret_cast<__m128i*>(m_vi.io + ef10::kTxDescUpdReg);
+        _mm_store_si128(dbell, _mm_set_epi64x(static_cast<long long>(qs.added & m_vi.vi_txq.mask),
+                                              static_cast<long long>(desc)));
+    } else if constexpr (UseCtpio) {
         ef_vi_transmit_ctpio(&m_vi, m_txPtr, m_txLen, CtThreshold);
         for (;;) {
             const int rc = ef_vi_transmit_ctpio_fallback(&m_vi, m_txDma[m_txSlot], static_cast<int>(m_txLen),
@@ -776,9 +928,9 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                        HwTimestamps>::send(std::span<const std::uint8_t> frame) noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::send(std::span<const std::uint8_t> frame) noexcept
     requires (M == EtherFabricMode::TxOnly || M == EtherFabricMode::RxTx)
 {
     auto* dst = acquire(static_cast<std::uint32_t>(frame.size()));
@@ -791,25 +943,30 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 inline std::span<const std::uint8_t> EtherFabricVirtualInterface<
-    M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps>::tryReceive() noexcept
+    M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps, Tuning>::tryReceive() noexcept
     requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx)
 {
     if constexpr (kEfViRxPayloadPoll) {
         std::uint8_t*                 buf    = rxSlot(m_rxNextIdx);
         const volatile std::uint16_t* marker = reinterpret_cast<const volatile std::uint16_t*>(
             buf + m_rxPrefix + 12);
-        if (*marker != 0) [[unlikely]] {
-            m_heldId    = m_rxNextIdx;
-            m_rxNextIdx = (m_rxNextIdx + 1) & (NbRxBufs - 1);
-            ++m_rxPollHits;
-            if constexpr (HwTimestamps) {
-                readRxTimestamp(buf);
+        for (std::uint32_t k = 0; k < kMarkerSpins; ++k) {
+            if (*marker != 0) [[unlikely]] {
+                m_heldId    = m_rxNextIdx;
+                m_rxNextIdx = (m_rxNextIdx + 1) & (NbRxBufs - 1);
+                ++m_rxPollHits;
+                if constexpr (HwTimestamps && !ULL) {
+                    readRxTimestamp(buf);
+                }
+                return {buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix)};
             }
-            return {buf + m_rxPrefix, BufSize - static_cast<std::uint32_t>(m_rxPrefix)};
         }
 
+        if constexpr (ULL) {
+            repostReleased();
+        }
         RxEv ev{};
         (void)pollEvent(ev, true);
         return {};
@@ -827,9 +984,9 @@ inline std::span<const std::uint8_t> EtherFabricVirtualInterface<
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                        HwTimestamps>::release() noexcept
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::release() noexcept
     requires (M == EtherFabricMode::RxOnly || M == EtherFabricMode::RxTx)
 {
     if constexpr (kEfViRxPayloadPoll) {
@@ -837,6 +994,10 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
         std::memset(slot + m_rxPrefix + 12, 0, 2);
         asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot)));
         asm volatile("clflushopt %0" : : "m"(*reinterpret_cast<volatile char*>(slot + 64)));
+    }
+    if constexpr (ULL) {
+        ++m_rxReleased;   // descriptor re-post happens in the miss spin (repostReleased)
+        return;
     }
     ef_vi_receive_init(&m_vi, m_rxDma[m_heldId], static_cast<ef_request_id>(m_heldId));
     ++m_rxPendingPush;
@@ -847,10 +1008,80 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline void
-EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                            HwTimestamps>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::repostReleased() noexcept {
+    // Slots complete and are released in FIFO order, so the re-post counter modulo
+    // the ring size IS the slot index. Runs from the miss spin only.
+    while (m_rxReposted != m_rxReleased) {
+        const std::uint32_t id = m_rxReposted & (NbRxBufs - 1);
+        ef_vi_receive_init(&m_vi, m_rxDma[id], static_cast<ef_request_id>(id));
+        ++m_rxReposted;
+        ++m_rxPendingPush;
+    }
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::initUllTx() noexcept {
+    if (m_vi.nic_type.arch != EF_VI_ARCH_EF10 || m_vi.vi_ctpio_mmap_ptr == nullptr ||
+        (m_vi.vi_flags & EF_VI_TX_PHYS_ADDR) != 0) {
+        fmt::println(stderr, "[ef_vi] {}: X2522Ull needs an EF10 VI with CTPIO in buffer-table mode",
+                     m_ifname);
+        return false;
+    }
+    // Buffer-table TX descriptor: [63] IS_OPT=0 [62] CONT [61:48] BYTE_CNT
+    // [47:44] BUF_PAGE_SIZE(order) [43:0] BUF_ID_OFFSET — ef10_dma_tx_calc_ip_buf().
+    // The libciul encoding is read back through ef_vi_transmitv_init() for every
+    // slot and must match bit for bit.
+    ef_vi_txq_state& qs   = m_vi.ep_state->txq;
+    const auto       mask = m_vi.vi_txq.mask;
+    for (std::uint32_t s = 0; s < NbTxBufs; ++s) {
+        const std::uint64_t vaddr = static_cast<std::uint64_t>(m_txDma[s]);
+        const std::uint64_t idOff = vaddr & 0xffffffffffffULL;
+        const std::uint64_t order = vaddr >> 48;
+        if ((idOff >> ef10::kTxUsrBufIdOffsetBits) != 0 || (order >> ef10::kTxUsrBufPageSizeBits) != 0) {
+            fmt::println(stderr, "[ef_vi] {}: X2522Ull: TX buffer address {:#x} does not fit the descriptor",
+                         m_ifname, vaddr);
+            return false;
+        }
+        m_txDescBase[s] = (order << ef10::kTxUsrBufPageSizeLbn) | idOff;
+
+        constexpr std::uint32_t kProbeLen = 64;
+        const std::uint32_t     added     = qs.added;
+        const std::uint32_t     di        = added & mask;
+        const ef_iovec          iov{m_txDma[s], kProbeLen};
+        if (ef_vi_transmitv_init(&m_vi, &iov, 1, static_cast<ef_request_id>(s)) != 0) {
+            fmt::println(stderr, "[ef_vi] {}: X2522Ull: probe transmitv_init failed", m_ifname);
+            return false;
+        }
+        const std::uint64_t lib  = static_cast<const std::uint64_t*>(m_vi.vi_txq.descriptors)[di];
+        qs.added                 = added;   // roll the probe back: nothing was pushed
+        m_vi.vi_txq.ids[di]      = EF_REQUEST_ID_MASK;
+        const std::uint64_t ours = m_txDescBase[s] |
+                                   (static_cast<std::uint64_t>(kProbeLen) << ef10::kTxUsrByteCntLbn);
+        if (lib != ours) {
+            fmt::println(
+                stderr,
+                "[ef_vi] {}: X2522Ull: descriptor encoding mismatch slot {} lib={:#018x} ours={:#018x}",
+                m_ifname, s, lib, ours);
+            return false;
+        }
+    }
+    if (m_vi.tx_push_thresh == 0) {
+        fmt::println(stderr,
+                     "[ef_vi] {}: X2522Ull: descriptor push disabled (EF_VI_TX_PUSH_DISABLE) — refusing",
+                     m_ifname);
+        return false;
+    }
+    return true;
+}
+
+template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::readRxTimestamp(const std::uint8_t* prefixBase) noexcept {
     std::memcpy(&m_rxTsRaw, prefixBase + kRxPrefixTsOffset, sizeof m_rxTsRaw);
     if constexpr (prof::kDebugProfiling) {
         ef_precisetime ts{};
@@ -873,24 +1104,25 @@ EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpi
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                                 HwTimestamps>::rxSlot(std::uint32_t i) const noexcept {
+                                                 HwTimestamps, Tuning>::rxSlot(std::uint32_t i)
+    const noexcept {
     return m_mem + static_cast<std::size_t>(i) * BufSize;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
 inline std::uint8_t* EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                                 HwTimestamps>::txSlot(std::uint32_t s) const noexcept {
+                                                 HwTimestamps, Tuning>::txSlot(std::uint32_t s)
+    const noexcept {
     return m_mem + static_cast<std::size_t>(m_txBase + s) * BufSize;
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                        HwTimestamps>::handleDiscard(std::uint32_t id,
-                                                                     unsigned      subtype) noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::handleDiscard(std::uint32_t id, unsigned subtype) noexcept {
     ++m_rxDiscards;
     if (subtype == EF_EVENT_RX_DISCARD_CRC_BAD) {
         ++m_rxCrcBad;
@@ -912,9 +1144,9 @@ inline void EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 // must never eat a frame). One eventq_poll refill per call keeps the empty
 // path (the hottest code here — the app spins on it) at a handful of insns.
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                        HwTimestamps>::pollEvent(RxEv& out, bool wantRx) noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                        Tuning>::pollEvent(RxEv& out, bool wantRx) noexcept {
     for (int pass = 0;; ++pass) {
         while (m_evIdx < m_nEv) {
             const ef_event& ev = m_evs[m_evIdx];
@@ -1083,9 +1315,9 @@ inline bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThresh
 }
 
 template <EtherFabricMode M, std::uint16_t NbRxBufs, std::uint16_t NbTxBufs, std::uint32_t BufSize,
-          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps>
-bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio,
-                                 HwTimestamps>::readMac() noexcept {
+          unsigned CtThreshold, bool UseCtpio, bool HwTimestamps, EfViTuning Tuning>
+bool EtherFabricVirtualInterface<M, NbRxBufs, NbTxBufs, BufSize, CtThreshold, UseCtpio, HwTimestamps,
+                                 Tuning>::readMac() noexcept {
     const std::string p = "/sys/class/net/" + m_ifname + "/address";
     FILE*             f = std::fopen(p.c_str(), "r");
     if (!f) {

@@ -434,16 +434,19 @@ inline constexpr unsigned kEfViCtThreshold = 64;
 inline constexpr bool kEfViUseCtpio = true;
 
 inline constexpr bool kEfViHwTimestamps = true;
+// X2522-Plus hand-rolled hot path — only ever compiled in with hardware timestamps;
+// the rdtscp instrument keeps the generic libciul path.
+inline constexpr EfViTuning kEfViTuning = kEfViHwTimestamps ? EfViTuning::X2522Ull : EfViTuning::Generic;
 
 struct EtherFabricTraits : TransportBase<EtherFabricTraits> {
     static constexpr std::string_view kName = "ef_vi";
 
     using TxOnly = EtherFabricVirtualInterface<EtherFabricMode::TxOnly, 256, 8, 2048, kEfViCtThreshold,
-                                               kEfViUseCtpio, kEfViHwTimestamps>;
+                                               kEfViUseCtpio, kEfViHwTimestamps, kEfViTuning>;
     using RxOnly = EtherFabricVirtualInterface<EtherFabricMode::RxOnly, 256, 8, 2048, kEfViCtThreshold,
-                                               kEfViUseCtpio, kEfViHwTimestamps>;
+                                               kEfViUseCtpio, kEfViHwTimestamps, kEfViTuning>;
     using RxTx   = EtherFabricVirtualInterface<EtherFabricMode::RxTx, 256, 8, 2048, kEfViCtThreshold,
-                                               kEfViUseCtpio, kEfViHwTimestamps>;
+                                               kEfViUseCtpio, kEfViHwTimestamps, kEfViTuning>;
 
     static TxOnly makeTx(const TestConfig&, const RoleConfig& role) {
         return TxOnly(role.interface);
